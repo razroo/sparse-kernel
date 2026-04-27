@@ -132,6 +132,69 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BooleanResult"
+  /browser/contexts:
+    get:
+      operationId: listBrowserContexts
+      responses:
+        "200":
+          description: Browser contexts known to the broker
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BrowserContext"
+  /browser/pools:
+    get:
+      operationId: listBrowserPools
+      responses:
+        "200":
+          description: Browser pools known to the broker
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BrowserPool"
+  /browser/contexts/acquire:
+    post:
+      operationId: acquireBrowserContext
+      description: Acquire a mock v0 browser context from a trust-zone-keyed pool.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcquireBrowserContextInput"
+      responses:
+        "200":
+          description: Acquired browser context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowserContext"
+  /browser/contexts/release:
+    post:
+      operationId: releaseBrowserContext
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [context_id]
+              properties:
+                context_id: { type: string }
+      responses:
+        "200":
+          description: Release result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [released]
+                properties:
+                  released: { type: boolean }
   /leases/release-expired:
     post:
       operationId: releaseExpiredLeases
@@ -367,6 +430,39 @@ components:
       required: [ok]
       properties:
         ok: { type: boolean }
+    BrowserContext:
+      type: object
+      required: [id, pool_id, profile_mode, status, created_at]
+      properties:
+        id: { type: string }
+        pool_id: { type: string }
+        agent_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        task_id: { type: [string, "null"] }
+        profile_mode: { type: string }
+        status: { type: string }
+        created_at: { type: string }
+    BrowserPool:
+      type: object
+      required: [id, trust_zone_id, browser_kind, status, max_contexts, created_at, updated_at]
+      properties:
+        id: { type: string }
+        trust_zone_id: { type: string }
+        browser_kind: { type: string }
+        status: { type: string }
+        max_contexts: { type: integer }
+        cdp_endpoint: { type: [string, "null"] }
+        created_at: { type: string }
+        updated_at: { type: string }
+    AcquireBrowserContextInput:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        agent_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        task_id: { type: [string, "null"] }
+        trust_zone_id: { type: string }
+        max_contexts: { type: integer }
     Capability:
       type: object
       required: [id, subject_type, subject_id, resource_type, action, created_at]

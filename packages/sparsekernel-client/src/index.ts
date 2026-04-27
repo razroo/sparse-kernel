@@ -76,6 +76,36 @@ export type SparseKernelReadArtifactResult = {
   content_base64: string;
 };
 
+export type SparseKernelBrowserContext = {
+  id: string;
+  pool_id: string;
+  agent_id?: string | null;
+  session_id?: string | null;
+  task_id?: string | null;
+  profile_mode: string;
+  status: string;
+  created_at: string;
+};
+
+export type SparseKernelBrowserPool = {
+  id: string;
+  trust_zone_id: string;
+  browser_kind: string;
+  status: string;
+  max_contexts: number;
+  cdp_endpoint?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SparseKernelAcquireBrowserContextInput = {
+  agent_id?: string | null;
+  session_id?: string | null;
+  task_id?: string | null;
+  trust_zone_id: string;
+  max_contexts?: number;
+};
+
 export type SparseKernelEnqueueTaskInput = {
   id?: string;
   agent_id?: string | null;
@@ -188,6 +218,27 @@ export class SparseKernelClient {
 
   async artifactMetadata(input: SparseKernelArtifactAccessInput): Promise<SparseKernelArtifact> {
     return await this.postJson<SparseKernelArtifact>("/artifacts/metadata", input);
+  }
+
+  async browserContexts(): Promise<SparseKernelBrowserContext[]> {
+    return await this.getJson<SparseKernelBrowserContext[]>("/browser/contexts");
+  }
+
+  async browserPools(): Promise<SparseKernelBrowserPool[]> {
+    return await this.getJson<SparseKernelBrowserPool[]>("/browser/pools");
+  }
+
+  async acquireBrowserContext(
+    input: SparseKernelAcquireBrowserContextInput,
+  ): Promise<SparseKernelBrowserContext> {
+    return await this.postJson<SparseKernelBrowserContext>("/browser/contexts/acquire", input);
+  }
+
+  async releaseBrowserContext(contextId: string): Promise<boolean> {
+    const response = await this.postJson<{ released: boolean }>("/browser/contexts/release", {
+      context_id: contextId,
+    });
+    return response.released;
   }
 
   async enqueueTask(input: SparseKernelEnqueueTaskInput): Promise<SparseKernelTask> {

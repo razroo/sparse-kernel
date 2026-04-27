@@ -9,6 +9,8 @@ sidebarTitle: "Browser Broker"
 
 SparseKernel browser pools are keyed by trust zone. Browser contexts are leased per task, session, or agent.
 
+The v0 daemon exposes mock broker endpoints to acquire, release, and list browser contexts and pools. Acquisition is capability-checked with `browser_context` / `<trust-zone-id>` / `allocate`, and every acquire/release writes audit and lease records. The v0 broker records accounting only; it does not launch a real Playwright browser process.
+
 V0 provides the broker interface and mock accounting. A later Playwright broker should:
 
 - keep browser processes scarce and pooled by trust zone;

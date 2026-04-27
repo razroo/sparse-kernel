@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
-    ArtifactStore, CapabilityCheck, EnqueueTaskInput, GrantCapabilityInput, SparseKernelDb,
-    SparseKernelPaths,
+    ArtifactStore, BrowserBroker, CapabilityCheck, EnqueueTaskInput, GrantCapabilityInput,
+    MockBrowserBroker, SparseKernelDb, SparseKernelPaths,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
@@ -252,6 +252,20 @@ struct ListCapabilitiesRequest {
     subject_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AcquireBrowserContextRequest {
+    agent_id: Option<String>,
+    session_id: Option<String>,
+    task_id: Option<String>,
+    trust_zone_id: String,
+    max_contexts: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseBrowserContextRequest {
+    context_id: String,
+}
+
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Box<dyn Error>> {
     if body.is_empty() {
         return Err("request body is required".into());
@@ -354,6 +368,36 @@ pub fn handle_api_request_with_artifact_root(
             status_code: 200,
             body: serde_json::to_value(db.list_tasks(100)?)?,
         },
+        ("GET", "/browser/contexts") => ApiReply {
+            status_code: 200,
+            body: serde_json::to_value(db.list_browser_contexts(100)?)?,
+        },
+        ("GET", "/browser/pools") => ApiReply {
+            status_code: 200,
+            body: serde_json::to_value(db.list_browser_pools()?)?,
+        },
+        ("POST", "/browser/contexts/acquire") => {
+            let input: AcquireBrowserContextRequest = parse_body(body)?;
+            let broker = MockBrowserBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(broker.acquire_context(
+                    input.agent_id.as_deref(),
+                    input.session_id.as_deref(),
+                    input.task_id.as_deref(),
+                    &input.trust_zone_id,
+                    input.max_contexts.unwrap_or(2),
+                )?)?,
+            }
+        }
+        ("POST", "/browser/contexts/release") => {
+            let input: ReleaseBrowserContextRequest = parse_body(body)?;
+            let broker = MockBrowserBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: json!({ "released": broker.release_context(&input.context_id)? }),
+            }
+        }
         ("POST", "/tasks/enqueue") => {
             let input: EnqueueTaskInput = parse_body(body)?;
             ApiReply {
@@ -680,6 +724,81 @@ mod tests {
             json!({ "id": capability_id }),
         );
         assert_eq!(revoked["revoked"], true);
+    }
+
+    #[test]
+    fn browser_api_acquires_lists_and_releases_contexts() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("task-a".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "browser".to_string(),
+            priority: 0,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "browser_context".to_string(),
+            resource_id: Some("public_web".to_string()),
+            action: "allocate".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let context = json_call(
+            &mut db,
+            "POST",
+            "/browser/contexts/acquire",
+            json!({
+                "agent_id": "main",
+                "task_id": "task-a",
+                "trust_zone_id": "public_web",
+                "max_contexts": 1,
+            }),
+        );
+        let context_id = context["id"].as_str().unwrap().to_string();
+        assert_eq!(context["status"], "active");
+
+        let denied = handle_api_request(
+            &mut db,
+            "POST",
+            "/browser/contexts/acquire",
+            serde_json::to_string(&json!({
+                "agent_id": "main",
+                "trust_zone_id": "public_web",
+                "max_contexts": 1,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        assert!(denied.is_err());
+
+        let contexts = handle_api_request(&mut db, "GET", "/browser/contexts", &[])
+            .unwrap()
+            .body;
+        assert_eq!(contexts.as_array().unwrap().len(), 1);
+
+        let pools = handle_api_request(&mut db, "GET", "/browser/pools", &[])
+            .unwrap()
+            .body;
+        assert_eq!(pools[0]["trust_zone_id"], "public_web");
+
+        let released = json_call(
+            &mut db,
+            "POST",
+            "/browser/contexts/release",
+            json!({ "context_id": context_id }),
+        );
+        assert_eq!(released["released"], true);
+        let contexts = handle_api_request(&mut db, "GET", "/browser/contexts", &[])
+            .unwrap()
+            .body;
+        assert_eq!(contexts[0]["status"], "released");
     }
 
     #[test]

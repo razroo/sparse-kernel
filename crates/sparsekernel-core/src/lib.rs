@@ -221,6 +221,18 @@ pub struct BrowserContextRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserPoolRecord {
+    pub id: String,
+    pub trust_zone_id: String,
+    pub browser_kind: String,
+    pub status: String,
+    pub max_contexts: i64,
+    pub cdp_endpoint: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxAllocationRecord {
     pub id: String,
     pub task_id: Option<String>,
@@ -777,6 +789,26 @@ impl SparseKernelDb {
             .map_err(SparseKernelError::from)
     }
 
+    pub fn list_browser_contexts(&self, limit: i64) -> Result<Vec<BrowserContextRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pool_id, agent_id, session_id, task_id, profile_mode, status, created_at
+             FROM browser_contexts ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit.max(0)], browser_context_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn list_browser_pools(&self) -> Result<Vec<BrowserPoolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, trust_zone_id, browser_kind, status, max_contexts, cdp_endpoint, created_at, updated_at
+             FROM browser_pools ORDER BY trust_zone_id ASC, browser_kind ASC",
+        )?;
+        let rows = stmt.query_map([], browser_pool_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
     fn record_task_event(&self, task_id: &str, event_type: &str, payload: Value) -> Result<()> {
         self.conn.execute(
             "INSERT INTO task_events(task_id, event_type, payload_json, created_at) VALUES(?, ?, ?, ?)",
@@ -814,6 +846,32 @@ fn capability_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CapabilityRe
         constraints: parse_json(row.get(6)?),
         expires_at: row.get(7)?,
         created_at: row.get(8)?,
+    })
+}
+
+fn browser_context_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserContextRecord> {
+    Ok(BrowserContextRecord {
+        id: row.get(0)?,
+        pool_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        session_id: row.get(3)?,
+        task_id: row.get(4)?,
+        profile_mode: row.get(5)?,
+        status: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+fn browser_pool_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserPoolRecord> {
+    Ok(BrowserPoolRecord {
+        id: row.get(0)?,
+        trust_zone_id: row.get(1)?,
+        browser_kind: row.get(2)?,
+        status: row.get(3)?,
+        max_contexts: row.get(4)?,
+        cdp_endpoint: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 

@@ -37,6 +37,7 @@ Small machines can keep many logical agents parked in durable state, but they ca
 - `crates/sparsekernel-core`: Rust ledger, artifacts, task leases, capabilities, audit, and mock brokers.
 - `crates/sparsekernel-cli`: `sparsekernel` CLI and `sparsekerneld` local daemon.
 - `migrations/0001_initial.sql`: initial SQLite schema.
+- `packages/browser-broker`: TypeScript CDP adapter that materializes leased browser contexts and artifactizes screenshots/downloads.
 - `packages/sparsekernel-client`: small TypeScript daemon client.
 - `schemas/`: API and event schema definitions.
 
@@ -46,8 +47,8 @@ The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/c
 
 The API is intentionally narrow. Agents and adapters should call the daemon or typed core APIs; they should not read or mutate the ledger with raw SQL.
 
-The browser broker can now register an existing local CDP endpoint on a trust-zone pool and probe `/json/version` to verify the browser process is reachable. That is a local integration seam, not agent authority: agents receive leases and context ids, not raw CDP endpoints.
+The browser broker can now register an existing local CDP endpoint on a trust-zone pool and probe `/json/version` to verify the browser process is reachable. The TypeScript CDP adapter can then create a real browser context and target for the leased task/session, capture screenshots, and store screenshots/downloads as SparseKernel artifacts. That is a local integration seam, not agent authority: agents receive leases, context ids, and artifact ids, not raw CDP endpoints.
 
 ## Current limitations
 
-V0 proves the foundation. It does not launch or supervise Playwright browser process pools, create real Playwright contexts, implement production sandbox backends, enforce an egress proxy, isolate plugins in subprocesses, stream large artifact transfers, or rewrite OpenClaw around SparseKernel.
+V0 proves the foundation. It does not launch or supervise Playwright browser process pools, implement production sandbox backends, enforce an egress proxy, isolate plugins in subprocesses, stream large artifact transfers, or rewrite OpenClaw around SparseKernel.

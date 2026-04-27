@@ -1,0 +1,12 @@
+{
+  "name": "@openclaw/sparsekernel-browser-broker",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}

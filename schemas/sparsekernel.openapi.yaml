@@ -132,6 +132,84 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BooleanResult"
+  /tool-calls:
+    get:
+      operationId: listToolCalls
+      responses:
+        "200":
+          description: Recent tool calls
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ToolCall"
+  /tool-calls/create:
+    post:
+      operationId: createToolCall
+      description: Create a brokered tool call after capability-checking tool invocation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateToolCallInput"
+      responses:
+        "200":
+          description: Created tool call
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolCall"
+  /tool-calls/start:
+    post:
+      operationId: startToolCall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ToolCallIdInput"
+      responses:
+        "200":
+          description: Started tool call
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolCall"
+  /tool-calls/complete:
+    post:
+      operationId: completeToolCall
+      description: Complete a running tool call and record output artifact ids in the ledger.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteToolCallInput"
+      responses:
+        "200":
+          description: Completed tool call
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolCall"
+  /tool-calls/fail:
+    post:
+      operationId: failToolCall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FailToolCallInput"
+      responses:
+        "200":
+          description: Failed tool call
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ToolCall"
   /browser/contexts:
     get:
       operationId: listBrowserContexts
@@ -447,6 +525,54 @@ components:
       required: [ok]
       properties:
         ok: { type: boolean }
+    ToolCall:
+      type: object
+      required: [id, tool_name, status, created_at]
+      properties:
+        id: { type: string }
+        task_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        agent_id: { type: [string, "null"] }
+        tool_name: { type: string }
+        status:
+          type: string
+          enum: [created, running, completed, failed]
+        input: true
+        output: true
+        error: { type: [string, "null"] }
+        started_at: { type: [string, "null"] }
+        ended_at: { type: [string, "null"] }
+        created_at: { type: string }
+    CreateToolCallInput:
+      type: object
+      required: [tool_name]
+      properties:
+        id: { type: string }
+        task_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        agent_id: { type: [string, "null"] }
+        tool_name: { type: string }
+        input: true
+    ToolCallIdInput:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+    CompleteToolCallInput:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        output: true
+        artifact_ids:
+          type: array
+          items: { type: string }
+    FailToolCallInput:
+      type: object
+      required: [id, error]
+      properties:
+        id: { type: string }
+        error: { type: string }
     BrowserContext:
       type: object
       required: [id, pool_id, profile_mode, status, created_at]

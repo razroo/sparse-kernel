@@ -164,6 +164,39 @@ pub struct EnqueueTaskInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub tool_name: String,
+    pub status: String,
+    pub input: Option<Value>,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateToolCallInput {
+    pub id: Option<String>,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub tool_name: String,
+    pub input: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteToolCallInput {
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     pub id: String,
     pub sha256: String,
@@ -801,6 +834,172 @@ impl SparseKernelDb {
             .map_err(SparseKernelError::from)
     }
 
+    pub fn create_tool_call(&self, input: CreateToolCallInput) -> Result<ToolCallRecord> {
+        let tool_name = input.tool_name.trim();
+        if tool_name.is_empty() {
+            return Err(SparseKernelError::Invalid(
+                "tool_name is required".to_string(),
+            ));
+        }
+        if let Some(agent_id) = &input.agent_id {
+            self.ensure_agent(agent_id)?;
+            let allowed = self.check_capability(CapabilityCheck {
+                subject_type: "agent".to_string(),
+                subject_id: agent_id.clone(),
+                resource_type: "tool".to_string(),
+                resource_id: Some(tool_name.to_string()),
+                action: "invoke".to_string(),
+                context: Some(json!({
+                    "taskId": input.task_id.clone(),
+                    "sessionId": input.session_id.clone(),
+                })),
+                audit_denied: true,
+            })?;
+            if !allowed {
+                self.record_audit(AuditInput {
+                    actor_type: Some("agent".to_string()),
+                    actor_id: Some(agent_id.clone()),
+                    action: "tool_call.denied".to_string(),
+                    object_type: Some("tool".to_string()),
+                    object_id: Some(tool_name.to_string()),
+                    payload: None,
+                })?;
+                return Err(SparseKernelError::Denied(format!(
+                    "agent {agent_id} cannot invoke tool {tool_name}"
+                )));
+            }
+        }
+
+        let id = input
+            .id
+            .unwrap_or_else(|| format!("tool_call_{}", Uuid::new_v4()));
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO tool_calls(id, task_id, session_id, agent_id, tool_name, status, input_json, created_at)
+             VALUES(?, ?, ?, ?, ?, 'created', ?, ?)",
+            params![
+                id,
+                input.task_id,
+                input.session_id,
+                input.agent_id,
+                tool_name,
+                json_text(input.input.as_ref()),
+                now,
+            ],
+        )?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "tool_call.created".to_string(),
+            object_type: Some("tool_call".to_string()),
+            object_id: Some(id.clone()),
+            payload: Some(json!({ "toolName": tool_name })),
+        })?;
+        self.get_tool_call(&id)
+    }
+
+    pub fn get_tool_call(&self, id: &str) -> Result<ToolCallRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, task_id, session_id, agent_id, tool_name, status, input_json, output_json, error, started_at, ended_at, created_at
+                 FROM tool_calls WHERE id = ?",
+                params![id],
+                tool_call_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("tool call {id}")))
+    }
+
+    pub fn list_tool_calls(&self, limit: i64) -> Result<Vec<ToolCallRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, session_id, agent_id, tool_name, status, input_json, output_json, error, started_at, ended_at, created_at
+             FROM tool_calls ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit.max(0)], tool_call_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn start_tool_call(&self, id: &str) -> Result<ToolCallRecord> {
+        let now = now_iso();
+        let updated = self.conn.execute(
+            "UPDATE tool_calls SET status = 'running', started_at = ? WHERE id = ? AND status = 'created'",
+            params![now, id],
+        )?;
+        if updated == 0 {
+            return Err(SparseKernelError::Invalid(format!(
+                "tool call {id} cannot be started"
+            )));
+        }
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "tool_call.started".to_string(),
+            object_type: Some("tool_call".to_string()),
+            object_id: Some(id.to_string()),
+            payload: None,
+        })?;
+        self.get_tool_call(id)
+    }
+
+    pub fn complete_tool_call(
+        &self,
+        id: &str,
+        input: CompleteToolCallInput,
+    ) -> Result<ToolCallRecord> {
+        for artifact_id in &input.artifact_ids {
+            self.get_artifact(artifact_id)?;
+        }
+        let now = now_iso();
+        let output = json!({
+            "output": input.output,
+            "artifact_ids": input.artifact_ids,
+        });
+        let updated = self.conn.execute(
+            "UPDATE tool_calls SET status = 'completed', output_json = ?, error = NULL, ended_at = ? WHERE id = ? AND status = 'running'",
+            params![output.to_string(), now, id],
+        )?;
+        if updated == 0 {
+            return Err(SparseKernelError::Invalid(format!(
+                "tool call {id} cannot be completed"
+            )));
+        }
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "tool_call.completed".to_string(),
+            object_type: Some("tool_call".to_string()),
+            object_id: Some(id.to_string()),
+            payload: Some(json!({ "artifactIds": output["artifact_ids"] })),
+        })?;
+        self.get_tool_call(id)
+    }
+
+    pub fn fail_tool_call(&self, id: &str, error: &str) -> Result<ToolCallRecord> {
+        if error.trim().is_empty() {
+            return Err(SparseKernelError::Invalid("error is required".to_string()));
+        }
+        let now = now_iso();
+        let updated = self.conn.execute(
+            "UPDATE tool_calls SET status = 'failed', error = ?, ended_at = ? WHERE id = ? AND status IN ('created', 'running')",
+            params![error, now, id],
+        )?;
+        if updated == 0 {
+            return Err(SparseKernelError::Invalid(format!(
+                "tool call {id} cannot be failed"
+            )));
+        }
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "tool_call.failed".to_string(),
+            object_type: Some("tool_call".to_string()),
+            object_id: Some(id.to_string()),
+            payload: Some(json!({ "error": error })),
+        })?;
+        self.get_tool_call(id)
+    }
+
     pub fn list_browser_contexts(&self, limit: i64) -> Result<Vec<BrowserContextRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pool_id, agent_id, session_id, task_id, profile_mode, status, created_at
@@ -844,6 +1043,23 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         result_artifact_id: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+    })
+}
+
+fn tool_call_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallRecord> {
+    Ok(ToolCallRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        session_id: row.get(2)?,
+        agent_id: row.get(3)?,
+        tool_name: row.get(4)?,
+        status: row.get(5)?,
+        input: parse_json(row.get(6)?),
+        output: parse_json(row.get(7)?),
+        error: row.get(8)?,
+        started_at: row.get(9)?,
+        ended_at: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -1161,6 +1377,35 @@ fn parse_http_response(response: &str) -> std::result::Result<(u16, String), Str
         .parse::<u16>()
         .map_err(|_| "invalid HTTP status code from CDP endpoint".to_string())?;
     Ok((status_code, body.to_string()))
+}
+
+pub trait ToolBroker {
+    fn create_call(&self, input: CreateToolCallInput) -> Result<ToolCallRecord>;
+    fn start_call(&self, id: &str) -> Result<ToolCallRecord>;
+    fn complete_call(&self, id: &str, input: CompleteToolCallInput) -> Result<ToolCallRecord>;
+    fn fail_call(&self, id: &str, error: &str) -> Result<ToolCallRecord>;
+}
+
+pub struct LedgerToolBroker<'a> {
+    pub db: &'a SparseKernelDb,
+}
+
+impl ToolBroker for LedgerToolBroker<'_> {
+    fn create_call(&self, input: CreateToolCallInput) -> Result<ToolCallRecord> {
+        self.db.create_tool_call(input)
+    }
+
+    fn start_call(&self, id: &str) -> Result<ToolCallRecord> {
+        self.db.start_tool_call(id)
+    }
+
+    fn complete_call(&self, id: &str, input: CompleteToolCallInput) -> Result<ToolCallRecord> {
+        self.db.complete_tool_call(id, input)
+    }
+
+    fn fail_call(&self, id: &str, error: &str) -> Result<ToolCallRecord> {
+        self.db.fail_tool_call(id, error)
+    }
 }
 
 pub trait BrowserBroker {
@@ -1500,6 +1745,82 @@ mod tests {
         assert!(actions.contains(&"capability.denied".to_string()));
         assert!(actions.contains(&"capability.granted".to_string()));
         assert!(actions.contains(&"capability.revoked".to_string()));
+    }
+
+    #[test]
+    fn tool_broker_checks_capability_tracks_artifacts_and_audits() {
+        let (dir, db) = temp_db();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("task-a".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "browser_capture".to_string(),
+            priority: 0,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "tool".to_string(),
+            resource_id: Some("browser.capture".to_string()),
+            action: "invoke".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let broker = LedgerToolBroker { db: &db };
+        let call = broker
+            .create_call(CreateToolCallInput {
+                id: Some("tool-call-a".to_string()),
+                task_id: Some("task-a".to_string()),
+                session_id: None,
+                agent_id: Some("main".to_string()),
+                tool_name: "browser.capture".to_string(),
+                input: Some(json!({ "url": "https://example.com" })),
+            })
+            .unwrap();
+        assert_eq!(call.status, "created");
+
+        let denied = broker.create_call(CreateToolCallInput {
+            id: Some("tool-call-denied".to_string()),
+            task_id: Some("task-a".to_string()),
+            session_id: None,
+            agent_id: Some("main".to_string()),
+            tool_name: "exec".to_string(),
+            input: None,
+        });
+        assert!(denied.is_err());
+
+        let running = broker.start_call(&call.id).unwrap();
+        assert_eq!(running.status, "running");
+        let artifact = ArtifactStore::new(&db, dir.path().join("artifacts"))
+            .write(b"pixels", Some("image/png"), Some("debug"), None)
+            .unwrap();
+        let completed = broker
+            .complete_call(
+                &call.id,
+                CompleteToolCallInput {
+                    output: Some(json!({ "ok": true })),
+                    artifact_ids: vec![artifact.id.clone()],
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.output.unwrap()["artifact_ids"][0], artifact.id);
+
+        let actions: Vec<String> = db
+            .list_audit(20)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(actions.contains(&"tool_call.created".to_string()));
+        assert!(actions.contains(&"tool_call.denied".to_string()));
+        assert!(actions.contains(&"tool_call.started".to_string()));
+        assert!(actions.contains(&"tool_call.completed".to_string()));
     }
 
     #[test]

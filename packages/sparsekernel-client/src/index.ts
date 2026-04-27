@@ -30,6 +30,21 @@ export type SparseKernelTask = {
   updated_at: string;
 };
 
+export type SparseKernelToolCall = {
+  id: string;
+  task_id?: string | null;
+  session_id?: string | null;
+  agent_id?: string | null;
+  tool_name: string;
+  status: string;
+  input?: unknown;
+  output?: unknown;
+  error?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  created_at: string;
+};
+
 export type SparseKernelAuditEvent = {
   id: number;
   actor_type?: string | null;
@@ -159,6 +174,21 @@ export type SparseKernelReleaseExpiredLeasesResult = {
   resources: number;
 };
 
+export type SparseKernelCreateToolCallInput = {
+  id?: string;
+  task_id?: string | null;
+  session_id?: string | null;
+  agent_id?: string | null;
+  tool_name: string;
+  input?: unknown;
+};
+
+export type SparseKernelCompleteToolCallInput = {
+  id: string;
+  output?: unknown;
+  artifact_ids?: string[];
+};
+
 export type SparseKernelCapability = {
   id: string;
   subject_type: string;
@@ -210,6 +240,10 @@ export class SparseKernelClient {
 
   async tasks(): Promise<SparseKernelTask[]> {
     return await this.getJson<SparseKernelTask[]>("/tasks");
+  }
+
+  async toolCalls(): Promise<SparseKernelToolCall[]> {
+    return await this.getJson<SparseKernelToolCall[]>("/tool-calls");
   }
 
   async audit(): Promise<SparseKernelAuditEvent[]> {
@@ -287,6 +321,22 @@ export class SparseKernelClient {
       "/leases/release-expired",
       input,
     );
+  }
+
+  async createToolCall(input: SparseKernelCreateToolCallInput): Promise<SparseKernelToolCall> {
+    return await this.postJson<SparseKernelToolCall>("/tool-calls/create", input);
+  }
+
+  async startToolCall(id: string): Promise<SparseKernelToolCall> {
+    return await this.postJson<SparseKernelToolCall>("/tool-calls/start", { id });
+  }
+
+  async completeToolCall(input: SparseKernelCompleteToolCallInput): Promise<SparseKernelToolCall> {
+    return await this.postJson<SparseKernelToolCall>("/tool-calls/complete", input);
+  }
+
+  async failToolCall(id: string, error: string): Promise<SparseKernelToolCall> {
+    return await this.postJson<SparseKernelToolCall>("/tool-calls/fail", { id, error });
   }
 
   async grantCapability(input: SparseKernelGrantCapabilityInput): Promise<SparseKernelCapability> {

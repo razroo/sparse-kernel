@@ -5,7 +5,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
     probe_browser_endpoint, ArtifactStore, AuditInput, BrowserBroker, CapabilityCheck,
-    EnqueueTaskInput, GrantCapabilityInput, MockBrowserBroker, SparseKernelDb, SparseKernelPaths,
+    CompleteToolCallInput, CreateToolCallInput, EnqueueTaskInput, GrantCapabilityInput,
+    LedgerToolBroker, MockBrowserBroker, SparseKernelDb, SparseKernelPaths, ToolBroker,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
@@ -272,6 +273,25 @@ struct ProbeBrowserPoolRequest {
     cdp_endpoint: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ToolCallIdRequest {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteToolCallRequest {
+    id: String,
+    output: Option<Value>,
+    #[serde(default)]
+    artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailToolCallRequest {
+    id: String,
+    error: String,
+}
+
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Box<dyn Error>> {
     if body.is_empty() {
         return Err("request body is required".into());
@@ -374,6 +394,48 @@ pub fn handle_api_request_with_artifact_root(
             status_code: 200,
             body: serde_json::to_value(db.list_tasks(100)?)?,
         },
+        ("GET", "/tool-calls") => ApiReply {
+            status_code: 200,
+            body: serde_json::to_value(db.list_tool_calls(100)?)?,
+        },
+        ("POST", "/tool-calls/create") => {
+            let input: CreateToolCallInput = parse_body(body)?;
+            let broker = LedgerToolBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(broker.create_call(input)?)?,
+            }
+        }
+        ("POST", "/tool-calls/start") => {
+            let input: ToolCallIdRequest = parse_body(body)?;
+            let broker = LedgerToolBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(broker.start_call(&input.id)?)?,
+            }
+        }
+        ("POST", "/tool-calls/complete") => {
+            let input: CompleteToolCallRequest = parse_body(body)?;
+            let broker = LedgerToolBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(broker.complete_call(
+                    &input.id,
+                    CompleteToolCallInput {
+                        output: input.output,
+                        artifact_ids: input.artifact_ids,
+                    },
+                )?)?,
+            }
+        }
+        ("POST", "/tool-calls/fail") => {
+            let input: FailToolCallRequest = parse_body(body)?;
+            let broker = LedgerToolBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(broker.fail_call(&input.id, &input.error)?)?,
+            }
+        }
         ("GET", "/browser/contexts") => ApiReply {
             status_code: 200,
             body: serde_json::to_value(db.list_browser_contexts(100)?)?,
@@ -754,6 +816,85 @@ mod tests {
             json!({ "id": capability_id }),
         );
         assert_eq!(revoked["revoked"], true);
+    }
+
+    #[test]
+    fn tool_call_api_tracks_lifecycle_artifacts_and_denials() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let artifact_root = tempfile::tempdir().unwrap();
+        let artifact = ArtifactStore::new(&db, artifact_root.path())
+            .write(b"pixels", Some("image/png"), Some("debug"), None)
+            .unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "tool".to_string(),
+            resource_id: Some("browser.capture".to_string()),
+            action: "invoke".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let denied = handle_api_request(
+            &mut db,
+            "POST",
+            "/tool-calls/create",
+            serde_json::to_string(&json!({
+                "agent_id": "main",
+                "tool_name": "exec",
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        assert!(denied.is_err());
+
+        let created = json_call(
+            &mut db,
+            "POST",
+            "/tool-calls/create",
+            json!({
+                "id": "tool-call-a",
+                "agent_id": "main",
+                "tool_name": "browser.capture",
+                "input": { "url": "https://example.com" },
+            }),
+        );
+        assert_eq!(created["status"], "created");
+
+        let started = json_call(
+            &mut db,
+            "POST",
+            "/tool-calls/start",
+            json!({ "id": "tool-call-a" }),
+        );
+        assert_eq!(started["status"], "running");
+
+        let completed = json_call(
+            &mut db,
+            "POST",
+            "/tool-calls/complete",
+            json!({
+                "id": "tool-call-a",
+                "output": { "ok": true },
+                "artifact_ids": [artifact.id.clone()],
+            }),
+        );
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["output"]["artifact_ids"][0], artifact.id);
+
+        let calls = handle_api_request(&mut db, "GET", "/tool-calls", &[])
+            .unwrap()
+            .body;
+        assert_eq!(calls.as_array().unwrap().len(), 1);
+        let actions: Vec<String> = db
+            .list_audit(10)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(actions.contains(&"tool_call.denied".to_string()));
+        assert!(actions.contains(&"tool_call.completed".to_string()));
     }
 
     #[test]

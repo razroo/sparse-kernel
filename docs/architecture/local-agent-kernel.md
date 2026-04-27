@@ -111,6 +111,8 @@ Sensitive operations should check capabilities before they mutate state or alloc
 
 Capability grants, revokes, and denied checks are audited. Embedded agent runs now wrap the effective tool set with the ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
 
+The SparseKernel daemon now exposes the v0 ToolBroker lifecycle over local JSON: create, start, complete, fail, and list. Create checks `tool` / `<tool-name>` / `invoke`; completion records small structured output plus `artifact_ids`; and every transition writes audit records. See [Tool Broker](/architecture/tool-broker).
+
 ## Session compatibility
 
 Import existing sessions:

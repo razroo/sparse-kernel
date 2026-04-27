@@ -43,11 +43,13 @@ Small machines can keep many logical agents parked in durable state, but they ca
 
 ## Local API
 
-The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
+The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, tool-call create/start/complete/fail/list, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
 
 The API is intentionally narrow. Agents and adapters should call the daemon or typed core APIs; they should not read or mutate the ledger with raw SQL.
 
 The browser broker can now register an existing local CDP endpoint on a trust-zone pool and probe `/json/version` to verify the browser process is reachable. The TypeScript CDP adapter can then create a real browser context and target for the leased task/session, capture screenshots, and store screenshots/downloads as SparseKernel artifacts. That is a local integration seam, not agent authority: agents receive leases, context ids, and artifact ids, not raw CDP endpoints.
+
+The tool broker records tool-call lifecycle transitions, capability-checks agent invocation, and links output artifacts. See [Tool Broker](/architecture/tool-broker).
 
 ## Current limitations
 

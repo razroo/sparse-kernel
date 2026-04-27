@@ -41,6 +41,41 @@ export type SparseKernelAuditEvent = {
   created_at: string;
 };
 
+export type SparseKernelArtifact = {
+  id: string;
+  sha256: string;
+  mime_type?: string | null;
+  size_bytes: number;
+  storage_ref: string;
+  classification?: string | null;
+  retention_policy?: string | null;
+  created_at: string;
+};
+
+export type SparseKernelArtifactSubject = {
+  subject_type: string;
+  subject_id: string;
+  permission?: string | null;
+};
+
+export type SparseKernelCreateArtifactInput = {
+  content_base64?: string;
+  content_text?: string;
+  mime_type?: string | null;
+  retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string | null;
+  subject?: SparseKernelArtifactSubject;
+};
+
+export type SparseKernelArtifactAccessInput = {
+  id: string;
+  subject?: SparseKernelArtifactSubject;
+};
+
+export type SparseKernelReadArtifactResult = {
+  artifact: SparseKernelArtifact;
+  content_base64: string;
+};
+
 export type SparseKernelEnqueueTaskInput = {
   id?: string;
   agent_id?: string | null;
@@ -139,6 +174,20 @@ export class SparseKernelClient {
 
   async audit(): Promise<SparseKernelAuditEvent[]> {
     return await this.getJson<SparseKernelAuditEvent[]>("/audit");
+  }
+
+  async createArtifact(input: SparseKernelCreateArtifactInput): Promise<SparseKernelArtifact> {
+    return await this.postJson<SparseKernelArtifact>("/artifacts/create", input);
+  }
+
+  async readArtifact(
+    input: SparseKernelArtifactAccessInput,
+  ): Promise<SparseKernelReadArtifactResult> {
+    return await this.postJson<SparseKernelReadArtifactResult>("/artifacts/read", input);
+  }
+
+  async artifactMetadata(input: SparseKernelArtifactAccessInput): Promise<SparseKernelArtifact> {
+    return await this.postJson<SparseKernelArtifact>("/artifacts/metadata", input);
   }
 
   async enqueueTask(input: SparseKernelEnqueueTaskInput): Promise<SparseKernelTask> {

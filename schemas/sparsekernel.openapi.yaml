@@ -233,6 +233,62 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Capability"
+  /artifacts/create:
+    post:
+      operationId: createArtifact
+      description: Store artifact bytes outside SQLite and record artifact metadata in the ledger.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateArtifactInput"
+      responses:
+        "200":
+          description: Created or deduplicated artifact metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+  /artifacts/read:
+    post:
+      operationId: readArtifact
+      description: Read artifact bytes as base64 after capability and artifact-access checks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactAccessInput"
+      responses:
+        "200":
+          description: Artifact metadata and base64 content
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [artifact, content_base64]
+                properties:
+                  artifact:
+                    $ref: "#/components/schemas/Artifact"
+                  content_base64: { type: string }
+  /artifacts/metadata:
+    post:
+      operationId: artifactMetadata
+      description: Read artifact metadata after capability and artifact-access checks when a subject is supplied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactAccessInput"
+      responses:
+        "200":
+          description: Artifact metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
   /audit:
     get:
       operationId: listAudit
@@ -346,6 +402,46 @@ components:
         action: { type: string }
         context: true
         audit_denied: { type: boolean }
+    Artifact:
+      type: object
+      required: [id, sha256, size_bytes, storage_ref, created_at]
+      properties:
+        id: { type: string }
+        sha256: { type: string }
+        mime_type: { type: [string, "null"] }
+        size_bytes: { type: integer }
+        storage_ref: { type: string }
+        classification: { type: [string, "null"] }
+        retention_policy: { type: [string, "null"] }
+        created_at: { type: string }
+    ArtifactSubject:
+      type: object
+      required: [subject_type, subject_id]
+      properties:
+        subject_type: { type: string }
+        subject_id: { type: string }
+        permission: { type: [string, "null"] }
+    CreateArtifactInput:
+      type: object
+      properties:
+        content_base64: { type: string }
+        content_text: { type: string }
+        mime_type: { type: [string, "null"] }
+        retention_policy:
+          type: [string, "null"]
+          enum: [ephemeral, session, durable, debug, null]
+        subject:
+          $ref: "#/components/schemas/ArtifactSubject"
+      anyOf:
+        - required: [content_base64]
+        - required: [content_text]
+    ArtifactAccessInput:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        subject:
+          $ref: "#/components/schemas/ArtifactSubject"
     AuditEvent:
       type: object
       required: [id, action, created_at]

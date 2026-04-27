@@ -1,12 +1,15 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
-    CapabilityCheck, EnqueueTaskInput, GrantCapabilityInput, SparseKernelDb, SparseKernelPaths,
+    ArtifactStore, CapabilityCheck, EnqueueTaskInput, GrantCapabilityInput, SparseKernelDb,
+    SparseKernelPaths,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use tiny_http::{Header, Response, Server};
 
 #[derive(Debug, Parser)]
@@ -262,6 +265,78 @@ pub fn handle_api_request(
     url: &str,
     body: &[u8],
 ) -> Result<ApiReply, Box<dyn Error>> {
+    handle_api_request_with_artifact_root(db, method, url, body, None)
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactSubject {
+    subject_type: String,
+    subject_id: String,
+    permission: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateArtifactRequest {
+    content_base64: Option<String>,
+    content_text: Option<String>,
+    mime_type: Option<String>,
+    retention_policy: Option<String>,
+    subject: Option<ArtifactSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactAccessRequest {
+    id: String,
+    subject: Option<ArtifactSubject>,
+}
+
+fn artifact_root_path(override_root: Option<&Path>) -> PathBuf {
+    override_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| SparseKernelPaths::from_env().artifact_root)
+}
+
+fn decode_artifact_content(input: &CreateArtifactRequest) -> Result<Vec<u8>, Box<dyn Error>> {
+    match (&input.content_base64, &input.content_text) {
+        (Some(_), Some(_)) => Err("pass only one of content_base64 or content_text".into()),
+        (Some(raw), None) => Ok(BASE64_STANDARD.decode(raw)?),
+        (None, Some(text)) => Ok(text.as_bytes().to_vec()),
+        (None, None) => Err("content_base64 or content_text is required".into()),
+    }
+}
+
+fn require_artifact_capability(
+    db: &SparseKernelDb,
+    subject: &ArtifactSubject,
+    artifact_id: Option<&str>,
+    action: &str,
+) -> Result<(), Box<dyn Error>> {
+    let allowed = db.check_capability(CapabilityCheck {
+        subject_type: subject.subject_type.clone(),
+        subject_id: subject.subject_id.clone(),
+        resource_type: "artifact".to_string(),
+        resource_id: artifact_id.map(str::to_string),
+        action: action.to_string(),
+        context: None,
+        audit_denied: true,
+    })?;
+    if allowed {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {} lacks artifact {action} capability",
+        subject.subject_type, subject.subject_id
+    )
+    .into())
+}
+
+pub fn handle_api_request_with_artifact_root(
+    db: &mut SparseKernelDb,
+    method: &str,
+    url: &str,
+    body: &[u8],
+    artifact_root: Option<&Path>,
+) -> Result<ApiReply, Box<dyn Error>> {
     let reply = match (method, url) {
         ("GET", "/health") => ApiReply {
             status_code: 200,
@@ -375,6 +450,78 @@ pub fn handle_api_request(
                 )?,
             }
         }
+        ("POST", "/artifacts/create") => {
+            let input: CreateArtifactRequest = parse_body(body)?;
+            let bytes = decode_artifact_content(&input)?;
+            if let Some(subject) = &input.subject {
+                require_artifact_capability(db, subject, None, "write")?;
+            }
+            let store = ArtifactStore::new(db, artifact_root_path(artifact_root));
+            let subject = input.subject.as_ref().map(|subject| {
+                (
+                    subject.subject_type.as_str(),
+                    subject.subject_id.as_str(),
+                    subject.permission.as_deref().unwrap_or("read"),
+                )
+            });
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(store.write(
+                    &bytes,
+                    input.mime_type.as_deref(),
+                    input.retention_policy.as_deref(),
+                    subject,
+                )?)?,
+            }
+        }
+        ("POST", "/artifacts/read") => {
+            let input: ArtifactAccessRequest = parse_body(body)?;
+            if let Some(subject) = &input.subject {
+                require_artifact_capability(db, subject, Some(&input.id), "read")?;
+            }
+            let store = ArtifactStore::new(db, artifact_root_path(artifact_root));
+            let subject = input.subject.as_ref().map(|subject| {
+                (
+                    subject.subject_type.as_str(),
+                    subject.subject_id.as_str(),
+                    subject.permission.as_deref().unwrap_or("read"),
+                )
+            });
+            let bytes = store.read(&input.id, subject)?;
+            ApiReply {
+                status_code: 200,
+                body: json!({
+                    "artifact": db.get_artifact(&input.id)?,
+                    "content_base64": BASE64_STANDARD.encode(bytes),
+                }),
+            }
+        }
+        ("POST", "/artifacts/metadata") => {
+            let input: ArtifactAccessRequest = parse_body(body)?;
+            if let Some(subject) = &input.subject {
+                require_artifact_capability(db, subject, Some(&input.id), "read")?;
+                if !db.has_artifact_access(
+                    &input.id,
+                    &subject.subject_type,
+                    &subject.subject_id,
+                    subject.permission.as_deref().unwrap_or("read"),
+                )? {
+                    db.record_audit(sparsekernel_core::AuditInput {
+                        actor_type: Some(subject.subject_type.clone()),
+                        actor_id: Some(subject.subject_id.clone()),
+                        action: "artifact_access.denied".to_string(),
+                        object_type: Some("artifact".to_string()),
+                        object_id: Some(input.id.clone()),
+                        payload: Some(json!({ "permission": subject.permission.as_deref().unwrap_or("read") })),
+                    })?;
+                    return Err(format!("artifact access denied: {}", input.id).into());
+                }
+            }
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.get_artifact(&input.id)?)?,
+            }
+        }
         ("GET", "/audit") => ApiReply {
             status_code: 200,
             body: serde_json::to_value(db.list_audit(100)?)?,
@@ -426,6 +573,24 @@ mod tests {
             method,
             url,
             serde_json::to_string(&body).unwrap().as_bytes(),
+        )
+        .unwrap()
+        .body
+    }
+
+    fn json_call_with_artifact_root(
+        db: &mut SparseKernelDb,
+        artifact_root: &Path,
+        method: &str,
+        url: &str,
+        body: Value,
+    ) -> Value {
+        handle_api_request_with_artifact_root(
+            db,
+            method,
+            url,
+            serde_json::to_string(&body).unwrap().as_bytes(),
+            Some(artifact_root),
         )
         .unwrap()
         .body
@@ -515,5 +680,101 @@ mod tests {
             json!({ "id": capability_id }),
         );
         assert_eq!(revoked["revoked"], true);
+    }
+
+    #[test]
+    fn artifact_api_creates_reads_and_checks_access() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "artifact".to_string(),
+            resource_id: None,
+            action: "write".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let created = json_call_with_artifact_root(
+            &mut db,
+            root.path(),
+            "POST",
+            "/artifacts/create",
+            json!({
+                "content_text": "hello",
+                "mime_type": "text/plain",
+                "retention_policy": "session",
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }),
+        );
+        let artifact_id = created["id"].as_str().unwrap().to_string();
+        let read_without_capability = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/read",
+            serde_json::to_string(&json!({
+                "id": artifact_id,
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }))
+            .unwrap()
+            .as_bytes(),
+            Some(root.path()),
+        );
+        assert!(read_without_capability.is_err());
+
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "artifact".to_string(),
+            resource_id: Some(artifact_id.clone()),
+            action: "read".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        let metadata = json_call_with_artifact_root(
+            &mut db,
+            root.path(),
+            "POST",
+            "/artifacts/metadata",
+            json!({
+                "id": artifact_id,
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }),
+        );
+        assert_eq!(metadata["mime_type"], "text/plain");
+
+        let read = json_call_with_artifact_root(
+            &mut db,
+            root.path(),
+            "POST",
+            "/artifacts/read",
+            json!({
+                "id": metadata["id"],
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }),
+        );
+        let decoded = BASE64_STANDARD
+            .decode(read["content_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"hello");
     }
 }

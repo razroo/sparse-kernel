@@ -42,10 +42,10 @@ Small machines can keep many logical agents parked in durable state, but they ca
 
 ## Local API
 
-The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
+The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, artifact create/read/metadata, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
 
 The API is intentionally narrow. Agents and adapters should call the daemon or typed core APIs; they should not read or mutate the ledger with raw SQL.
 
 ## Current limitations
 
-V0 proves the foundation. It does not implement real Playwright browser process pooling, production sandbox backends, egress proxy enforcement, plugin subprocess isolation, artifact binary upload/download endpoints, or an OpenClaw-wide rewrite.
+V0 proves the foundation. It does not implement real Playwright browser process pooling, production sandbox backends, egress proxy enforcement, plugin subprocess isolation, streaming artifact transfer, or an OpenClaw-wide rewrite.

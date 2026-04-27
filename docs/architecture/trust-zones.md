@@ -1,0 +1,30 @@
+---
+summary: "SparseKernel trust zones and resource lease boundaries"
+read_when:
+  - Changing browser, sandbox, filesystem, or network trust policy
+  - Adding SparseKernel broker backends
+title: "Trust Zones"
+sidebarTitle: "Trust Zones"
+---
+
+SparseKernel leases expensive and sensitive resources by trust zone, not by logical agent.
+
+Default zones:
+
+- `public_web`
+- `authenticated_web`
+- `local_files_readonly`
+- `local_files_rw`
+- `code_execution`
+- `plugin_untrusted`
+- `user_browser_profile`
+
+Trust zones are policy labels. A trust zone can select a sandbox backend, network policy, filesystem policy, and resource budget. Logical agents request capabilities against a zone and then receive a lease for one bounded step.
+
+## Why zones instead of per-agent sandboxes
+
+Hundreds of logical agents on a 4 GB VM cannot each own a browser process or sandbox. SparseKernel parks most agents in SQLite and materializes only active work. Expensive resources are pooled by trust boundary and leased to the active task or session.
+
+## Security notes
+
+`local/no_isolation` is accounting only. It does not provide process, filesystem, network, kernel, or VM isolation. Docker, bwrap, minijail, smolvm, and VM backends must be described by their real properties when implemented.

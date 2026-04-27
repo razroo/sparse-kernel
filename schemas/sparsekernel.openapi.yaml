@@ -1,0 +1,360 @@
+openapi: 3.1.0
+info:
+  title: SparseKernel Local API
+  version: 0.1.0
+  description: Local JSON API for the SparseKernel daemon.
+servers:
+  - url: http://127.0.0.1:8765
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Daemon health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, service, version]
+                properties:
+                  ok: { type: boolean }
+                  service: { type: string }
+                  version: { type: string }
+  /status:
+    get:
+      operationId: status
+      responses:
+        "200":
+          description: Runtime ledger status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, schema_version, counts]
+                properties:
+                  path: { type: string }
+                  schema_version: { type: integer }
+                  counts:
+                    type: object
+                    additionalProperties: { type: integer }
+  /tasks:
+    get:
+      operationId: listTasks
+      responses:
+        "200":
+          description: Recent tasks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Task"
+  /tasks/enqueue:
+    post:
+      operationId: enqueueTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnqueueTaskInput"
+      responses:
+        "200":
+          description: Enqueued task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+  /tasks/claim:
+    post:
+      operationId: claimTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimTaskInput"
+      responses:
+        "200":
+          description: Claimed task or null when none are available
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Task"
+                  - type: "null"
+  /tasks/heartbeat:
+    post:
+      operationId: heartbeatTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HeartbeatTaskInput"
+      responses:
+        "200":
+          description: Heartbeat result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BooleanResult"
+  /tasks/complete:
+    post:
+      operationId: completeTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteTaskInput"
+      responses:
+        "200":
+          description: Completion result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BooleanResult"
+  /tasks/fail:
+    post:
+      operationId: failTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FailTaskInput"
+      responses:
+        "200":
+          description: Failure transition result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BooleanResult"
+  /leases/release-expired:
+    post:
+      operationId: releaseExpiredLeases
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                now: { type: string }
+      responses:
+        "200":
+          description: Expired lease release counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tasks, resources]
+                properties:
+                  tasks: { type: integer }
+                  resources: { type: integer }
+  /capabilities/grant:
+    post:
+      operationId: grantCapability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantCapabilityInput"
+      responses:
+        "200":
+          description: Granted capability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Capability"
+  /capabilities/check:
+    post:
+      operationId: checkCapability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CapabilityCheckInput"
+      responses:
+        "200":
+          description: Capability decision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed]
+                properties:
+                  allowed: { type: boolean }
+  /capabilities/revoke:
+    post:
+      operationId: revokeCapability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        "200":
+          description: Revoke result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: { type: boolean }
+  /capabilities/list:
+    post:
+      operationId: listCapabilities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject_type, subject_id]
+              properties:
+                subject_type: { type: string }
+                subject_id: { type: string }
+      responses:
+        "200":
+          description: Subject capabilities
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Capability"
+  /audit:
+    get:
+      operationId: listAudit
+      responses:
+        "200":
+          description: Recent audit events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditEvent"
+components:
+  schemas:
+    Task:
+      type: object
+      required: [id, kind, priority, status, attempts, created_at, updated_at]
+      properties:
+        id: { type: string }
+        agent_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        kind: { type: string }
+        priority: { type: integer }
+        status:
+          type: string
+          enum: [queued, running, completed, failed, cancelled]
+        lease_owner: { type: [string, "null"] }
+        lease_until: { type: [string, "null"] }
+        attempts: { type: integer }
+        result_artifact_id: { type: [string, "null"] }
+        created_at: { type: string }
+        updated_at: { type: string }
+    EnqueueTaskInput:
+      type: object
+      required: [kind]
+      properties:
+        id: { type: string }
+        agent_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        kind: { type: string }
+        priority: { type: integer, default: 0 }
+        idempotency_key: { type: [string, "null"] }
+        input: true
+    ClaimTaskInput:
+      type: object
+      required: [worker_id]
+      properties:
+        worker_id: { type: string }
+        kinds:
+          type: array
+          items: { type: string }
+        lease_seconds: { type: integer }
+    HeartbeatTaskInput:
+      type: object
+      required: [task_id, worker_id]
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        lease_seconds: { type: integer }
+    CompleteTaskInput:
+      type: object
+      required: [task_id, worker_id]
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        result_artifact_id: { type: [string, "null"] }
+    FailTaskInput:
+      type: object
+      required: [task_id, worker_id, error]
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        error: { type: string }
+    BooleanResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+    Capability:
+      type: object
+      required: [id, subject_type, subject_id, resource_type, action, created_at]
+      properties:
+        id: { type: string }
+        subject_type: { type: string }
+        subject_id: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: [string, "null"] }
+        action: { type: string }
+        constraints: true
+        expires_at: { type: [string, "null"] }
+        created_at: { type: string }
+    GrantCapabilityInput:
+      type: object
+      required: [subject_type, subject_id, resource_type, action]
+      properties:
+        subject_type: { type: string }
+        subject_id: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: [string, "null"] }
+        action: { type: string }
+        constraints: true
+        expires_at: { type: [string, "null"] }
+    CapabilityCheckInput:
+      type: object
+      required: [subject_type, subject_id, resource_type, action]
+      properties:
+        subject_type: { type: string }
+        subject_id: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: [string, "null"] }
+        action: { type: string }
+        context: true
+        audit_denied: { type: boolean }
+    AuditEvent:
+      type: object
+      required: [id, action, created_at]
+      properties:
+        id: { type: integer }
+        actor_type: { type: [string, "null"] }
+        actor_id: { type: [string, "null"] }
+        action: { type: string }
+        object_type: { type: [string, "null"] }
+        object_id: { type: [string, "null"] }
+        payload: true
+        created_at: { type: string }

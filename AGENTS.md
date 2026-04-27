@@ -24,6 +24,20 @@ Telegraph style. Root rules only. Read scoped `AGENTS.md` before subtree work.
 
 ## Architecture
 
+- SparseKernel is a local multi-agent kernel, not just a database wrapper. In OpenClaw docs/code, call this OpenClaw SparseKernel when discussing the implementation direction.
+- SparseKernel keeps many logical agents as compact durable state and materializes only the active slice through leased tools, files, browsers, and sandboxes.
+- Do not add ad hoc JSON files for runtime coordination. Use SQLite migrations for structured runtime state.
+- SQLite is the SparseKernel ledger, not a dumping ground. Store agents, sessions, transcript events, tasks, leases, tool calls, capabilities, trust zones, broker state, artifact metadata, audit logs, and usage records there.
+- Large blobs must go through the content-addressed artifact store. Do not store screenshots, videos, browser traces, downloads, PDFs, repo snapshots, or exported transcript blobs directly in SQLite by default.
+- Agents/plugins never get raw SparseKernel DB access. Route state changes through kernel APIs, SDKs, and brokers that enforce capabilities and emit audit records.
+- Expensive resources are leased by trust zone. Sandboxes are allocated by trust boundary, not by logical agent.
+- Browser processes are pooled by trust zone; browser contexts are leased by task/session/agent.
+- BrowserContext isolation is session isolation, not host isolation. Playwright route blocking is not a hard security boundary.
+- Do not disable browser sandboxing or weaken sandbox network/filesystem policy casually. If a backend provides only local/no isolation, name that explicitly in docs, status, and tests.
+- Tool calls must go through the tool broker where feasible. Sensitive tool, browser, sandbox, and artifact operations need capability checks plus audit events.
+- SparseKernel must stay usable on small VMs: bounded active workers, scarce browser/sandbox leases, compact logs, and retention policies.
+- Add tests for migrations, task leases, artifact dedupe, capability allow/deny, audit events, and broker lifecycle behavior.
+- Preserve backwards compatibility when introducing SparseKernel into existing OpenClaw runtime paths.
 - Core stays extension-agnostic. No bundled ids in core when manifest/registry/capability contracts work.
 - Runtime coordination belongs in the local kernel ledger. Prefer typed runtime DB migrations over ad hoc JSON state files for sessions, tasks, leases, tool calls, broker state, resource accounting, permissions, and audit trails.
 - SQLite is structured state only. Large screenshots, downloads, PDFs, traces, videos, HTML dumps, workspace snapshots, and exported transcripts are artifacts in a content-addressed store with DB metadata/access records.

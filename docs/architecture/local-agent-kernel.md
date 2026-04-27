@@ -8,7 +8,7 @@ title: "Local Agent Kernel"
 sidebarTitle: "Local Agent Kernel"
 ---
 
-OpenClaw is moving toward a local agent kernel: the Gateway owns runtime state transitions, brokers access to expensive or sensitive resources, and records the transitions that matter.
+OpenClaw is moving toward SparseKernel: the Gateway owns runtime state transitions, brokers access to expensive or sensitive resources, and records the transitions that matter. See [SparseKernel](/architecture/sparsekernel) for the Rust daemon and SDK direction.
 
 This is not just replacing JSON with SQLite. The runtime ledger is for structured state, coordination, leases, permissions, resource accounting, and audit trails. Large byte payloads stay out of SQLite.
 

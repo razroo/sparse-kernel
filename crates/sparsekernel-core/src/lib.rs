@@ -1,0 +1,1260 @@
+use chrono::{Duration as ChronoDuration, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::env;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use uuid::Uuid;
+
+pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 1;
+const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
+
+pub type Result<T> = std::result::Result<T, SparseKernelError>;
+
+#[derive(Debug)]
+pub enum SparseKernelError {
+    Sqlite(rusqlite::Error),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    NotFound(String),
+    Denied(String),
+    Invalid(String),
+}
+
+impl fmt::Display for SparseKernelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SparseKernelError::Sqlite(err) => write!(f, "sqlite error: {err}"),
+            SparseKernelError::Io(err) => write!(f, "io error: {err}"),
+            SparseKernelError::Json(err) => write!(f, "json error: {err}"),
+            SparseKernelError::NotFound(message) => write!(f, "not found: {message}"),
+            SparseKernelError::Denied(message) => write!(f, "denied: {message}"),
+            SparseKernelError::Invalid(message) => write!(f, "invalid: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SparseKernelError {}
+
+impl From<rusqlite::Error> for SparseKernelError {
+    fn from(value: rusqlite::Error) -> Self {
+        SparseKernelError::Sqlite(value)
+    }
+}
+
+impl From<std::io::Error> for SparseKernelError {
+    fn from(value: std::io::Error) -> Self {
+        SparseKernelError::Io(value)
+    }
+}
+
+impl From<serde_json::Error> for SparseKernelError {
+    fn from(value: serde_json::Error) -> Self {
+        SparseKernelError::Json(value)
+    }
+}
+
+fn now_iso() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn future_iso(seconds: i64) -> String {
+    (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339()
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    value.map(Value::to_string)
+}
+
+fn parse_json(raw: Option<String>) -> Option<Value> {
+    raw.and_then(|text| serde_json::from_str(&text).ok())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SparseKernelPaths {
+    pub home_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub artifact_root: PathBuf,
+}
+
+impl SparseKernelPaths {
+    pub fn from_env() -> Self {
+        let home_dir = env::var_os("SPARSEKERNEL_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("OPENCLAW_STATE_DIR")
+                    .map(|state| PathBuf::from(state).join("sparsekernel"))
+            })
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".sparsekernel")))
+            .unwrap_or_else(|| PathBuf::from(".sparsekernel"));
+        let runtime_dir = home_dir.join("runtime");
+        let db_path = runtime_dir.join("sparsekernel.sqlite");
+        let artifact_root = home_dir.join("artifacts");
+        Self {
+            home_dir,
+            runtime_dir,
+            db_path,
+            artifact_root,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DbInspect {
+    pub path: PathBuf,
+    pub schema_version: i64,
+    pub counts: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub action: String,
+    pub object_type: Option<String>,
+    pub object_id: Option<String>,
+    pub payload: Option<Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditInput {
+    pub actor_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub action: String,
+    pub object_type: Option<String>,
+    pub object_id: Option<String>,
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRecord {
+    pub id: String,
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub kind: String,
+    pub priority: i64,
+    pub status: String,
+    pub lease_owner: Option<String>,
+    pub lease_until: Option<String>,
+    pub attempts: i64,
+    pub result_artifact_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueTaskInput {
+    pub id: Option<String>,
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub kind: String,
+    pub priority: i64,
+    pub idempotency_key: Option<String>,
+    pub input: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub id: String,
+    pub sha256: String,
+    pub mime_type: Option<String>,
+    pub size_bytes: i64,
+    pub storage_ref: String,
+    pub classification: Option<String>,
+    pub retention_policy: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityRecord {
+    pub id: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub action: String,
+    pub constraints: Option<Value>,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantCapabilityInput {
+    pub subject_type: String,
+    pub subject_id: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub action: String,
+    pub constraints: Option<Value>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityCheck {
+    pub subject_type: String,
+    pub subject_id: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub action: String,
+    pub context: Option<Value>,
+    pub audit_denied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserContextRecord {
+    pub id: String,
+    pub pool_id: String,
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub profile_mode: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxAllocationRecord {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub trust_zone_id: String,
+    pub backend: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+pub struct SparseKernelDb {
+    conn: Connection,
+    path: PathBuf,
+}
+
+impl SparseKernelDb {
+    pub fn open_default() -> Result<Self> {
+        Self::open(SparseKernelPaths::from_env().db_path)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(&path)?;
+        conn.busy_timeout(Duration::from_millis(5_000))?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
+        )?;
+        let db = Self { conn, path };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    pub fn migrate(&self) -> Result<()> {
+        let current = self.schema_version()?;
+        if current >= SPARSEKERNEL_SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<()> {
+            self.conn.execute_batch(MIGRATION_0001)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                params![SPARSEKERNEL_SCHEMA_VERSION, now_iso()],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
+        }
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(0);
+        }
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn inspect(&self) -> Result<DbInspect> {
+        let tables = [
+            "agents",
+            "sessions",
+            "transcript_events",
+            "messages",
+            "tasks",
+            "task_events",
+            "tool_calls",
+            "trust_zones",
+            "network_policies",
+            "resource_leases",
+            "browser_pools",
+            "browser_contexts",
+            "artifacts",
+            "artifact_access",
+            "capabilities",
+            "audit_log",
+            "usage_records",
+        ];
+        let mut counts = BTreeMap::new();
+        for table in tables {
+            let count =
+                self.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            counts.insert(table.to_string(), count);
+        }
+        Ok(DbInspect {
+            path: self.path.clone(),
+            schema_version: self.schema_version()?,
+            counts,
+        })
+    }
+
+    pub fn record_audit(&self, input: AuditInput) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+             VALUES(?, ?, ?, ?, ?, ?, ?)",
+            params![
+                input.actor_type,
+                input.actor_id,
+                input.action,
+                input.object_type,
+                input.object_id,
+                json_text(input.payload.as_ref()),
+                now_iso(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_audit(&self, limit: i64) -> Result<Vec<AuditEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, actor_type, actor_id, action, object_type, object_id, payload_json, created_at
+             FROM audit_log ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit.max(0)], |row| {
+            Ok(AuditEvent {
+                id: row.get(0)?,
+                actor_type: row.get(1)?,
+                actor_id: row.get(2)?,
+                action: row.get(3)?,
+                object_type: row.get(4)?,
+                object_id: row.get(5)?,
+                payload: parse_json(row.get(6)?),
+                created_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn ensure_agent(&self, id: &str) -> Result<()> {
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO agents(id, status, created_at, updated_at)
+             VALUES(?, 'active', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![id, now, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_task(&self, input: EnqueueTaskInput) -> Result<TaskRecord> {
+        let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO tasks(id, agent_id, session_id, kind, priority, status, idempotency_key, input_json, created_at, updated_at)
+             VALUES(?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                id,
+                input.agent_id,
+                input.session_id,
+                input.kind,
+                input.priority,
+                input.idempotency_key,
+                json_text(input.input.as_ref()),
+                now,
+                now,
+            ],
+        )?;
+        self.record_task_event(&id, "queued", json!({ "priority": input.priority }))?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "task.created".to_string(),
+            object_type: Some("task".to_string()),
+            object_id: Some(id.clone()),
+            payload: Some(json!({ "kind": input.kind })),
+        })?;
+        self.get_task(&id)
+    }
+
+    pub fn get_task(&self, id: &str) -> Result<TaskRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, session_id, kind, priority, status, lease_owner, lease_until, attempts, result_artifact_id, created_at, updated_at
+                 FROM tasks WHERE id = ?",
+                params![id],
+                task_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("task {id}")))
+    }
+
+    pub fn list_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, kind, priority, status, lease_owner, lease_until, attempts, result_artifact_id, created_at, updated_at
+             FROM tasks ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit.max(0)], task_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn claim_next_task(
+        &mut self,
+        worker_id: &str,
+        kinds: &[String],
+        lease_seconds: i64,
+    ) -> Result<Option<TaskRecord>> {
+        let tx = self.conn.transaction()?;
+        let selected: Option<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, kind FROM tasks WHERE status = 'queued' ORDER BY priority DESC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut found = None;
+            for row in rows {
+                let (id, kind) = row?;
+                if kinds.is_empty() || kinds.iter().any(|entry| entry == &kind) {
+                    found = Some((id, kind));
+                    break;
+                }
+            }
+            found
+        };
+        let Some((id, kind)) = selected else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let now = now_iso();
+        let lease_until = future_iso(lease_seconds.max(1));
+        let updated = tx.execute(
+            "UPDATE tasks
+             SET status = 'running', lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated_at = ?
+             WHERE id = ? AND status = 'queued'",
+            params![worker_id, lease_until, now, id],
+        )?;
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO task_events(task_id, event_type, payload_json, created_at) VALUES(?, 'claimed', ?, ?)",
+            params![id, json!({ "workerId": worker_id }).to_string(), now],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+             VALUES('worker', ?, 'task.claimed', 'task', ?, ?, ?)",
+            params![worker_id, id, json!({ "kind": kind }).to_string(), now],
+        )?;
+        tx.commit()?;
+        self.get_task(&id).map(Some)
+    }
+
+    pub fn heartbeat_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        let lease_until = future_iso(lease_seconds.max(1));
+        let updated = self.conn.execute(
+            "UPDATE tasks SET lease_until = ?, updated_at = ? WHERE id = ? AND status = 'running' AND lease_owner = ?",
+            params![lease_until, now_iso(), task_id, worker_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        result_artifact_id: Option<&str>,
+    ) -> Result<bool> {
+        let now = now_iso();
+        let updated = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'completed', lease_owner = NULL, lease_until = NULL, result_artifact_id = ?, updated_at = ?
+             WHERE id = ? AND status = 'running' AND lease_owner = ?",
+            params![result_artifact_id, now, task_id, worker_id],
+        )?;
+        if updated > 0 {
+            self.record_task_event(task_id, "completed", json!({ "workerId": worker_id }))?;
+            self.record_audit(AuditInput {
+                actor_type: Some("worker".to_string()),
+                actor_id: Some(worker_id.to_string()),
+                action: "task.completed".to_string(),
+                object_type: Some("task".to_string()),
+                object_id: Some(task_id.to_string()),
+                payload: result_artifact_id.map(|id| json!({ "resultArtifactId": id })),
+            })?;
+        }
+        Ok(updated > 0)
+    }
+
+    pub fn fail_task(&self, task_id: &str, worker_id: &str, error: &str) -> Result<bool> {
+        let now = now_iso();
+        let updated = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'failed', lease_owner = NULL, lease_until = NULL, updated_at = ?
+             WHERE id = ? AND status = 'running' AND lease_owner = ?",
+            params![now, task_id, worker_id],
+        )?;
+        if updated > 0 {
+            self.record_task_event(task_id, "failed", json!({ "error": error }))?;
+            self.record_audit(AuditInput {
+                actor_type: Some("worker".to_string()),
+                actor_id: Some(worker_id.to_string()),
+                action: "task.failed".to_string(),
+                object_type: Some("task".to_string()),
+                object_id: Some(task_id.to_string()),
+                payload: Some(json!({ "error": error })),
+            })?;
+        }
+        Ok(updated > 0)
+    }
+
+    pub fn release_expired_leases(&self, now: &str) -> Result<(usize, usize)> {
+        let task_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM tasks WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until < ?")?;
+            let rows = stmt.query_map(params![now], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &task_ids {
+            self.conn.execute(
+                "UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
+                params![now, id],
+            )?;
+            self.record_task_event(id, "lease_expired", json!({}))?;
+        }
+        let resource_count = self.conn.execute(
+            "UPDATE resource_leases SET status = 'expired', updated_at = ? WHERE status = 'active' AND lease_until IS NOT NULL AND lease_until < ?",
+            params![now, now],
+        )?;
+        Ok((task_ids.len(), resource_count))
+    }
+
+    pub fn record_artifact(
+        &self,
+        sha256: &str,
+        size_bytes: i64,
+        storage_ref: &str,
+        mime_type: Option<&str>,
+        classification: Option<&str>,
+        retention_policy: Option<&str>,
+    ) -> Result<ArtifactRecord> {
+        let id = format!("artifact_{}", Uuid::new_v4());
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO artifacts(id, sha256, mime_type, size_bytes, storage_ref, classification, retention_policy, created_at)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, sha256, mime_type, size_bytes, storage_ref, classification, retention_policy, now],
+        )?;
+        let artifact = self.get_artifact_by_sha256(sha256)?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "artifact.created".to_string(),
+            object_type: Some("artifact".to_string()),
+            object_id: Some(artifact.id.clone()),
+            payload: Some(json!({ "sha256": sha256, "sizeBytes": size_bytes })),
+        })?;
+        Ok(artifact)
+    }
+
+    pub fn get_artifact(&self, id: &str) -> Result<ArtifactRecord> {
+        self.query_artifact("id", id)?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("artifact {id}")))
+    }
+
+    pub fn get_artifact_by_sha256(&self, sha256: &str) -> Result<ArtifactRecord> {
+        self.query_artifact("sha256", sha256)?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("artifact sha256 {sha256}")))
+    }
+
+    fn query_artifact(&self, column: &str, value: &str) -> Result<Option<ArtifactRecord>> {
+        self.conn
+            .query_row(
+                &format!("SELECT id, sha256, mime_type, size_bytes, storage_ref, classification, retention_policy, created_at FROM artifacts WHERE {column} = ?"),
+                params![value],
+                |row| {
+                    Ok(ArtifactRecord {
+                        id: row.get(0)?,
+                        sha256: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        size_bytes: row.get(3)?,
+                        storage_ref: row.get(4)?,
+                        classification: row.get(5)?,
+                        retention_policy: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn grant_artifact_access(
+        &self,
+        artifact_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        permission: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO artifact_access(artifact_id, subject_type, subject_id, permission, created_at)
+             VALUES(?, ?, ?, ?, ?)",
+            params![artifact_id, subject_type, subject_id, permission, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_artifact_access(
+        &self,
+        artifact_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        permission: &str,
+    ) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM artifact_access
+             WHERE artifact_id = ? AND subject_type = ? AND subject_id = ? AND permission = ?
+               AND (expires_at IS NULL OR expires_at > ?)",
+                params![artifact_id, subject_type, subject_id, permission, now_iso()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    pub fn grant_capability(&self, input: GrantCapabilityInput) -> Result<CapabilityRecord> {
+        let id = format!("cap_{}", Uuid::new_v4());
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO capabilities(id, subject_type, subject_id, resource_type, resource_id, action, constraints_json, expires_at, created_at)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                id,
+                input.subject_type,
+                input.subject_id,
+                input.resource_type,
+                input.resource_id,
+                input.action,
+                json_text(input.constraints.as_ref()),
+                input.expires_at,
+                now,
+            ],
+        )?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "capability.granted".to_string(),
+            object_type: Some("capability".to_string()),
+            object_id: Some(id.clone()),
+            payload: None,
+        })?;
+        self.get_capability(&id)
+    }
+
+    pub fn get_capability(&self, id: &str) -> Result<CapabilityRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, subject_type, subject_id, resource_type, resource_id, action, constraints_json, expires_at, created_at
+                 FROM capabilities WHERE id = ?",
+                params![id],
+                capability_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("capability {id}")))
+    }
+
+    pub fn revoke_capability(&self, id: &str) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute("DELETE FROM capabilities WHERE id = ?", params![id])?;
+        if updated > 0 {
+            self.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "capability.revoked".to_string(),
+                object_type: Some("capability".to_string()),
+                object_id: Some(id.to_string()),
+                payload: None,
+            })?;
+        }
+        Ok(updated > 0)
+    }
+
+    pub fn check_capability(&self, check: CapabilityCheck) -> Result<bool> {
+        let found: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM capabilities
+             WHERE subject_type = ? AND subject_id = ? AND resource_type = ?
+               AND (resource_id = ? OR resource_id IS NULL)
+               AND action = ? AND (expires_at IS NULL OR expires_at > ?)
+             LIMIT 1",
+                params![
+                    check.subject_type,
+                    check.subject_id,
+                    check.resource_type,
+                    check.resource_id,
+                    check.action,
+                    now_iso(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let allowed = found.is_some();
+        if !allowed && check.audit_denied {
+            self.record_audit(AuditInput {
+                actor_type: Some(check.subject_type),
+                actor_id: Some(check.subject_id),
+                action: "capability.denied".to_string(),
+                object_type: Some(check.resource_type),
+                object_id: check.resource_id,
+                payload: Some(json!({ "action": check.action, "context": check.context })),
+            })?;
+        }
+        Ok(allowed)
+    }
+
+    pub fn list_capabilities(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<Vec<CapabilityRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject_type, subject_id, resource_type, resource_id, action, constraints_json, expires_at, created_at
+             FROM capabilities WHERE subject_type = ? AND subject_id = ? ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![subject_type, subject_id], capability_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    fn record_task_event(&self, task_id: &str, event_type: &str, payload: Value) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO task_events(task_id, event_type, payload_json, created_at) VALUES(?, ?, ?, ?)",
+            params![task_id, event_type, payload.to_string(), now_iso()],
+        )?;
+        Ok(())
+    }
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
+    Ok(TaskRecord {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        session_id: row.get(2)?,
+        kind: row.get(3)?,
+        priority: row.get(4)?,
+        status: row.get(5)?,
+        lease_owner: row.get(6)?,
+        lease_until: row.get(7)?,
+        attempts: row.get(8)?,
+        result_artifact_id: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn capability_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CapabilityRecord> {
+    Ok(CapabilityRecord {
+        id: row.get(0)?,
+        subject_type: row.get(1)?,
+        subject_id: row.get(2)?,
+        resource_type: row.get(3)?,
+        resource_id: row.get(4)?,
+        action: row.get(5)?,
+        constraints: parse_json(row.get(6)?),
+        expires_at: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+pub struct ArtifactStore<'a> {
+    db: &'a SparseKernelDb,
+    root: PathBuf,
+}
+
+impl<'a> ArtifactStore<'a> {
+    pub fn new(db: &'a SparseKernelDb, root: impl AsRef<Path>) -> Self {
+        Self {
+            db,
+            root: root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn write(
+        &self,
+        bytes: &[u8],
+        mime_type: Option<&str>,
+        retention_policy: Option<&str>,
+        subject: Option<(&str, &str, &str)>,
+    ) -> Result<ArtifactRecord> {
+        let sha256 = hex_sha256(bytes);
+        let storage_ref = artifact_storage_ref(&sha256)?;
+        let storage_path = self.root.join(&storage_ref);
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !storage_path.exists() {
+            fs::write(&storage_path, bytes)?;
+        }
+        let artifact = self.db.record_artifact(
+            &sha256,
+            bytes.len() as i64,
+            &storage_ref,
+            mime_type,
+            None,
+            retention_policy,
+        )?;
+        if let Some((subject_type, subject_id, permission)) = subject {
+            self.db
+                .grant_artifact_access(&artifact.id, subject_type, subject_id, permission)?;
+        }
+        Ok(artifact)
+    }
+
+    pub fn read(&self, artifact_id: &str, subject: Option<(&str, &str, &str)>) -> Result<Vec<u8>> {
+        if let Some((subject_type, subject_id, permission)) = subject {
+            if !self
+                .db
+                .has_artifact_access(artifact_id, subject_type, subject_id, permission)?
+            {
+                self.db.record_audit(AuditInput {
+                    actor_type: Some(subject_type.to_string()),
+                    actor_id: Some(subject_id.to_string()),
+                    action: "artifact_access.denied".to_string(),
+                    object_type: Some("artifact".to_string()),
+                    object_id: Some(artifact_id.to_string()),
+                    payload: Some(json!({ "permission": permission })),
+                })?;
+                return Err(SparseKernelError::Denied(format!(
+                    "artifact access denied: {artifact_id}"
+                )));
+            }
+        }
+        let artifact = self.db.get_artifact(artifact_id)?;
+        Ok(fs::read(self.root.join(artifact.storage_ref))?)
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn artifact_storage_ref(sha256: &str) -> Result<String> {
+    if sha256.len() != 64 || !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(SparseKernelError::Invalid(format!(
+            "invalid sha256 {sha256}"
+        )));
+    }
+    Ok(format!(
+        "sha256/{}/{}/{}",
+        &sha256[0..2],
+        &sha256[2..4],
+        sha256
+    ))
+}
+
+pub trait BrowserBroker {
+    fn acquire_context(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        trust_zone_id: &str,
+        max_contexts: i64,
+    ) -> Result<BrowserContextRecord>;
+    fn release_context(&self, context_id: &str) -> Result<bool>;
+}
+
+pub struct MockBrowserBroker<'a> {
+    pub db: &'a SparseKernelDb,
+}
+
+impl BrowserBroker for MockBrowserBroker<'_> {
+    fn acquire_context(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        trust_zone_id: &str,
+        max_contexts: i64,
+    ) -> Result<BrowserContextRecord> {
+        if let Some(agent_id) = agent_id {
+            self.db.ensure_agent(agent_id)?;
+            let allowed = self.db.check_capability(CapabilityCheck {
+                subject_type: "agent".to_string(),
+                subject_id: agent_id.to_string(),
+                resource_type: "browser_context".to_string(),
+                resource_id: Some(trust_zone_id.to_string()),
+                action: "allocate".to_string(),
+                context: None,
+                audit_denied: true,
+            })?;
+            if !allowed {
+                return Err(SparseKernelError::Denied(format!(
+                    "agent {agent_id} cannot allocate browser context"
+                )));
+            }
+        }
+        let pool_id = format!("browser_pool_{trust_zone_id}");
+        let now = now_iso();
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO browser_pools(id, trust_zone_id, browser_kind, status, max_contexts, created_at, updated_at)
+             VALUES(?, ?, 'mock', 'active', ?, ?, ?)",
+            params![pool_id, trust_zone_id, max_contexts, now, now],
+        )?;
+        let active: i64 = self.db.conn.query_row(
+            "SELECT COUNT(*) FROM browser_contexts WHERE pool_id = ? AND status = 'active'",
+            params![pool_id],
+            |row| row.get(0),
+        )?;
+        if active >= max_contexts {
+            return Err(SparseKernelError::Denied(
+                "no browser contexts available".to_string(),
+            ));
+        }
+        let context_id = format!("browser_ctx_{}", Uuid::new_v4());
+        self.db.conn.execute(
+            "INSERT INTO browser_contexts(id, pool_id, agent_id, session_id, task_id, profile_mode, status, created_at)
+             VALUES(?, ?, ?, ?, ?, 'ephemeral', 'active', ?)",
+            params![context_id, pool_id, agent_id, session_id, task_id, now],
+        )?;
+        self.db.conn.execute(
+            "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, created_at, updated_at)
+             VALUES(?, 'browser_context', ?, ?, ?, ?, 'active', ?, ?)",
+            params![context_id, context_id, task_id, agent_id, trust_zone_id, now, now],
+        )?;
+        self.db.record_audit(AuditInput {
+            actor_type: agent_id.map(|_| "agent".to_string()),
+            actor_id: agent_id.map(str::to_string),
+            action: "browser_context.acquired".to_string(),
+            object_type: Some("browser_context".to_string()),
+            object_id: Some(context_id.clone()),
+            payload: Some(json!({ "trustZoneId": trust_zone_id })),
+        })?;
+        Ok(BrowserContextRecord {
+            id: context_id,
+            pool_id,
+            agent_id: agent_id.map(str::to_string),
+            session_id: session_id.map(str::to_string),
+            task_id: task_id.map(str::to_string),
+            profile_mode: "ephemeral".to_string(),
+            status: "active".to_string(),
+            created_at: now,
+        })
+    }
+
+    fn release_context(&self, context_id: &str) -> Result<bool> {
+        let now = now_iso();
+        let updated = self.db.conn.execute(
+            "UPDATE browser_contexts SET status = 'released' WHERE id = ? AND status = 'active'",
+            params![context_id],
+        )?;
+        if updated > 0 {
+            self.db.conn.execute(
+                "UPDATE resource_leases SET status = 'released', updated_at = ? WHERE resource_type = 'browser_context' AND resource_id = ?",
+                params![now, context_id],
+            )?;
+            self.db.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "browser_context.released".to_string(),
+                object_type: Some("browser_context".to_string()),
+                object_id: Some(context_id.to_string()),
+                payload: None,
+            })?;
+        }
+        Ok(updated > 0)
+    }
+}
+
+pub trait SandboxBroker {
+    fn allocate_sandbox(
+        &self,
+        agent_id: Option<&str>,
+        task_id: Option<&str>,
+        trust_zone_id: &str,
+        backend: Option<&str>,
+    ) -> Result<SandboxAllocationRecord>;
+    fn release_sandbox(&self, allocation_id: &str) -> Result<bool>;
+}
+
+pub struct LocalSandboxBroker<'a> {
+    pub db: &'a SparseKernelDb,
+}
+
+impl SandboxBroker for LocalSandboxBroker<'_> {
+    fn allocate_sandbox(
+        &self,
+        agent_id: Option<&str>,
+        task_id: Option<&str>,
+        trust_zone_id: &str,
+        backend: Option<&str>,
+    ) -> Result<SandboxAllocationRecord> {
+        if let Some(agent_id) = agent_id {
+            self.db.ensure_agent(agent_id)?;
+            let allowed = self.db.check_capability(CapabilityCheck {
+                subject_type: "agent".to_string(),
+                subject_id: agent_id.to_string(),
+                resource_type: "sandbox".to_string(),
+                resource_id: Some(trust_zone_id.to_string()),
+                action: "allocate".to_string(),
+                context: None,
+                audit_denied: true,
+            })?;
+            if !allowed {
+                return Err(SparseKernelError::Denied(format!(
+                    "agent {agent_id} cannot allocate sandbox"
+                )));
+            }
+        }
+        let allocation_id = format!("sandbox_{}", Uuid::new_v4());
+        let now = now_iso();
+        let backend = backend.unwrap_or("local/no_isolation").to_string();
+        self.db.conn.execute(
+            "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, created_at, updated_at)
+             VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?)",
+            params![allocation_id, allocation_id, task_id, agent_id, trust_zone_id, now, now],
+        )?;
+        self.db.record_audit(AuditInput {
+            actor_type: agent_id.map(|_| "agent".to_string()),
+            actor_id: agent_id.map(str::to_string),
+            action: "sandbox.allocated".to_string(),
+            object_type: Some("resource_lease".to_string()),
+            object_id: Some(allocation_id.clone()),
+            payload: Some(json!({ "trustZoneId": trust_zone_id, "backend": backend })),
+        })?;
+        Ok(SandboxAllocationRecord {
+            id: allocation_id,
+            task_id: task_id.map(str::to_string),
+            trust_zone_id: trust_zone_id.to_string(),
+            backend,
+            status: "active".to_string(),
+            created_at: now,
+        })
+    }
+
+    fn release_sandbox(&self, allocation_id: &str) -> Result<bool> {
+        let now = now_iso();
+        let updated = self.db.conn.execute(
+            "UPDATE resource_leases SET status = 'released', updated_at = ? WHERE id = ? AND resource_type = 'sandbox' AND status = 'active'",
+            params![now, allocation_id],
+        )?;
+        if updated > 0 {
+            self.db.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "sandbox.released".to_string(),
+                object_type: Some("resource_lease".to_string()),
+                object_id: Some(allocation_id.to_string()),
+                payload: None,
+            })?;
+        }
+        Ok(updated > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn temp_db() -> (tempfile::TempDir, SparseKernelDb) {
+        let dir = tempdir().expect("temp dir");
+        let db = SparseKernelDb::open(dir.path().join("runtime.sqlite")).expect("db");
+        (dir, db)
+    }
+
+    #[test]
+    fn migrates_empty_db_idempotently() {
+        let (_dir, db) = temp_db();
+        assert_eq!(db.schema_version().unwrap(), SPARSEKERNEL_SCHEMA_VERSION);
+        db.migrate().unwrap();
+        assert_eq!(db.schema_version().unwrap(), SPARSEKERNEL_SCHEMA_VERSION);
+        assert_eq!(db.inspect().unwrap().counts["trust_zones"], 7);
+    }
+
+    #[test]
+    fn task_claiming_is_atomic_and_expired_leases_recover() {
+        let (_dir, mut db) = temp_db();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("task-a".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "demo".to_string(),
+            priority: 1,
+            idempotency_key: None,
+            input: Some(json!({ "hello": true })),
+        })
+        .unwrap();
+        let claimed = db
+            .claim_next_task("worker-a", &[], 60)
+            .unwrap()
+            .expect("claimed");
+        assert_eq!(claimed.id, "task-a");
+        assert_eq!(claimed.status, "running");
+        assert!(db.claim_next_task("worker-b", &[], 60).unwrap().is_none());
+        let future = (Utc::now() + ChronoDuration::hours(1)).to_rfc3339();
+        assert_eq!(db.release_expired_leases(&future).unwrap().0, 1);
+        let reclaimed = db.claim_next_task("worker-b", &[], 60).unwrap().unwrap();
+        assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
+        assert!(db.complete_task("task-a", "worker-b", None).unwrap());
+        assert_eq!(db.get_task("task-a").unwrap().status, "completed");
+    }
+
+    #[test]
+    fn artifact_store_dedupes_and_enforces_access() {
+        let (dir, db) = temp_db();
+        let store = ArtifactStore::new(&db, dir.path().join("artifacts"));
+        let first = store
+            .write(
+                b"hello",
+                Some("text/plain"),
+                Some("session"),
+                Some(("agent", "main", "read")),
+            )
+            .unwrap();
+        let second = store
+            .write(b"hello", Some("text/plain"), Some("session"), None)
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            store
+                .read(&first.id, Some(("agent", "main", "read")))
+                .unwrap(),
+            b"hello"
+        );
+        assert!(store
+            .read(&first.id, Some(("agent", "other", "read")))
+            .is_err());
+    }
+
+    #[test]
+    fn capabilities_allow_deny_revoke_and_audit() {
+        let (_dir, db) = temp_db();
+        let check = CapabilityCheck {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "tool".to_string(),
+            resource_id: Some("exec".to_string()),
+            action: "invoke".to_string(),
+            context: None,
+            audit_denied: true,
+        };
+        assert!(!db.check_capability(check.clone()).unwrap());
+        let cap = db
+            .grant_capability(GrantCapabilityInput {
+                subject_type: "agent".to_string(),
+                subject_id: "main".to_string(),
+                resource_type: "tool".to_string(),
+                resource_id: Some("exec".to_string()),
+                action: "invoke".to_string(),
+                constraints: None,
+                expires_at: None,
+            })
+            .unwrap();
+        assert!(db.check_capability(check.clone()).unwrap());
+        assert_eq!(db.list_capabilities("agent", "main").unwrap().len(), 1);
+        assert!(db.revoke_capability(&cap.id).unwrap());
+        assert!(!db.check_capability(check).unwrap());
+        let actions: Vec<String> = db
+            .list_audit(10)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(actions.contains(&"capability.denied".to_string()));
+        assert!(actions.contains(&"capability.granted".to_string()));
+        assert!(actions.contains(&"capability.revoked".to_string()));
+    }
+
+    #[test]
+    fn mock_browser_and_sandbox_brokers_allocate_and_release() {
+        let (_dir, db) = temp_db();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "browser_context".to_string(),
+            resource_id: Some("public_web".to_string()),
+            action: "allocate".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "sandbox".to_string(),
+            resource_id: Some("code_execution".to_string()),
+            action: "allocate".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        let browser = MockBrowserBroker { db: &db };
+        let context = browser
+            .acquire_context(Some("main"), None, None, "public_web", 1)
+            .unwrap();
+        assert!(browser
+            .acquire_context(Some("main"), None, None, "public_web", 1)
+            .is_err());
+        assert!(browser.release_context(&context.id).unwrap());
+        let sandbox = LocalSandboxBroker { db: &db };
+        let allocation = sandbox
+            .allocate_sandbox(Some("main"), None, "code_execution", None)
+            .unwrap();
+        assert_eq!(allocation.backend, "local/no_isolation");
+        assert!(sandbox.release_sandbox(&allocation.id).unwrap());
+    }
+}

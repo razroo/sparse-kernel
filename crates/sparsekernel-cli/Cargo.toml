@@ -1,0 +1,23 @@
+[package]
+name = "sparsekernel-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sparsekernel-core = { path = "../sparsekernel-core" }
+tiny_http = "0.12"
+
+[[bin]]
+name = "sparsekernel"
+path = "src/bin/sparsekernel.rs"
+
+[[bin]]
+name = "sparsekerneld"
+path = "src/bin/sparsekerneld.rs"

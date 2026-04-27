@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.ai/schemas/sparsekernel.capabilities.schema.json",
+  "title": "SparseKernel Capability",
+  "type": "object",
+  "required": ["subject_type", "subject_id", "resource_type", "action"],
+  "properties": {
+    "id": { "type": "string" },
+    "subject_type": { "type": "string" },
+    "subject_id": { "type": "string" },
+    "resource_type": { "type": "string" },
+    "resource_id": { "type": ["string", "null"] },
+    "action": { "type": "string" },
+    "constraints": true,
+    "expires_at": { "type": ["string", "null"] },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}

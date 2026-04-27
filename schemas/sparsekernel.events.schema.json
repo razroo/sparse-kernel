@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.ai/schemas/sparsekernel.events.schema.json",
+  "title": "SparseKernel Event",
+  "type": "object",
+  "required": ["action", "created_at"],
+  "properties": {
+    "id": { "type": "integer" },
+    "actor_type": { "type": ["string", "null"] },
+    "actor_id": { "type": ["string", "null"] },
+    "action": { "type": "string" },
+    "object_type": { "type": ["string", "null"] },
+    "object_id": { "type": ["string", "null"] },
+    "payload": true,
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

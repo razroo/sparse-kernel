@@ -1,0 +1,182 @@
+import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
+import { parseModelRef } from "../../agents/model-selection.js";
+import type { RuntimeEnv } from "../../runtime.js";
+import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
+import { resolveConfiguredEntries } from "./list.configured.js";
+import { formatErrorWithStack } from "./list.errors.js";
+import { printModelTable } from "./list.table.js";
+import type { ModelRow } from "./list.types.js";
+import { loadModelsConfigWithSource } from "./load-config.js";
+import { DEFAULT_PROVIDER, ensureFlagCompatibility } from "./shared.js";
+
+const DISPLAY_MODEL_PARSE_OPTIONS = { allowPluginNormalization: false } as const;
+
+type RegistryLoadModule = typeof import("./list.registry-load.js");
+type RowSourcesModule = typeof import("./list.row-sources.js");
+type SourcePlanModule = typeof import("./list.source-plan.js");
+
+let registryLoadModulePromise: Promise<RegistryLoadModule> | undefined;
+let rowSourcesModulePromise: Promise<RowSourcesModule> | undefined;
+let sourcePlanModulePromise: Promise<SourcePlanModule> | undefined;
+
+function loadRegistryLoadModule(): Promise<RegistryLoadModule> {
+  registryLoadModulePromise ??= import("./list.registry-load.js");
+  return registryLoadModulePromise;
+}
+
+function loadRowSourcesModule(): Promise<RowSourcesModule> {
+  rowSourcesModulePromise ??= import("./list.row-sources.js");
+  return rowSourcesModulePromise;
+}
+
+function loadSourcePlanModule(): Promise<SourcePlanModule> {
+  sourcePlanModulePromise ??= import("./list.source-plan.js");
+  return sourcePlanModulePromise;
+}
+
+export async function modelsListCommand(
+  opts: {
+    all?: boolean;
+    local?: boolean;
+    provider?: string;
+    json?: boolean;
+    plain?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  ensureFlagCompatibility(opts);
+  const providerFilter = (() => {
+    const raw = opts.provider?.trim();
+    if (!raw) {
+      return undefined;
+    }
+    if (/\s/u.test(raw)) {
+      runtime.error(
+        `Invalid provider filter "${raw}". Use a provider id such as "moonshot", not a display label.`,
+      );
+      process.exitCode = 1;
+      return null;
+    }
+    const parsed = parseModelRef(`${raw}/_`, DEFAULT_PROVIDER, DISPLAY_MODEL_PARSE_OPTIONS);
+    return parsed?.provider ?? normalizeLowercaseStringOrEmpty(raw);
+  })();
+  if (providerFilter === null) {
+    return;
+  }
+  const [{ loadAuthProfileStoreWithoutExternalProfiles }, { resolveOpenClawAgentDir }] =
+    await Promise.all([
+      import("../../agents/auth-profiles/store.js"),
+      import("../../agents/agent-paths.js"),
+    ]);
+  const { resolvedConfig: cfg } = await loadModelsConfigWithSource({
+    commandName: "models list",
+    runtime,
+  });
+  const authStore = loadAuthProfileStoreWithoutExternalProfiles();
+  const agentDir = resolveOpenClawAgentDir();
+
+  let modelRegistry: ModelRegistry | undefined;
+  let discoveredKeys = new Set<string>();
+  let availableKeys: Set<string> | undefined;
+  let availabilityErrorMessage: string | undefined;
+  const { entries } = resolveConfiguredEntries(cfg);
+  const configuredByKey = new Map(entries.map((entry) => [entry.key, entry]));
+  const sourcePlanModule = opts.all ? await loadSourcePlanModule() : undefined;
+  const sourcePlan = sourcePlanModule
+    ? await sourcePlanModule.planAllModelListSources({
+        all: opts.all,
+        providerFilter,
+        cfg,
+      })
+    : undefined;
+  const shouldLoadRegistry = sourcePlan?.requiresInitialRegistry ?? false;
+  const loadRegistryState = async () => {
+    const { loadListModelRegistry } = await loadRegistryLoadModule();
+    const loaded = await loadListModelRegistry(cfg, { providerFilter });
+    modelRegistry = loaded.registry;
+    discoveredKeys = loaded.discoveredKeys;
+    availableKeys = loaded.availableKeys;
+    availabilityErrorMessage = loaded.availabilityErrorMessage;
+  };
+  try {
+    if (shouldLoadRegistry) {
+      await loadRegistryState();
+    } else if (!opts.all && opts.local) {
+      const { loadConfiguredListModelRegistry } = await loadRegistryLoadModule();
+      const loaded = loadConfiguredListModelRegistry(cfg, entries, { providerFilter });
+      modelRegistry = loaded.registry;
+      discoveredKeys = loaded.discoveredKeys;
+      availableKeys = loaded.availableKeys;
+    }
+  } catch (err) {
+    runtime.error(`Model registry unavailable:\n${formatErrorWithStack(err)}`);
+    process.exitCode = 1;
+    return;
+  }
+  const buildRowContext = (skipRuntimeModelSuppression: boolean) => ({
+    cfg,
+    agentDir,
+    authStore,
+    availableKeys,
+    configuredByKey,
+    discoveredKeys,
+    filter: {
+      provider: providerFilter,
+      local: opts.local,
+    },
+    skipRuntimeModelSuppression,
+  });
+  const rows: ModelRow[] = [];
+
+  if (opts.all) {
+    const { appendAllModelRowSources } = await loadRowSourcesModule();
+    if (!sourcePlan || !sourcePlanModule) {
+      throw new Error("models list source plan was not initialized");
+    }
+    let rowContext = buildRowContext(sourcePlan.skipRuntimeModelSuppression);
+    const initialAppend = await appendAllModelRowSources({
+      rows,
+      context: rowContext,
+      modelRegistry,
+      sourcePlan,
+    });
+    if (initialAppend.requiresRegistryFallback) {
+      try {
+        await loadRegistryState();
+      } catch (err) {
+        runtime.error(`Model registry unavailable:\n${formatErrorWithStack(err)}`);
+        process.exitCode = 1;
+        return;
+      }
+      rows.length = 0;
+      rowContext = buildRowContext(false);
+      await appendAllModelRowSources({
+        rows,
+        context: rowContext,
+        modelRegistry,
+        sourcePlan: sourcePlanModule.createRegistryModelListSourcePlan(),
+      });
+    }
+  } else {
+    const { appendConfiguredModelRowSources } = await loadRowSourcesModule();
+    await appendConfiguredModelRowSources({
+      rows,
+      entries,
+      modelRegistry,
+      context: buildRowContext(!modelRegistry),
+    });
+  }
+
+  if (availabilityErrorMessage !== undefined) {
+    runtime.error(
+      `Model availability lookup failed; falling back to auth heuristics for discovered models: ${availabilityErrorMessage}`,
+    );
+  }
+
+  if (rows.length === 0) {
+    runtime.log("No models found.");
+    return;
+  }
+
+  printModelTable(rows, runtime, opts);
+}

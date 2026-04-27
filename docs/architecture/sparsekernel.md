@@ -42,10 +42,12 @@ Small machines can keep many logical agents parked in durable state, but they ca
 
 ## Local API
 
-The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, artifact create/read/metadata, mock browser context acquire/release/list, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
+The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
 
 The API is intentionally narrow. Agents and adapters should call the daemon or typed core APIs; they should not read or mutate the ledger with raw SQL.
 
+The browser broker can now register an existing local CDP endpoint on a trust-zone pool and probe `/json/version` to verify the browser process is reachable. That is a local integration seam, not agent authority: agents receive leases and context ids, not raw CDP endpoints.
+
 ## Current limitations
 
-V0 proves the foundation. It does not implement real Playwright browser process pooling, production sandbox backends, egress proxy enforcement, plugin subprocess isolation, streaming artifact transfer, or an OpenClaw-wide rewrite.
+V0 proves the foundation. It does not launch or supervise Playwright browser process pools, create real Playwright contexts, implement production sandbox backends, enforce an egress proxy, isolate plugins in subprocesses, stream large artifact transfers, or rewrite OpenClaw around SparseKernel.

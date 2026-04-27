@@ -98,12 +98,22 @@ export type SparseKernelBrowserPool = {
   updated_at: string;
 };
 
+export type SparseKernelBrowserEndpointProbe = {
+  endpoint: string;
+  reachable: boolean;
+  status_code?: number | null;
+  browser?: string | null;
+  web_socket_debugger_url?: string | null;
+  error?: string | null;
+};
+
 export type SparseKernelAcquireBrowserContextInput = {
   agent_id?: string | null;
   session_id?: string | null;
   task_id?: string | null;
   trust_zone_id: string;
   max_contexts?: number;
+  cdp_endpoint?: string | null;
 };
 
 export type SparseKernelEnqueueTaskInput = {
@@ -226,6 +236,12 @@ export class SparseKernelClient {
 
   async browserPools(): Promise<SparseKernelBrowserPool[]> {
     return await this.getJson<SparseKernelBrowserPool[]>("/browser/pools");
+  }
+
+  async probeBrowserPool(input: {
+    cdp_endpoint: string;
+  }): Promise<SparseKernelBrowserEndpointProbe> {
+    return await this.postJson<SparseKernelBrowserEndpointProbe>("/browser/pools/probe", input);
   }
 
   async acquireBrowserContext(

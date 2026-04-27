@@ -156,10 +156,27 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/BrowserPool"
+  /browser/pools/probe:
+    post:
+      operationId: probeBrowserPool
+      description: Probe a loopback-only CDP endpoint with `/json/version` without exposing raw CDP to agents.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProbeBrowserPoolInput"
+      responses:
+        "200":
+          description: CDP endpoint probe result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowserEndpointProbe"
   /browser/contexts/acquire:
     post:
       operationId: acquireBrowserContext
-      description: Acquire a mock v0 browser context from a trust-zone-keyed pool.
+      description: Acquire a v0 browser context lease from a trust-zone-keyed pool. A loopback CDP endpoint may be registered for the pool, but raw CDP is not returned to agents.
       requestBody:
         required: true
         content:
@@ -454,6 +471,23 @@ components:
         cdp_endpoint: { type: [string, "null"] }
         created_at: { type: string }
         updated_at: { type: string }
+    BrowserEndpointProbe:
+      type: object
+      required: [endpoint, reachable]
+      properties:
+        endpoint: { type: string }
+        reachable: { type: boolean }
+        status_code: { type: [integer, "null"] }
+        browser: { type: [string, "null"] }
+        web_socket_debugger_url: { type: [string, "null"] }
+        error: { type: [string, "null"] }
+    ProbeBrowserPoolInput:
+      type: object
+      required: [cdp_endpoint]
+      properties:
+        cdp_endpoint:
+          type: string
+          description: Loopback `http://` CDP endpoint, for example `http://127.0.0.1:9222`.
     AcquireBrowserContextInput:
       type: object
       required: [trust_zone_id]
@@ -463,6 +497,7 @@ components:
         task_id: { type: [string, "null"] }
         trust_zone_id: { type: string }
         max_contexts: { type: integer }
+        cdp_endpoint: { type: [string, "null"] }
     Capability:
       type: object
       required: [id, subject_type, subject_id, resource_type, action, created_at]

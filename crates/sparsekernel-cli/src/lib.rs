@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
-    ArtifactStore, BrowserBroker, CapabilityCheck, EnqueueTaskInput, GrantCapabilityInput,
-    MockBrowserBroker, SparseKernelDb, SparseKernelPaths,
+    probe_browser_endpoint, ArtifactStore, AuditInput, BrowserBroker, CapabilityCheck,
+    EnqueueTaskInput, GrantCapabilityInput, MockBrowserBroker, SparseKernelDb, SparseKernelPaths,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
@@ -259,11 +259,17 @@ struct AcquireBrowserContextRequest {
     task_id: Option<String>,
     trust_zone_id: String,
     max_contexts: Option<i64>,
+    cdp_endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReleaseBrowserContextRequest {
     context_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeBrowserPoolRequest {
+    cdp_endpoint: String,
 }
 
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Box<dyn Error>> {
@@ -376,6 +382,26 @@ pub fn handle_api_request_with_artifact_root(
             status_code: 200,
             body: serde_json::to_value(db.list_browser_pools()?)?,
         },
+        ("POST", "/browser/pools/probe") => {
+            let input: ProbeBrowserPoolRequest = parse_body(body)?;
+            let probe = probe_browser_endpoint(&input.cdp_endpoint);
+            db.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "browser_pool.probed".to_string(),
+                object_type: Some("browser_pool".to_string()),
+                object_id: None,
+                payload: Some(json!({
+                    "reachable": probe.reachable,
+                    "statusCode": probe.status_code,
+                    "loopbackOnly": true
+                })),
+            })?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(probe)?,
+            }
+        }
         ("POST", "/browser/contexts/acquire") => {
             let input: AcquireBrowserContextRequest = parse_body(body)?;
             let broker = MockBrowserBroker { db };
@@ -387,6 +413,7 @@ pub fn handle_api_request_with_artifact_root(
                     input.task_id.as_deref(),
                     &input.trust_zone_id,
                     input.max_contexts.unwrap_or(2),
+                    input.cdp_endpoint.as_deref(),
                 )?)?,
             }
         }
@@ -610,6 +637,9 @@ fn json_response_with_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn json_call(db: &mut SparseKernelDb, method: &str, url: &str, body: Value) -> Value {
         handle_api_request(
@@ -759,6 +789,7 @@ mod tests {
                 "task_id": "task-a",
                 "trust_zone_id": "public_web",
                 "max_contexts": 1,
+                "cdp_endpoint": "http://127.0.0.1:9222",
             }),
         );
         let context_id = context["id"].as_str().unwrap().to_string();
@@ -787,6 +818,8 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(pools[0]["trust_zone_id"], "public_web");
+        assert_eq!(pools[0]["browser_kind"], "cdp");
+        assert_eq!(pools[0]["cdp_endpoint"], "http://127.0.0.1:9222");
 
         let released = json_call(
             &mut db,
@@ -799,6 +832,38 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(contexts[0]["status"], "released");
+    }
+
+    #[test]
+    fn browser_probe_api_checks_loopback_cdp_endpoint() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"Browser":"Chrome/123.0","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/test"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let probe = json_call(
+            &mut db,
+            "POST",
+            "/browser/pools/probe",
+            json!({ "cdp_endpoint": format!("http://{addr}") }),
+        );
+        server.join().unwrap();
+
+        assert_eq!(probe["reachable"], true);
+        assert_eq!(probe["browser"], "Chrome/123.0");
+        assert_eq!(probe["status_code"], 200);
+        assert_eq!(db.list_audit(1).unwrap()[0].action, "browser_pool.probed");
     }
 
     #[test]

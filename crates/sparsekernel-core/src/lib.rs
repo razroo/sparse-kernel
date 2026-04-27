@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -230,6 +232,16 @@ pub struct BrowserPoolRecord {
     pub cdp_endpoint: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserEndpointProbe {
+    pub endpoint: String,
+    pub reachable: bool,
+    pub status_code: Option<u16>,
+    pub browser: Option<String>,
+    pub web_socket_debugger_url: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -963,6 +975,194 @@ fn artifact_storage_ref(sha256: &str) -> Result<String> {
     ))
 }
 
+#[derive(Debug, Clone)]
+struct LoopbackHttpEndpoint {
+    authority: String,
+    host: String,
+    port: u16,
+}
+
+fn parse_loopback_http_endpoint(
+    endpoint: &str,
+) -> std::result::Result<LoopbackHttpEndpoint, String> {
+    let endpoint = endpoint.trim();
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        return Err("only http:// loopback CDP endpoints are supported".to_string());
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err("CDP endpoint host is required".to_string());
+    }
+    if authority.contains('@') {
+        return Err("credentials in CDP endpoint URLs are not supported".to_string());
+    }
+
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let (host, suffix) = stripped
+            .split_once(']')
+            .ok_or_else(|| "invalid IPv6 CDP endpoint".to_string())?;
+        let port = suffix
+            .strip_prefix(':')
+            .map(parse_port)
+            .transpose()?
+            .unwrap_or(80);
+        (host.to_string(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || port.is_empty() {
+            return Err("CDP endpoint host and port are required".to_string());
+        }
+        (host.to_string(), parse_port(port)?)
+    } else {
+        (authority.to_string(), 80)
+    };
+
+    let normalized = host.to_ascii_lowercase();
+    if normalized != "localhost" && normalized != "127.0.0.1" && normalized != "::1" {
+        return Err("CDP endpoint must be loopback (localhost, 127.0.0.1, or [::1])".to_string());
+    }
+
+    Ok(LoopbackHttpEndpoint {
+        authority: authority.to_string(),
+        host,
+        port,
+    })
+}
+
+fn parse_port(raw: &str) -> std::result::Result<u16, String> {
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| format!("invalid CDP endpoint port: {raw}"))?;
+    if port == 0 {
+        return Err("CDP endpoint port must be nonzero".to_string());
+    }
+    Ok(port)
+}
+
+fn validate_browser_cdp_endpoint(endpoint: &str) -> Result<()> {
+    parse_loopback_http_endpoint(endpoint)
+        .map(|_| ())
+        .map_err(SparseKernelError::Invalid)
+}
+
+pub fn probe_browser_endpoint(endpoint: &str) -> BrowserEndpointProbe {
+    let parsed = match parse_loopback_http_endpoint(endpoint) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return BrowserEndpointProbe {
+                endpoint: endpoint.to_string(),
+                reachable: false,
+                status_code: None,
+                browser: None,
+                web_socket_debugger_url: None,
+                error: Some(error),
+            };
+        }
+    };
+
+    match probe_loopback_http_endpoint(&parsed) {
+        Ok((status_code, body)) => {
+            let mut probe = BrowserEndpointProbe {
+                endpoint: endpoint.to_string(),
+                reachable: (200..300).contains(&status_code),
+                status_code: Some(status_code),
+                browser: None,
+                web_socket_debugger_url: None,
+                error: None,
+            };
+            if !probe.reachable {
+                probe.error = Some(format!("CDP endpoint returned HTTP {status_code}"));
+                return probe;
+            }
+            match serde_json::from_str::<Value>(&body) {
+                Ok(value) => {
+                    probe.browser = value
+                        .get("Browser")
+                        .or_else(|| value.get("browser"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    probe.web_socket_debugger_url = value
+                        .get("webSocketDebuggerUrl")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    probe
+                }
+                Err(err) => BrowserEndpointProbe {
+                    endpoint: endpoint.to_string(),
+                    reachable: false,
+                    status_code: Some(status_code),
+                    browser: None,
+                    web_socket_debugger_url: None,
+                    error: Some(format!("invalid CDP version JSON: {err}")),
+                },
+            }
+        }
+        Err(error) => BrowserEndpointProbe {
+            endpoint: endpoint.to_string(),
+            reachable: false,
+            status_code: None,
+            browser: None,
+            web_socket_debugger_url: None,
+            error: Some(error),
+        },
+    }
+}
+
+fn probe_loopback_http_endpoint(
+    endpoint: &LoopbackHttpEndpoint,
+) -> std::result::Result<(u16, String), String> {
+    let timeout = Duration::from_millis(1_500);
+    let addrs = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .map_err(|err| format!("failed to resolve CDP endpoint: {err}"))?;
+    let mut last_error = None;
+    for addr in addrs {
+        if !addr.ip().is_loopback() {
+            continue;
+        }
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .map_err(|err| format!("failed to set read timeout: {err}"))?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .map_err(|err| format!("failed to set write timeout: {err}"))?;
+                let request = format!(
+                    "GET /json/version HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+                    endpoint.authority
+                );
+                stream
+                    .write_all(request.as_bytes())
+                    .map_err(|err| format!("failed to write CDP probe: {err}"))?;
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .map_err(|err| format!("failed to read CDP probe: {err}"))?;
+                return parse_http_response(&response);
+            }
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "no loopback address resolved for CDP endpoint".to_string()))
+}
+
+fn parse_http_response(response: &str) -> std::result::Result<(u16, String), String> {
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "invalid HTTP response from CDP endpoint".to_string())?;
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| "missing HTTP status line from CDP endpoint".to_string())?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "missing HTTP status code from CDP endpoint".to_string())?
+        .parse::<u16>()
+        .map_err(|_| "invalid HTTP status code from CDP endpoint".to_string())?;
+    Ok((status_code, body.to_string()))
+}
+
 pub trait BrowserBroker {
     fn acquire_context(
         &self,
@@ -971,6 +1171,7 @@ pub trait BrowserBroker {
         task_id: Option<&str>,
         trust_zone_id: &str,
         max_contexts: i64,
+        cdp_endpoint: Option<&str>,
     ) -> Result<BrowserContextRecord>;
     fn release_context(&self, context_id: &str) -> Result<bool>;
 }
@@ -987,7 +1188,11 @@ impl BrowserBroker for MockBrowserBroker<'_> {
         task_id: Option<&str>,
         trust_zone_id: &str,
         max_contexts: i64,
+        cdp_endpoint: Option<&str>,
     ) -> Result<BrowserContextRecord> {
+        if let Some(endpoint) = cdp_endpoint {
+            validate_browser_cdp_endpoint(endpoint)?;
+        }
         if let Some(agent_id) = agent_id {
             self.db.ensure_agent(agent_id)?;
             let allowed = self.db.check_capability(CapabilityCheck {
@@ -1007,10 +1212,23 @@ impl BrowserBroker for MockBrowserBroker<'_> {
         }
         let pool_id = format!("browser_pool_{trust_zone_id}");
         let now = now_iso();
+        let browser_kind = if cdp_endpoint.is_some() {
+            "cdp"
+        } else {
+            "mock"
+        };
         self.db.conn.execute(
-            "INSERT OR IGNORE INTO browser_pools(id, trust_zone_id, browser_kind, status, max_contexts, created_at, updated_at)
-             VALUES(?, ?, 'mock', 'active', ?, ?, ?)",
-            params![pool_id, trust_zone_id, max_contexts, now, now],
+            "INSERT INTO browser_pools(id, trust_zone_id, browser_kind, status, max_contexts, cdp_endpoint, created_at, updated_at)
+             VALUES(?, ?, ?, 'active', ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               browser_kind = CASE
+                 WHEN excluded.cdp_endpoint IS NOT NULL THEN excluded.browser_kind
+                 ELSE browser_pools.browser_kind
+               END,
+               max_contexts = excluded.max_contexts,
+               cdp_endpoint = COALESCE(excluded.cdp_endpoint, browser_pools.cdp_endpoint),
+               updated_at = excluded.updated_at",
+            params![pool_id, trust_zone_id, browser_kind, max_contexts, cdp_endpoint, now, now],
         )?;
         let active: i64 = self.db.conn.query_row(
             "SELECT COUNT(*) FROM browser_contexts WHERE pool_id = ? AND status = 'active'",
@@ -1039,7 +1257,11 @@ impl BrowserBroker for MockBrowserBroker<'_> {
             action: "browser_context.acquired".to_string(),
             object_type: Some("browser_context".to_string()),
             object_id: Some(context_id.clone()),
-            payload: Some(json!({ "trustZoneId": trust_zone_id })),
+            payload: Some(json!({
+                "trustZoneId": trust_zone_id,
+                "browserKind": browser_kind,
+                "cdpEndpointConfigured": cdp_endpoint.is_some()
+            })),
         })?;
         Ok(BrowserContextRecord {
             id: context_id,
@@ -1166,6 +1388,9 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
     use tempfile::tempdir;
 
     fn temp_db() -> (tempfile::TempDir, SparseKernelDb) {
@@ -1278,6 +1503,42 @@ mod tests {
     }
 
     #[test]
+    fn browser_endpoint_probe_reads_loopback_cdp_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"Browser":"Chrome/123.0","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/test"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let probe = probe_browser_endpoint(&format!("http://{addr}"));
+        server.join().unwrap();
+
+        assert!(probe.reachable);
+        assert_eq!(probe.status_code, Some(200));
+        assert_eq!(probe.browser.as_deref(), Some("Chrome/123.0"));
+        assert_eq!(
+            probe.web_socket_debugger_url.as_deref(),
+            Some("ws://127.0.0.1/devtools/browser/test")
+        );
+    }
+
+    #[test]
+    fn browser_endpoint_probe_rejects_non_loopback_cdp() {
+        let probe = probe_browser_endpoint("http://10.0.0.8:9222");
+        assert!(!probe.reachable);
+        assert!(probe.error.unwrap().contains("loopback"));
+    }
+
+    #[test]
     fn mock_browser_and_sandbox_brokers_allocate_and_release() {
         let (_dir, db) = temp_db();
         db.grant_capability(GrantCapabilityInput {
@@ -1302,10 +1563,23 @@ mod tests {
         .unwrap();
         let browser = MockBrowserBroker { db: &db };
         let context = browser
-            .acquire_context(Some("main"), None, None, "public_web", 1)
+            .acquire_context(
+                Some("main"),
+                None,
+                None,
+                "public_web",
+                1,
+                Some("http://127.0.0.1:9222"),
+            )
             .unwrap();
+        let pools = db.list_browser_pools().unwrap();
+        assert_eq!(pools[0].browser_kind, "cdp");
+        assert_eq!(
+            pools[0].cdp_endpoint.as_deref(),
+            Some("http://127.0.0.1:9222")
+        );
         assert!(browser
-            .acquire_context(Some("main"), None, None, "public_web", 1)
+            .acquire_context(Some("main"), None, None, "public_web", 1, None)
             .is_err());
         assert!(browser.release_context(&context.id).unwrap());
         let sandbox = LocalSandboxBroker { db: &db };

@@ -308,6 +308,52 @@ describe("session store lock (Promise chain mutex)", () => {
     writeSpy.mockRestore();
   });
 
+  it("treats SQLite as primary in strict runtime session-store mode", async () => {
+    const key = "agent:main:sqlite-primary";
+    const { dir, storePath } = await makeTmpStore({
+      [key]: { sessionId: "s-sqlite", updatedAt: Date.now() },
+    });
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const previousMode = process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+    process.env.OPENCLAW_STATE_DIR = path.join(dir, "state");
+    process.env.OPENCLAW_RUNTIME_SESSION_STORE = "sqlite";
+    const writeSpy = vi
+      .spyOn(jsonFiles, "writeTextAtomic")
+      .mockRejectedValueOnce(new Error("legacy file unavailable"));
+    try {
+      await updateSessionStore(
+        storePath,
+        (store) => {
+          store[key] = {
+            ...store[key],
+            modelOverride: "gpt-5.4",
+          } as SessionEntry;
+        },
+        { skipMaintenance: true },
+      );
+
+      expect(writeSpy).toHaveBeenCalled();
+      expect(loadSessionStore(storePath, { skipCache: true })[key]?.modelOverride).toBe("gpt-5.4");
+      const legacyStore = JSON.parse(await fsPromises.readFile(storePath, "utf-8")) as Record<
+        string,
+        SessionEntry
+      >;
+      expect(legacyStore[key]?.modelOverride).toBeUndefined();
+    } finally {
+      writeSpy.mockRestore();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      if (previousMode === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SESSION_STORE = previousMode;
+      }
+    }
+  });
+
   it("multiple consecutive errors do not permanently poison the queue", async () => {
     const key = "agent:main:multi-err";
     const { storePath } = await makeTmpStore({

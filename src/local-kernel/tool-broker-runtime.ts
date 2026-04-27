@@ -10,6 +10,8 @@ export type BrokerToolsForRunInput = {
   runId?: string;
   taskId?: string;
   dbPath?: string;
+  artifactRootDir?: string;
+  outputArtifactThresholdBytes?: number;
   env?: NodeJS.ProcessEnv;
 };
 
@@ -87,7 +89,11 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): BrokeredToolsF
         }
       }
     }
-    const broker = new CapabilityToolBroker(db);
+    const broker = new CapabilityToolBroker(db, {
+      artifactRootDir: input.artifactRootDir,
+      outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
+      env: input.env,
+    });
     return {
       tools: broker.wrapTools(input.tools, {
         agentId: input.agentId,

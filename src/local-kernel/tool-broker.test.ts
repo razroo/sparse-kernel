@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import type { AnyAgentTool } from "../agents/tools/common.js";
@@ -63,6 +66,62 @@ describe("CapabilityToolBroker", () => {
       expect(row.status).toBe("succeeded");
     } finally {
       db.close();
+    }
+  });
+
+  it("artifactizes large tool outputs in the ledger without changing the tool result", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-tool-broker-"));
+    const db = new LocalKernelDatabase({ dbPath: path.join(root, "runtime.sqlite") });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "sensitive_tool",
+        action: "invoke",
+      });
+      const largeText = "x".repeat(256);
+      const broker = new CapabilityToolBroker(db, {
+        artifactRootDir: path.join(root, "artifacts"),
+        outputArtifactThresholdBytes: 64,
+      });
+      const tool = broker.wrapTool(
+        {
+          ...makeTool(),
+          execute: async () => ({ content: [{ type: "text", text: largeText }], details: {} }),
+        },
+        {
+          subject: { subjectType: "agent", subjectId: "main" },
+          agentId: "main",
+        },
+      );
+      await expect(tool.execute("call-large", {})).resolves.toEqual({
+        content: [{ type: "text", text: largeText }],
+        details: {},
+      });
+      const row = db.db
+        .prepare("SELECT output_json FROM tool_calls WHERE id = ?")
+        .get("call-large") as { output_json: string };
+      const output = JSON.parse(row.output_json) as {
+        type: string;
+        artifactType: string;
+        artifactId: string;
+      };
+      expect(output).toMatchObject({ type: "artifact_ref", artifactType: "tool_output" });
+      const artifact = db.getArtifact(output.artifactId);
+      expect(artifact).toMatchObject({
+        mimeType: "application/json",
+        classification: "tool_output",
+        retentionPolicy: "debug",
+      });
+      const audit = db.db
+        .prepare("SELECT action FROM audit_log WHERE action = ?")
+        .get("tool_call.output_artifactized") as { action: string } | undefined;
+      expect(audit?.action).toBe("tool_call.output_artifactized");
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

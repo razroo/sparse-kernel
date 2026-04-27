@@ -58,6 +58,57 @@ export function resolveRuntimeSessionStoreMode(
   return "dual";
 }
 
+export function isRuntimeSessionStorePrimary(env: NodeJS.ProcessEnv = process.env): boolean {
+  return resolveRuntimeSessionStoreMode(env) === "sqlite";
+}
+
+function buildSessionStoreLedgerEntries(params: {
+  storePath: string;
+  store: Record<string, SessionEntry>;
+}) {
+  const storePath = path.resolve(params.storePath);
+  const defaultAgentId = inferAgentIdFromStorePath(storePath);
+  return Object.entries(params.store).flatMap(([sessionKey, entry]) => {
+    if (!entry?.sessionId) {
+      return [];
+    }
+    const agentId = defaultAgentId;
+    return [
+      {
+        sessionKey,
+        sessionId: entry.sessionId,
+        agentId,
+        entry,
+        channel: entry.lastChannel ?? entry.channel,
+        status: inferSessionStatus(entry),
+        currentTokenCount: entry.totalTokens ?? entry.contextTokens ?? 0,
+        lastActivityAt: dateFromEpochMs(entry.lastInteractionAt ?? entry.updatedAt),
+        createdAt: dateFromEpochMs(entry.sessionStartedAt ?? entry.startedAt),
+        updatedAt: dateFromEpochMs(entry.updatedAt),
+      },
+    ];
+  });
+}
+
+export function persistSessionStoreToRuntimeLedger(params: {
+  storePath: string;
+  store: Record<string, SessionEntry>;
+  env?: NodeJS.ProcessEnv;
+}): void {
+  const env = params.env ?? process.env;
+  const storePath = path.resolve(params.storePath);
+  const entries = buildSessionStoreLedgerEntries({
+    storePath,
+    store: params.store,
+  });
+  const db = openLocalKernelDatabase({ env });
+  try {
+    db.replaceSessionEntriesForStore({ storePath, entries });
+  } finally {
+    db.close();
+  }
+}
+
 export function loadSessionStoreFromRuntimeLedger(
   storePath: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -84,37 +135,17 @@ export function mirrorSessionStoreToRuntimeLedger(params: {
   if (mode === "off") {
     return;
   }
-  const storePath = path.resolve(params.storePath);
-  const defaultAgentId = inferAgentIdFromStorePath(storePath);
-  const entries = Object.entries(params.store).flatMap(([sessionKey, entry]) => {
-    if (!entry?.sessionId) {
-      return [];
-    }
-    const agentId = defaultAgentId;
-    return [
-      {
-        sessionKey,
-        sessionId: entry.sessionId,
-        agentId,
-        entry,
-        channel: entry.lastChannel ?? entry.channel,
-        status: inferSessionStatus(entry),
-        currentTokenCount: entry.totalTokens ?? entry.contextTokens ?? 0,
-        lastActivityAt: dateFromEpochMs(entry.lastInteractionAt ?? entry.updatedAt),
-        createdAt: dateFromEpochMs(entry.sessionStartedAt ?? entry.startedAt),
-        updatedAt: dateFromEpochMs(entry.updatedAt),
-      },
-    ];
-  });
-
-  let db: ReturnType<typeof openLocalKernelDatabase> | undefined;
   try {
-    db = openLocalKernelDatabase({ env });
-    db.replaceSessionEntriesForStore({ storePath, entries });
+    persistSessionStoreToRuntimeLedger({
+      storePath: params.storePath,
+      store: params.store,
+      env,
+    });
   } catch (err) {
     if (mode === "sqlite") {
       throw err;
     }
+    const storePath = path.resolve(params.storePath);
     const warningKey = `${storePath}:${err instanceof Error ? err.message : String(err)}`;
     if (!warnedMirrorFailures.has(warningKey)) {
       warnedMirrorFailures.add(warningKey);
@@ -123,8 +154,6 @@ export function mirrorSessionStoreToRuntimeLedger(params: {
         error: err instanceof Error ? err.message : String(err),
       });
     }
-  } finally {
-    db?.close();
   }
 }
 

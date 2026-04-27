@@ -17,7 +17,11 @@ import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import { getFileStatSnapshot } from "../cache-utils.js";
 import { enforceSessionDiskBudget, type SessionDiskBudgetSweepResult } from "./disk-budget.js";
 import { deriveSessionMetaPatch } from "./metadata.js";
-import { mirrorSessionStoreToRuntimeLedger } from "./runtime-ledger.js";
+import {
+  isRuntimeSessionStorePrimary,
+  mirrorSessionStoreToRuntimeLedger,
+  persistSessionStoreToRuntimeLedger,
+} from "./runtime-ledger.js";
 import {
   dropSessionStoreObjectCache,
   getSerializedSessionStore,
@@ -373,9 +377,15 @@ async function saveSessionStoreUnlocked(
 
   await fs.promises.mkdir(path.dirname(storePath), { recursive: true });
   const json = JSON.stringify(store, null, 2);
+  const runtimeStorePrimary = isRuntimeSessionStorePrimary();
+  if (runtimeStorePrimary) {
+    persistSessionStoreToRuntimeLedger({ storePath, store });
+  }
   if (getSerializedSessionStore(storePath) === json) {
     updateSessionStoreWriteCaches({ storePath, store, serialized: json });
-    mirrorSessionStoreToRuntimeLedger({ storePath, store });
+    if (!runtimeStorePrimary) {
+      mirrorSessionStoreToRuntimeLedger({ storePath, store });
+    }
     return;
   }
 
@@ -383,7 +393,12 @@ async function saveSessionStoreUnlocked(
   if (process.platform === "win32") {
     for (let i = 0; i < 5; i++) {
       try {
-        await writeSessionStoreAtomic({ storePath, store, serialized: json });
+        await writeSessionStoreAtomic({
+          storePath,
+          store,
+          serialized: json,
+          mirrorRuntimeLedger: !runtimeStorePrimary,
+        });
         return;
       } catch (err) {
         const code = getErrorCode(err);
@@ -396,15 +411,31 @@ async function saveSessionStoreUnlocked(
         }
         // Final attempt failed — skip this save. The write lock ensures
         // the next save will retry with fresh data. Log for diagnostics.
-        log.warn(`atomic write failed after 5 attempts: ${storePath}`);
+        log.warn(
+          runtimeStorePrimary
+            ? `legacy session file write failed after 5 attempts; runtime ledger remains authoritative: ${storePath}`
+            : `atomic write failed after 5 attempts: ${storePath}`,
+        );
       }
     }
     return;
   }
 
   try {
-    await writeSessionStoreAtomic({ storePath, store, serialized: json });
+    await writeSessionStoreAtomic({
+      storePath,
+      store,
+      serialized: json,
+      mirrorRuntimeLedger: !runtimeStorePrimary,
+    });
   } catch (err) {
+    if (runtimeStorePrimary) {
+      log.warn("legacy session file write failed; runtime ledger remains authoritative", {
+        storePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
     const code = getErrorCode(err);
 
     if (code === "ENOENT") {
@@ -512,6 +543,7 @@ async function writeSessionStoreAtomic(params: {
   storePath: string;
   store: Record<string, SessionEntry>;
   serialized: string;
+  mirrorRuntimeLedger?: boolean;
 }): Promise<void> {
   await writeTextAtomic(params.storePath, params.serialized, { mode: 0o600 });
   updateSessionStoreWriteCaches({
@@ -519,10 +551,12 @@ async function writeSessionStoreAtomic(params: {
     store: params.store,
     serialized: params.serialized,
   });
-  mirrorSessionStoreToRuntimeLedger({
-    storePath: params.storePath,
-    store: params.store,
-  });
+  if (params.mirrorRuntimeLedger ?? true) {
+    mirrorSessionStoreToRuntimeLedger({
+      storePath: params.storePath,
+      store: params.store,
+    });
+  }
 }
 
 async function persistResolvedSessionEntry(params: {

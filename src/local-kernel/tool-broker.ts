@@ -1,8 +1,11 @@
 import type { AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
+import { ContentAddressedArtifactStore } from "./artifact-store.js";
 import { LocalBrowserBroker } from "./browser-broker.js";
 import type { LocalKernelDatabase } from "./database.js";
+
+const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
 
 export type ToolBrokerSubject = {
   subjectType: string;
@@ -17,8 +20,37 @@ export type ToolBrokerContext = {
   subject: ToolBrokerSubject;
 };
 
+export type CapabilityToolBrokerOptions = {
+  artifactRootDir?: string;
+  outputArtifactThresholdBytes?: number;
+  env?: NodeJS.ProcessEnv;
+};
+
+function resolveOutputArtifactThresholdBytes(options: CapabilityToolBrokerOptions): number {
+  if (options.outputArtifactThresholdBytes !== undefined) {
+    return Math.max(0, Math.floor(options.outputArtifactThresholdBytes));
+  }
+  const raw =
+    options.env?.OPENCLAW_RUNTIME_TOOL_OUTPUT_ARTIFACT_BYTES ??
+    process.env.OPENCLAW_RUNTIME_TOOL_OUTPUT_ARTIFACT_BYTES;
+  if (!raw?.trim()) {
+    return DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES;
+}
+
 export class CapabilityToolBroker {
-  constructor(private readonly db: LocalKernelDatabase) {}
+  private readonly outputArtifactThresholdBytes: number;
+
+  constructor(
+    private readonly db: LocalKernelDatabase,
+    private readonly options: CapabilityToolBrokerOptions = {},
+  ) {
+    this.outputArtifactThresholdBytes = resolveOutputArtifactThresholdBytes(options);
+  }
 
   wrapTool(tool: AnyAgentTool, context: ToolBrokerContext): AnyAgentTool {
     const execute = tool.execute;
@@ -57,7 +89,8 @@ export class CapabilityToolBroker {
         const browserContext = this.maybeAcquireBrowserContext(tool, context, params);
         try {
           const result = await execute(toolCallId, params, signal, onUpdate);
-          this.db.finishToolCall(toolCallDbId, result);
+          const ledgerOutput = await this.prepareToolOutputForLedger(toolCallDbId, context, result);
+          this.db.finishToolCall(toolCallDbId, ledgerOutput);
           return result;
         } catch (err) {
           this.db.failToolCall(toolCallDbId, err);
@@ -75,6 +108,67 @@ export class CapabilityToolBroker {
 
   wrapTools(tools: AnyAgentTool[], context: ToolBrokerContext): AnyAgentTool[] {
     return tools.map((tool) => this.wrapTool(tool, context));
+  }
+
+  private async prepareToolOutputForLedger(
+    toolCallDbId: string,
+    context: ToolBrokerContext,
+    result: unknown,
+  ): Promise<unknown> {
+    if (this.outputArtifactThresholdBytes <= 0) {
+      return result;
+    }
+    const serialized = JSON.stringify(result);
+    const sizeBytes = Buffer.byteLength(serialized);
+    if (sizeBytes <= this.outputArtifactThresholdBytes) {
+      return result;
+    }
+    const artifact = await new ContentAddressedArtifactStore(
+      this.db,
+      this.options.artifactRootDir,
+    ).write({
+      bytes: serialized,
+      mimeType: "application/json",
+      createdByTaskId: context.taskId,
+      createdByToolCallId: toolCallDbId,
+      classification: "tool_output",
+      retentionPolicy: "debug",
+      subject: {
+        subjectType: context.subject.subjectType,
+        subjectId: context.subject.subjectId,
+        permission: "read",
+      },
+    });
+    if (
+      context.agentId &&
+      !(context.subject.subjectType === "agent" && context.subject.subjectId === context.agentId)
+    ) {
+      this.db.grantArtifactAccess({
+        artifactId: artifact.id,
+        subjectType: "agent",
+        subjectId: context.agentId,
+        permission: "read",
+      });
+    }
+    this.db.recordAudit({
+      actor: { type: "runtime" },
+      action: "tool_call.output_artifactized",
+      objectType: "tool_call",
+      objectId: toolCallDbId,
+      payload: {
+        artifactId: artifact.id,
+        sizeBytes,
+        thresholdBytes: this.outputArtifactThresholdBytes,
+      },
+    });
+    return {
+      type: "artifact_ref",
+      artifactType: "tool_output",
+      artifactId: artifact.id,
+      sha256: artifact.sha256,
+      sizeBytes: artifact.sizeBytes,
+      mimeType: artifact.mimeType,
+    };
   }
 
   private maybeAcquireBrowserContext(

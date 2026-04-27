@@ -56,6 +56,8 @@ Large outputs are content-addressed files under:
 
 SQLite stores metadata, access records, and retention policy only. Screenshots, downloads, PDFs, browser traces, videos, large HTML dumps, workspace snapshots, and exported transcripts should be artifact files, not SQLite blobs.
 
+Brokered tool calls also keep oversized JSON outputs out of `tool_calls.output_json`. The ToolBroker returns the original tool result to the agent, stores large serialized outputs as `debug` artifacts, and records an artifact reference plus audit event in the ledger.
+
 Retention policies are:
 
 - `ephemeral`
@@ -125,11 +127,11 @@ openclaw sessions export --session <session-id> --format jsonl
 
 Import is additive and idempotent for already-imported transcript events. It does not delete or rewrite `sessions.json` or transcript files.
 
-Session metadata writes are mirrored into the runtime ledger by default. Set `OPENCLAW_RUNTIME_SESSION_STORE=sqlite` to make the session-store read path prefer the SQLite mirror; set `OPENCLAW_RUNTIME_SESSION_STORE=off` to disable mirroring. Strict SQLite mode still writes the legacy files for compatibility, but failed ledger writes become hard failures instead of warnings.
+Session metadata writes are mirrored into the runtime ledger by default. Set `OPENCLAW_RUNTIME_SESSION_STORE=sqlite` to make the runtime ledger the primary session metadata store; set `OPENCLAW_RUNTIME_SESSION_STORE=off` to disable mirroring. Strict SQLite mode writes the ledger first and still attempts legacy JSON output for compatibility. Failed ledger writes are hard failures; failed legacy JSON writes are warnings because SQLite is authoritative in this mode.
 
 ## Current limitations
 
-- Full transcript ownership is still staged: assistant transcript mirrors and import/export are ledger-backed, while the pi session manager still appends JSONL.
+- Full transcript ownership is still staged: session metadata can run with SQLite as primary, assistant transcript mirrors and import/export are ledger-backed, and the pi session manager still appends JSONL.
 - Browser process pooling is still accounting-first; the current browser control backend is not fully replaced by pooled Playwright process management.
 - Sandbox allocation records requested bwrap/minijail/Docker backends and checks availability, but local/no-isolation still does not harden execution.
 - Native plugins still execute in process; tool invocation is brokered and audited but untrusted plugin isolation is a later process-boundary change.

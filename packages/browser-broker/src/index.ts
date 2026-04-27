@@ -2,7 +2,18 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket, { type RawData } from "ws";
-import type {
+import {
+  SparseKernelClient,
+  type SparseKernelClientOptions,
+  type SparseKernelAcquireBrowserContextInput,
+  type SparseKernelArtifact,
+  type SparseKernelArtifactSubject,
+  type SparseKernelBrowserContext,
+  type SparseKernelBrowserEndpointProbe,
+  type SparseKernelCreateArtifactInput,
+} from "../../sparsekernel-client/src/index.js";
+
+export type {
   SparseKernelAcquireBrowserContextInput,
   SparseKernelArtifact,
   SparseKernelArtifactSubject,
@@ -35,6 +46,10 @@ export type CdpTransportFactory = (webSocketUrl: string) => Promise<CdpTransport
 export type SparseKernelBrowserBrokerOptions = {
   kernel: SparseKernelBrowserKernelClient;
   fetchImpl?: typeof fetch;
+  transportFactory?: CdpTransportFactory;
+};
+
+export type SparseKernelCdpBrowserBrokerFactoryOptions = SparseKernelClientOptions & {
   transportFactory?: CdpTransportFactory;
 };
 
@@ -80,6 +95,17 @@ export type BrowserArtifactResult = {
   filename?: string;
   source_url?: string;
 };
+
+export function createSparseKernelCdpBrowserBroker(
+  options: SparseKernelCdpBrowserBrokerFactoryOptions = {},
+): SparseKernelCdpBrowserBroker {
+  const client = new SparseKernelClient(options);
+  return new SparseKernelCdpBrowserBroker({
+    kernel: client,
+    fetchImpl: options.fetchImpl,
+    transportFactory: options.transportFactory,
+  });
+}
 
 type CdpResponseWaiter = {
   resolve: (value: unknown) => void;

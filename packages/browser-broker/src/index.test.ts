@@ -7,7 +7,11 @@ import type {
   SparseKernelCreateArtifactInput,
 } from "../../sparsekernel-client/src/index.js";
 import type { CdpTransport, SparseKernelBrowserKernelClient } from "./index.js";
-import { normalizeLoopbackCdpEndpoint, SparseKernelCdpBrowserBroker } from "./index.js";
+import {
+  createSparseKernelCdpBrowserBroker,
+  normalizeLoopbackCdpEndpoint,
+  SparseKernelCdpBrowserBroker,
+} from "./index.js";
 
 class FakeKernel implements SparseKernelBrowserKernelClient {
   readonly artifactInputs: SparseKernelCreateArtifactInput[] = [];
@@ -262,6 +266,79 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       content_base64: Buffer.from("download body").toString("base64"),
       mime_type: "text/plain",
       retention_policy: "durable",
+    });
+  });
+
+  it("constructs from the SparseKernel daemon client", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const transport = new FakeCdpTransport();
+    const broker = createSparseKernelCdpBrowserBroker({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (input, init) => {
+        const url = input.toString();
+        const body =
+          typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, string>) : {};
+        calls.push({ url, body });
+        if (url.endsWith("/browser/pools/probe")) {
+          return Response.json({
+            endpoint: body.cdp_endpoint,
+            reachable: true,
+            status_code: 200,
+          });
+        }
+        if (url.endsWith("/browser/contexts/acquire")) {
+          return Response.json({
+            id: "browser_ctx_client",
+            pool_id: "browser_pool_public_web",
+            profile_mode: "ephemeral",
+            status: "active",
+            created_at: "2026-04-27T00:00:00Z",
+          });
+        }
+        if (url.endsWith("/json/version")) {
+          return Response.json({
+            webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+          });
+        }
+        if (url.endsWith("/artifacts/create")) {
+          return Response.json({
+            id: "artifact_client",
+            sha256: "sha_client",
+            size_bytes: Buffer.from(body.content_base64, "base64").length,
+            storage_ref: "sha256/aa/bb/sha_client",
+            mime_type: body.mime_type,
+            retention_policy: body.retention_policy,
+            created_at: "2026-04-27T00:00:00Z",
+          });
+        }
+        if (url.endsWith("/browser/contexts/release")) {
+          return Response.json({ released: true });
+        }
+        return Response.json({ error: "not found" }, { status: 404 });
+      },
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+    });
+    const screenshot = await broker.captureScreenshotArtifact(context.ledger_context.id);
+    await expect(broker.releaseContext(context.ledger_context.id)).resolves.toBe(true);
+
+    expect(screenshot.artifact.id).toBe("artifact_client");
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual(
+      expect.arrayContaining([
+        "/browser/pools/probe",
+        "/browser/contexts/acquire",
+        "/json/version",
+        "/artifacts/create",
+        "/browser/contexts/release",
+      ]),
+    );
+    expect(calls.find((call) => call.url.endsWith("/artifacts/create"))?.body).toMatchObject({
+      content_base64: Buffer.from("pixels").toString("base64"),
+      mime_type: "image/png",
     });
   });
 });

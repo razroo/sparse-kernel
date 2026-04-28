@@ -4,9 +4,10 @@ use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
-    probe_browser_endpoint, ArtifactStore, AuditInput, BrowserBroker, CapabilityCheck,
-    CompleteToolCallInput, CreateToolCallInput, EnqueueTaskInput, GrantCapabilityInput,
-    LedgerToolBroker, MockBrowserBroker, SparseKernelDb, SparseKernelPaths, ToolBroker,
+    probe_browser_endpoint, AppendTranscriptEventInput, ArtifactStore, AuditInput, BrowserBroker,
+    CapabilityCheck, CompleteToolCallInput, CreateToolCallInput, EnqueueTaskInput,
+    GrantCapabilityInput, LedgerToolBroker, LocalSandboxBroker, MockBrowserBroker, SandboxBroker,
+    SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
@@ -217,6 +218,13 @@ struct ClaimTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ClaimTaskByIdRequest {
+    task_id: String,
+    worker_id: String,
+    lease_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct HeartbeatTaskRequest {
     task_id: String,
     worker_id: String,
@@ -269,6 +277,19 @@ struct ReleaseBrowserContextRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AllocateSandboxRequest {
+    agent_id: Option<String>,
+    task_id: Option<String>,
+    trust_zone_id: String,
+    backend: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseSandboxRequest {
+    allocation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProbeBrowserPoolRequest {
     cdp_endpoint: String,
 }
@@ -290,6 +311,12 @@ struct CompleteToolCallRequest {
 struct FailToolCallRequest {
     id: String,
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListTranscriptEventsRequest {
+    session_id: String,
+    limit: Option<i64>,
 }
 
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Box<dyn Error>> {
@@ -394,6 +421,33 @@ pub fn handle_api_request_with_artifact_root(
             status_code: 200,
             body: serde_json::to_value(db.list_tasks(100)?)?,
         },
+        ("GET", "/sessions") => ApiReply {
+            status_code: 200,
+            body: serde_json::to_value(db.list_sessions(100)?)?,
+        },
+        ("POST", "/sessions/upsert") => {
+            let input: UpsertSessionInput = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.upsert_session(input)?)?,
+            }
+        }
+        ("POST", "/transcript-events/append") => {
+            let input: AppendTranscriptEventInput = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.append_transcript_event(input)?)?,
+            }
+        }
+        ("POST", "/transcript-events/list") => {
+            let input: ListTranscriptEventsRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(
+                    db.list_transcript_events(&input.session_id, input.limit.unwrap_or(100))?,
+                )?,
+            }
+        }
         ("GET", "/tool-calls") => ApiReply {
             status_code: 200,
             body: serde_json::to_value(db.list_tool_calls(100)?)?,
@@ -505,6 +559,17 @@ pub fn handle_api_request_with_artifact_root(
                 )?)?,
             }
         }
+        ("POST", "/tasks/claim-id") => {
+            let input: ClaimTaskByIdRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.claim_task(
+                    &input.task_id,
+                    &input.worker_id,
+                    input.lease_seconds.unwrap_or(300),
+                )?)?,
+            }
+        }
         ("POST", "/tasks/heartbeat") => {
             let input: HeartbeatTaskRequest = parse_body(body)?;
             ApiReply {
@@ -538,6 +603,27 @@ pub fn handle_api_request_with_artifact_root(
                 body: json!({
                     "ok": db.fail_task(&input.task_id, &input.worker_id, &input.error)?,
                 }),
+            }
+        }
+        ("POST", "/sandbox/allocate") => {
+            let input: AllocateSandboxRequest = parse_body(body)?;
+            let broker = LocalSandboxBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(broker.allocate_sandbox(
+                    input.agent_id.as_deref(),
+                    input.task_id.as_deref(),
+                    &input.trust_zone_id,
+                    input.backend.as_deref(),
+                )?)?,
+            }
+        }
+        ("POST", "/sandbox/release") => {
+            let input: ReleaseSandboxRequest = parse_body(body)?;
+            let broker = LocalSandboxBroker { db };
+            ApiReply {
+                status_code: 200,
+                body: json!({ "released": broker.release_sandbox(&input.allocation_id)? }),
             }
         }
         ("POST", "/leases/release-expired") => {
@@ -746,8 +832,8 @@ mod tests {
         let claimed = json_call(
             &mut db,
             "POST",
-            "/tasks/claim",
-            json!({ "worker_id": "worker-a", "kinds": ["demo"], "lease_seconds": 60 }),
+            "/tasks/claim-id",
+            json!({ "task_id": task_id, "worker_id": "worker-a", "lease_seconds": 60 }),
         );
         assert_eq!(claimed["id"], task_id);
         assert_eq!(claimed["lease_owner"], "worker-a");
@@ -816,6 +902,53 @@ mod tests {
             json!({ "id": capability_id }),
         );
         assert_eq!(revoked["revoked"], true);
+    }
+
+    #[test]
+    fn session_api_upserts_and_lists_sessions() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let session = json_call(
+            &mut db,
+            "POST",
+            "/sessions/upsert",
+            json!({
+                "id": "session-a",
+                "agent_id": "agent-a",
+                "session_key": "agent:agent-a:main",
+                "channel": "discord",
+                "status": "active",
+                "current_token_count": 12,
+                "last_activity_at": "2026-04-27T00:00:00Z",
+            }),
+        );
+        assert_eq!(session["id"], "session-a");
+        assert_eq!(session["agent_id"], "agent-a");
+        assert_eq!(session["current_token_count"], 12);
+
+        let sessions = handle_api_request(&mut db, "GET", "/sessions", &[])
+            .unwrap()
+            .body;
+        assert_eq!(sessions.as_array().unwrap().len(), 1);
+
+        let event = json_call(
+            &mut db,
+            "POST",
+            "/transcript-events/append",
+            json!({
+                "session_id": "session-a",
+                "role": "user",
+                "event_type": "message",
+                "content": { "text": "hi" },
+            }),
+        );
+        assert_eq!(event["seq"], 1);
+        let events = json_call(
+            &mut db,
+            "POST",
+            "/transcript-events/list",
+            json!({ "session_id": "session-a" }),
+        );
+        assert_eq!(events.as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -973,6 +1106,53 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(contexts[0]["status"], "released");
+    }
+
+    #[test]
+    fn sandbox_api_allocates_and_releases_with_capability() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("task-sandbox".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "sandbox".to_string(),
+            priority: 0,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "sandbox".to_string(),
+            resource_id: Some("code_execution".to_string()),
+            action: "allocate".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let allocation = json_call(
+            &mut db,
+            "POST",
+            "/sandbox/allocate",
+            json!({
+                "agent_id": "main",
+                "task_id": "task-sandbox",
+                "trust_zone_id": "code_execution",
+                "backend": "local/no_isolation",
+            }),
+        );
+        let allocation_id = allocation["id"].as_str().unwrap().to_string();
+        assert_eq!(allocation["backend"], "local/no_isolation");
+
+        let released = json_call(
+            &mut db,
+            "POST",
+            "/sandbox/release",
+            json!({ "allocation_id": allocation_id }),
+        );
+        assert_eq!(released["released"], true);
     }
 
     #[test]

@@ -30,6 +30,52 @@ export type SparseKernelTask = {
   updated_at: string;
 };
 
+export type SparseKernelSession = {
+  id: string;
+  agent_id: string;
+  session_key?: string | null;
+  channel?: string | null;
+  status: string;
+  current_token_count: number;
+  last_activity_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SparseKernelTranscriptEvent = {
+  id: number;
+  session_id: string;
+  parent_event_id?: number | null;
+  seq: number;
+  role: string;
+  event_type: string;
+  content?: unknown;
+  tool_call_id?: string | null;
+  token_count?: number | null;
+  created_at: string;
+};
+
+export type SparseKernelUpsertSessionInput = {
+  id: string;
+  agent_id: string;
+  session_key?: string | null;
+  channel?: string | null;
+  status?: string | null;
+  current_token_count?: number | null;
+  last_activity_at?: string | null;
+};
+
+export type SparseKernelAppendTranscriptEventInput = {
+  session_id: string;
+  parent_event_id?: number | null;
+  role: string;
+  event_type: string;
+  content?: unknown;
+  tool_call_id?: string | null;
+  token_count?: number | null;
+  created_at?: string | null;
+};
+
 export type SparseKernelToolCall = {
   id: string;
   task_id?: string | null;
@@ -147,6 +193,12 @@ export type SparseKernelClaimTaskInput = {
   lease_seconds?: number;
 };
 
+export type SparseKernelClaimTaskByIdInput = {
+  task_id: string;
+  worker_id: string;
+  lease_seconds?: number;
+};
+
 export type SparseKernelHeartbeatTaskInput = {
   task_id: string;
   worker_id: string;
@@ -172,6 +224,22 @@ export type SparseKernelReleaseExpiredLeasesInput = {
 export type SparseKernelReleaseExpiredLeasesResult = {
   tasks: number;
   resources: number;
+};
+
+export type SparseKernelSandboxAllocation = {
+  id: string;
+  task_id?: string | null;
+  trust_zone_id: string;
+  backend: string;
+  status: string;
+  created_at: string;
+};
+
+export type SparseKernelAllocateSandboxInput = {
+  agent_id?: string | null;
+  task_id?: string | null;
+  trust_zone_id: string;
+  backend?: string | null;
 };
 
 export type SparseKernelCreateToolCallInput = {
@@ -242,6 +310,27 @@ export class SparseKernelClient {
     return await this.getJson<SparseKernelTask[]>("/tasks");
   }
 
+  async sessions(): Promise<SparseKernelSession[]> {
+    return await this.getJson<SparseKernelSession[]>("/sessions");
+  }
+
+  async upsertSession(input: SparseKernelUpsertSessionInput): Promise<SparseKernelSession> {
+    return await this.postJson<SparseKernelSession>("/sessions/upsert", input);
+  }
+
+  async appendTranscriptEvent(
+    input: SparseKernelAppendTranscriptEventInput,
+  ): Promise<SparseKernelTranscriptEvent> {
+    return await this.postJson<SparseKernelTranscriptEvent>("/transcript-events/append", input);
+  }
+
+  async transcriptEvents(input: {
+    session_id: string;
+    limit?: number;
+  }): Promise<SparseKernelTranscriptEvent[]> {
+    return await this.postJson<SparseKernelTranscriptEvent[]>("/transcript-events/list", input);
+  }
+
   async toolCalls(): Promise<SparseKernelToolCall[]> {
     return await this.getJson<SparseKernelToolCall[]>("/tool-calls");
   }
@@ -299,6 +388,10 @@ export class SparseKernelClient {
     return await this.postJson<SparseKernelTask | null>("/tasks/claim", input);
   }
 
+  async claimTask(input: SparseKernelClaimTaskByIdInput): Promise<SparseKernelTask | null> {
+    return await this.postJson<SparseKernelTask | null>("/tasks/claim-id", input);
+  }
+
   async heartbeatTask(input: SparseKernelHeartbeatTaskInput): Promise<boolean> {
     const response = await this.postJson<{ ok: boolean }>("/tasks/heartbeat", input);
     return response.ok;
@@ -321,6 +414,19 @@ export class SparseKernelClient {
       "/leases/release-expired",
       input,
     );
+  }
+
+  async allocateSandbox(
+    input: SparseKernelAllocateSandboxInput,
+  ): Promise<SparseKernelSandboxAllocation> {
+    return await this.postJson<SparseKernelSandboxAllocation>("/sandbox/allocate", input);
+  }
+
+  async releaseSandbox(allocationId: string): Promise<boolean> {
+    const response = await this.postJson<{ released: boolean }>("/sandbox/release", {
+      allocation_id: allocationId,
+    });
+    return response.released;
   }
 
   async createToolCall(input: SparseKernelCreateToolCallInput): Promise<SparseKernelToolCall> {

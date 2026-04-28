@@ -109,9 +109,9 @@ Sensitive operations should check capabilities before they mutate state or alloc
 - sandbox allocation;
 - tool invocation.
 
-Capability grants, revokes, and denied checks are audited. Embedded agent runs now wrap the effective tool set with the ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
+Capability grants, revokes, and denied checks are audited. Embedded agent runs now materialize the active step as a task lease and transcript events, then wrap the effective tool set with the local ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` to use the `sparsekerneld` run-ledger and ToolBroker path; daemon setup failures fall back to the local runtime broker. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
 
-The SparseKernel daemon now exposes the v0 ToolBroker lifecycle over local JSON: create, start, complete, fail, and list. Create checks `tool` / `<tool-name>` / `invoke`; completion records small structured output plus `artifact_ids`; and every transition writes audit records. See [Tool Broker](/architecture/tool-broker).
+The SparseKernel daemon now exposes the v0 run and ToolBroker lifecycle over local JSON: session upsert/list, transcript append/list, task enqueue/claim-by-id/claim-next/heartbeat/complete/fail, tool-call create/start/complete/fail/list, browser acquire/release, sandbox allocate/release, and artifact access. Tool-call create checks `tool` / `<tool-name>` / `invoke`; completion records small structured output plus `artifact_ids`; and every transition writes audit records. See [Tool Broker](/architecture/tool-broker).
 
 ## Session compatibility
 

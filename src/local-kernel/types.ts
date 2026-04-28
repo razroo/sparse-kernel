@@ -118,6 +118,13 @@ export type ClaimTaskInput = {
   now?: string;
 };
 
+export type ClaimTaskByIdInput = {
+  taskId: string;
+  workerId: string;
+  leaseMs?: number;
+  now?: string;
+};
+
 export type ArtifactRecordInput = {
   id?: string;
   sha256: string;

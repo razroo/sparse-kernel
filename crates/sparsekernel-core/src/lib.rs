@@ -152,6 +152,56 @@ pub struct TaskRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: String,
+    pub agent_id: String,
+    pub session_key: Option<String>,
+    pub channel: Option<String>,
+    pub status: String,
+    pub current_token_count: i64,
+    pub last_activity_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptEventRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub parent_event_id: Option<i64>,
+    pub seq: i64,
+    pub role: String,
+    pub event_type: String,
+    pub content: Option<Value>,
+    pub tool_call_id: Option<String>,
+    pub token_count: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertSessionInput {
+    pub id: String,
+    pub agent_id: String,
+    pub session_key: Option<String>,
+    pub channel: Option<String>,
+    pub status: Option<String>,
+    pub current_token_count: Option<i64>,
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendTranscriptEventInput {
+    pub session_id: String,
+    pub parent_event_id: Option<i64>,
+    pub role: String,
+    pub event_type: String,
+    pub content: Option<Value>,
+    pub tool_call_id: Option<String>,
+    pub token_count: Option<i64>,
+    pub created_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnqueueTaskInput {
     pub id: Option<String>,
@@ -442,6 +492,166 @@ impl SparseKernelDb {
         Ok(())
     }
 
+    pub fn upsert_session(&self, input: UpsertSessionInput) -> Result<SessionRecord> {
+        let id = input.id.trim();
+        if id.is_empty() {
+            return Err(SparseKernelError::Invalid(
+                "session id is required".to_string(),
+            ));
+        }
+        let agent_id = input.agent_id.trim();
+        if agent_id.is_empty() {
+            return Err(SparseKernelError::Invalid(
+                "agent_id is required".to_string(),
+            ));
+        }
+        self.ensure_agent(agent_id)?;
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO sessions(
+                id, agent_id, session_key, channel, status, current_token_count, last_activity_at, created_at, updated_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                session_key = excluded.session_key,
+                channel = excluded.channel,
+                status = excluded.status,
+                current_token_count = excluded.current_token_count,
+                last_activity_at = excluded.last_activity_at,
+                updated_at = excluded.updated_at",
+            params![
+                id,
+                agent_id,
+                input.session_key,
+                input.channel,
+                input.status.unwrap_or_else(|| "active".to_string()),
+                input.current_token_count.unwrap_or(0),
+                input.last_activity_at,
+                now,
+                now,
+            ],
+        )?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "session.upserted".to_string(),
+            object_type: Some("session".to_string()),
+            object_id: Some(id.to_string()),
+            payload: Some(json!({ "agentId": agent_id })),
+        })?;
+        self.get_session(id)
+    }
+
+    pub fn get_session(&self, id: &str) -> Result<SessionRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, session_key, channel, status, current_token_count, last_activity_at, created_at, updated_at
+                 FROM sessions WHERE id = ?",
+                params![id],
+                session_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("session {id}")))
+    }
+
+    pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_key, channel, status, current_token_count, last_activity_at, created_at, updated_at
+             FROM sessions ORDER BY updated_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit.max(0)], session_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn append_transcript_event(
+        &mut self,
+        input: AppendTranscriptEventInput,
+    ) -> Result<TranscriptEventRecord> {
+        let session_id = input.session_id.trim();
+        if session_id.is_empty() {
+            return Err(SparseKernelError::Invalid(
+                "session_id is required".to_string(),
+            ));
+        }
+        if input.role.trim().is_empty() {
+            return Err(SparseKernelError::Invalid("role is required".to_string()));
+        }
+        if input.event_type.trim().is_empty() {
+            return Err(SparseKernelError::Invalid(
+                "event_type is required".to_string(),
+            ));
+        }
+        self.get_session(session_id)?;
+        let now = input.created_at.unwrap_or_else(now_iso);
+        let tx = self.conn.transaction()?;
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_events WHERE session_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO transcript_events(
+                session_id, parent_event_id, seq, role, event_type, content_json, tool_call_id, token_count, created_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                session_id,
+                input.parent_event_id,
+                seq,
+                input.role.trim(),
+                input.event_type.trim(),
+                json_text(input.content.as_ref()),
+                input.tool_call_id,
+                input.token_count,
+                now,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+             VALUES('runtime', NULL, 'transcript_event.appended', 'transcript_event', ?, ?, ?)",
+            params![
+                id.to_string(),
+                json!({
+                    "sessionId": session_id,
+                    "seq": seq,
+                    "role": input.role.trim(),
+                    "eventType": input.event_type.trim()
+                })
+                .to_string(),
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_transcript_event(id)
+    }
+
+    pub fn get_transcript_event(&self, id: i64) -> Result<TranscriptEventRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, parent_event_id, seq, role, event_type, content_json, tool_call_id, token_count, created_at
+                 FROM transcript_events WHERE id = ?",
+                params![id],
+                transcript_event_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("transcript event {id}")))
+    }
+
+    pub fn list_transcript_events(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TranscriptEventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, parent_event_id, seq, role, event_type, content_json, tool_call_id, token_count, created_at
+             FROM transcript_events WHERE session_id = ? ORDER BY seq ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit.max(0)], transcript_event_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
     pub fn enqueue_task(&self, input: EnqueueTaskInput) -> Result<TaskRecord> {
         let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let now = now_iso();
@@ -546,6 +756,39 @@ impl SparseKernelDb {
         )?;
         tx.commit()?;
         self.get_task(&id).map(Some)
+    }
+
+    pub fn claim_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        lease_seconds: i64,
+    ) -> Result<Option<TaskRecord>> {
+        let now = now_iso();
+        let lease_until = future_iso(lease_seconds.max(1));
+        let updated = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'running', lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated_at = ?
+             WHERE id = ? AND status = 'queued'",
+            params![worker_id, lease_until, now, task_id],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.record_task_event(
+            task_id,
+            "claimed",
+            json!({ "workerId": worker_id, "leaseUntil": lease_until }),
+        )?;
+        self.record_audit(AuditInput {
+            actor_type: Some("worker".to_string()),
+            actor_id: Some(worker_id.to_string()),
+            action: "task.claimed".to_string(),
+            object_type: Some("task".to_string()),
+            object_id: Some(task_id.to_string()),
+            payload: Some(json!({ "leaseUntil": lease_until })),
+        })?;
+        self.get_task(task_id).map(Some)
     }
 
     pub fn heartbeat_task(
@@ -1043,6 +1286,35 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         result_artifact_id: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+    })
+}
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        session_key: row.get(2)?,
+        channel: row.get(3)?,
+        status: row.get(4)?,
+        current_token_count: row.get(5)?,
+        last_activity_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn transcript_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptEventRecord> {
+    Ok(TranscriptEventRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        parent_event_id: row.get(2)?,
+        seq: row.get(3)?,
+        role: row.get(4)?,
+        event_type: row.get(5)?,
+        content: parse_json(row.get(6)?),
+        tool_call_id: row.get(7)?,
+        token_count: row.get(8)?,
+        created_at: row.get(9)?,
     })
 }
 
@@ -1654,6 +1926,81 @@ mod tests {
     }
 
     #[test]
+    fn session_upsert_creates_agent_and_supports_tool_call_foreign_keys() {
+        let (_dir, mut db) = temp_db();
+        let session = db
+            .upsert_session(UpsertSessionInput {
+                id: "session-a".to_string(),
+                agent_id: "agent-a".to_string(),
+                session_key: Some("agent:agent-a:main".to_string()),
+                channel: Some("telegram".to_string()),
+                status: Some("active".to_string()),
+                current_token_count: Some(42),
+                last_activity_at: Some("2026-04-27T00:00:00Z".to_string()),
+            })
+            .unwrap();
+        assert_eq!(session.agent_id, "agent-a");
+        assert_eq!(session.current_token_count, 42);
+        assert_eq!(db.list_sessions(10).unwrap().len(), 1);
+        let first_event = db
+            .append_transcript_event(AppendTranscriptEventInput {
+                session_id: "session-a".to_string(),
+                parent_event_id: None,
+                role: "user".to_string(),
+                event_type: "message".to_string(),
+                content: Some(json!({ "text": "hello" })),
+                tool_call_id: None,
+                token_count: Some(3),
+                created_at: Some("2026-04-27T00:00:00Z".to_string()),
+            })
+            .unwrap();
+        let second_event = db
+            .append_transcript_event(AppendTranscriptEventInput {
+                session_id: "session-a".to_string(),
+                parent_event_id: Some(first_event.id),
+                role: "assistant".to_string(),
+                event_type: "message".to_string(),
+                content: Some(json!({ "text": "hi" })),
+                tool_call_id: None,
+                token_count: None,
+                created_at: None,
+            })
+            .unwrap();
+        assert_eq!(first_event.seq, 1);
+        assert_eq!(second_event.seq, 2);
+        assert_eq!(db.list_transcript_events("session-a", 10).unwrap().len(), 2);
+
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "agent-a".to_string(),
+            resource_type: "tool".to_string(),
+            resource_id: Some("demo".to_string()),
+            action: "invoke".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        let call = db
+            .create_tool_call(CreateToolCallInput {
+                id: Some("tool-call-session".to_string()),
+                task_id: None,
+                session_id: Some("session-a".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                tool_name: "demo".to_string(),
+                input: None,
+            })
+            .unwrap();
+        assert_eq!(call.session_id.as_deref(), Some("session-a"));
+        let actions: Vec<String> = db
+            .list_audit(10)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(actions.contains(&"session.upserted".to_string()));
+    }
+
+    #[test]
     fn task_claiming_is_atomic_and_expired_leases_recover() {
         let (_dir, mut db) = temp_db();
         db.enqueue_task(EnqueueTaskInput {
@@ -1666,19 +2013,40 @@ mod tests {
             input: Some(json!({ "hello": true })),
         })
         .unwrap();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("task-b".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "demo".to_string(),
+            priority: 10,
+            idempotency_key: None,
+            input: Some(json!({ "hello": "second" })),
+        })
+        .unwrap();
+        let claimed_by_id = db
+            .claim_task("task-a", "worker-id", 60)
+            .unwrap()
+            .expect("claimed by id");
+        assert_eq!(claimed_by_id.id, "task-a");
+        assert_eq!(claimed_by_id.lease_owner.as_deref(), Some("worker-id"));
+        assert!(db
+            .claim_task("task-a", "worker-other", 60)
+            .unwrap()
+            .is_none());
+        assert!(db.complete_task("task-a", "worker-id", None).unwrap());
         let claimed = db
             .claim_next_task("worker-a", &[], 60)
             .unwrap()
             .expect("claimed");
-        assert_eq!(claimed.id, "task-a");
+        assert_eq!(claimed.id, "task-b");
         assert_eq!(claimed.status, "running");
         assert!(db.claim_next_task("worker-b", &[], 60).unwrap().is_none());
         let future = (Utc::now() + ChronoDuration::hours(1)).to_rfc3339();
         assert_eq!(db.release_expired_leases(&future).unwrap().0, 1);
         let reclaimed = db.claim_next_task("worker-b", &[], 60).unwrap().unwrap();
         assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
-        assert!(db.complete_task("task-a", "worker-b", None).unwrap());
-        assert_eq!(db.get_task("task-a").unwrap().status, "completed");
+        assert!(db.complete_task("task-b", "worker-b", None).unwrap());
+        assert_eq!(db.get_task("task-b").unwrap().status, "completed");
     }
 
     #[test]

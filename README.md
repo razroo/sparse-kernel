@@ -44,6 +44,8 @@ The goal is to make local multi-agent systems practical on ordinary machines, in
 - `crates/sparsekernel-core`: Rust ledger, artifact store, task leases, capabilities, audit records, and mock broker primitives.
 - `crates/sparsekernel-cli`: `sparsekernel` CLI and `sparsekerneld` local daemon.
 - `migrations/0001_initial.sql`: initial SQLite runtime schema.
+- `packages/browser-broker`: TypeScript CDP browser broker for materialized browser-context leases and artifactized screenshots/downloads.
+- `packages/openclaw-sparsekernel-adapter`: TypeScript adapter that wraps OpenClaw-shaped tools in Sparse Kernel session, capability, tool-call, and artifact lifecycle calls.
 - `packages/sparsekernel-client`: TypeScript client for the daemon HTTP surface.
 - `schemas/`: API and event schema definitions.
 - `docs/architecture/`: architecture notes for the ledger, brokers, artifact store, trust zones, security boundaries, and small-VM resource model.
@@ -85,8 +87,12 @@ The daemon listens on `http://127.0.0.1:8765` by default and exposes:
 
 - `GET /health`
 - `GET /status`
+- `GET /sessions`
 - `GET /tasks`
+- `GET /tool-calls`
 - `GET /audit`
+
+It also exposes POST endpoints for session upsert, transcript event append/list, exact task claiming, task heartbeat/complete/fail, artifact create/read/metadata, capability grant/check/revoke/list, browser context acquire/release, and sandbox allocate/release.
 
 ## Storage Model
 
@@ -98,11 +104,13 @@ SQLite is for structured state and coordination. Large blobs belong in the conte
 
 Sparse Kernel is the standalone kernel direction behind OpenClaw SparseKernel work. OpenClaw uses the compatibility layer while this Rust workspace grows into the daemon, ledger, scheduler, broker, and client SDK surface.
 
+OpenClaw embedded runs now materialize a SparseKernel task lease and transcript events for the active step, then route tool calls through the local runtime broker by default. To route the run ledger and tool broker through `sparsekerneld`, start the daemon and set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon`; use `OPENCLAW_SPARSEKERNEL_BASE_URL` when the daemon listens somewhere other than the default localhost URL. Daemon setup failures fall back to the local SQLite runtime path.
+
 The product name of this repository is **Sparse Kernel**. The implementation crates, binaries, and package names use `sparsekernel` where package ecosystems prefer a compact identifier.
 
 ## Current Status
 
-V0 proves the foundation: migrations, the runtime ledger, artifact primitives, task leasing, capability checks, audit records, mock broker records, a CLI, a daemon, and a TypeScript client.
+V0 proves the foundation: migrations, the runtime ledger, transcript events, embedded-run task leases, artifact primitives, capability checks, audit records, browser/sandbox broker records, a CLI, a daemon, and a TypeScript client.
 
 It does not yet implement production Playwright browser process pooling, production sandbox backends, host-level egress proxy enforcement, plugin subprocess isolation, or a full OpenClaw runtime rewrite.
 

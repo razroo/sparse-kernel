@@ -6,6 +6,13 @@ export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
 export { checkTrustZoneNetworkUrl } from "./network-policy.js";
 export type { NetworkPolicyDecision } from "./network-policy.js";
+export { compactLedgerContent, materializeEmbeddedRunInKernel } from "./run-ledger-runtime.js";
+export type {
+  EmbeddedRunKernelLedger,
+  EmbeddedRunKernelLedgerClient,
+  KernelTranscriptEventInput,
+  MaterializeEmbeddedRunInKernelInput,
+} from "./run-ledger-runtime.js";
 export { LocalSandboxBroker } from "./sandbox-broker.js";
 export { accountSandboxForRun } from "./sandbox-broker-runtime.js";
 export type { AccountedSandboxRun, AccountSandboxForRunInput } from "./sandbox-broker-runtime.js";
@@ -19,8 +26,21 @@ export { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat
 export type { SessionImportResult, SessionStoreImportTarget } from "./session-compat.js";
 export { CapabilityToolBroker } from "./tool-broker.js";
 export type { ToolBrokerContext, ToolBrokerSubject } from "./tool-broker.js";
-export { brokerToolsForRun, shouldUseRuntimeToolBroker } from "./tool-broker-runtime.js";
-export type { BrokeredToolsForRun, BrokerToolsForRunInput } from "./tool-broker-runtime.js";
+export {
+  brokerEffectiveToolsForRun,
+  brokerToolsForRun,
+  brokerToolsForRunWithDaemon,
+  resolveRuntimeToolBrokerMode,
+  shouldUseRuntimeToolBroker,
+  shouldUseSparseKernelDaemonToolBroker,
+} from "./tool-broker-runtime.js";
+export type {
+  BrokeredToolsForRun,
+  BrokerEffectiveToolsForRunInput,
+  BrokerToolsForRunInput,
+  LocalBrokeredToolsForRun,
+  RuntimeToolBrokerMode,
+} from "./tool-broker-runtime.js";
 export {
   resolveArtifactStorageRef,
   resolveArtifactStoreRoot,

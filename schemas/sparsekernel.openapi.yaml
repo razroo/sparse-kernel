@@ -50,6 +50,74 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Task"
+  /sessions:
+    get:
+      operationId: listSessions
+      responses:
+        "200":
+          description: Recent sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Session"
+  /sessions/upsert:
+    post:
+      operationId: upsertSession
+      description: Create or update a session ledger row for an agent before recording session-scoped work.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertSessionInput"
+      responses:
+        "200":
+          description: Upserted session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+  /transcript-events/append:
+    post:
+      operationId: appendTranscriptEvent
+      description: Append a session transcript event with kernel-assigned per-session sequence ordering.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppendTranscriptEventInput"
+      responses:
+        "200":
+          description: Appended transcript event
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscriptEvent"
+  /transcript-events/list:
+    post:
+      operationId: listTranscriptEvents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties:
+                session_id: { type: string }
+                limit: { type: integer }
+      responses:
+        "200":
+          description: Session transcript events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TranscriptEvent"
   /tasks/enqueue:
     post:
       operationId: enqueueTask
@@ -78,6 +146,25 @@ paths:
       responses:
         "200":
           description: Claimed task or null when none are available
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Task"
+                  - type: "null"
+  /tasks/claim-id:
+    post:
+      operationId: claimTaskById
+      description: Atomically claim a specific queued task by id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimTaskByIdInput"
+      responses:
+        "200":
+          description: Claimed task or null when the task is not queued
           content:
             application/json:
               schema:
@@ -280,6 +367,45 @@ paths:
               required: [context_id]
               properties:
                 context_id: { type: string }
+      responses:
+        "200":
+          description: Release result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [released]
+                properties:
+                  released: { type: boolean }
+  /sandbox/allocate:
+    post:
+      operationId: allocateSandbox
+      description: Allocate a sandbox lease for a trust zone. The v0 local/no-isolation backend is accounting only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AllocateSandboxInput"
+      responses:
+        "200":
+          description: Sandbox allocation lease
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxAllocation"
+  /sandbox/release:
+    post:
+      operationId: releaseSandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [allocation_id]
+              properties:
+                allocation_id: { type: string }
       responses:
         "200":
           description: Release result
@@ -499,6 +625,13 @@ components:
           type: array
           items: { type: string }
         lease_seconds: { type: integer }
+    ClaimTaskByIdInput:
+      type: object
+      required: [task_id, worker_id]
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        lease_seconds: { type: integer }
     HeartbeatTaskInput:
       type: object
       required: [task_id, worker_id]
@@ -525,6 +658,56 @@ components:
       required: [ok]
       properties:
         ok: { type: boolean }
+    Session:
+      type: object
+      required: [id, agent_id, status, current_token_count, created_at, updated_at]
+      properties:
+        id: { type: string }
+        agent_id: { type: string }
+        session_key: { type: [string, "null"] }
+        channel: { type: [string, "null"] }
+        status: { type: string }
+        current_token_count: { type: integer }
+        last_activity_at: { type: [string, "null"] }
+        created_at: { type: string }
+        updated_at: { type: string }
+    UpsertSessionInput:
+      type: object
+      required: [id, agent_id]
+      properties:
+        id: { type: string }
+        agent_id: { type: string }
+        session_key: { type: [string, "null"] }
+        channel: { type: [string, "null"] }
+        status: { type: [string, "null"] }
+        current_token_count: { type: [integer, "null"] }
+        last_activity_at: { type: [string, "null"] }
+    TranscriptEvent:
+      type: object
+      required: [id, session_id, seq, role, event_type, created_at]
+      properties:
+        id: { type: integer }
+        session_id: { type: string }
+        parent_event_id: { type: [integer, "null"] }
+        seq: { type: integer }
+        role: { type: string }
+        event_type: { type: string }
+        content: true
+        tool_call_id: { type: [string, "null"] }
+        token_count: { type: [integer, "null"] }
+        created_at: { type: string }
+    AppendTranscriptEventInput:
+      type: object
+      required: [session_id, role, event_type]
+      properties:
+        session_id: { type: string }
+        parent_event_id: { type: [integer, "null"] }
+        role: { type: string }
+        event_type: { type: string }
+        content: true
+        tool_call_id: { type: [string, "null"] }
+        token_count: { type: [integer, "null"] }
+        created_at: { type: [string, "null"] }
     ToolCall:
       type: object
       required: [id, tool_name, status, created_at]
@@ -624,6 +807,24 @@ components:
         trust_zone_id: { type: string }
         max_contexts: { type: integer }
         cdp_endpoint: { type: [string, "null"] }
+    SandboxAllocation:
+      type: object
+      required: [id, trust_zone_id, backend, status, created_at]
+      properties:
+        id: { type: string }
+        task_id: { type: [string, "null"] }
+        trust_zone_id: { type: string }
+        backend: { type: string }
+        status: { type: string }
+        created_at: { type: string }
+    AllocateSandboxInput:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        agent_id: { type: [string, "null"] }
+        task_id: { type: [string, "null"] }
+        trust_zone_id: { type: string }
+        backend: { type: [string, "null"] }
     Capability:
       type: object
       required: [id, subject_type, subject_id, resource_type, action, created_at]

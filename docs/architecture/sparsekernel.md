@@ -38,14 +38,17 @@ Small machines can keep many logical agents parked in durable state, but they ca
 - `crates/sparsekernel-cli`: `sparsekernel` CLI and `sparsekerneld` local daemon.
 - `migrations/0001_initial.sql`: initial SQLite schema.
 - `packages/browser-broker`: TypeScript CDP adapter that materializes leased browser contexts and artifactizes screenshots/downloads.
+- `packages/openclaw-sparsekernel-adapter`: TypeScript adapter that wraps OpenClaw-shaped tool execution with daemon-backed session upsert, capability grants, tool-call lifecycle transitions, and oversized-output artifactization.
 - `packages/sparsekernel-client`: small TypeScript daemon client.
 - `schemas/`: API and event schema definitions.
 
 ## Local API
 
-The v0 daemon exposes localhost JSON endpoints for health/status, task enqueue/claim/heartbeat/complete/fail, expired lease release, tool-call create/start/complete/fail/list, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
+The v0 daemon exposes localhost JSON endpoints for health/status, session upsert/list, transcript event append/list, task enqueue/claim-by-id/claim-next/heartbeat/complete/fail, expired lease release, tool-call create/start/complete/fail/list, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, sandbox allocate/release, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
 
 The API is intentionally narrow. Agents and adapters should call the daemon or typed core APIs; they should not read or mutate the ledger with raw SQL.
+
+OpenClaw embedded runs now materialize the active step as a SparseKernel task lease and append transcript events for run start, prompt submission, assistant output, and run completion/failure. The default path writes to the local runtime ledger for compatibility. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` or `OPENCLAW_SPARSEKERNEL_TOOL_BROKER=1` to route the run ledger and tool broker through `sparsekerneld`; daemon setup failures fall back to the local broker.
 
 The browser broker can now register an existing local CDP endpoint on a trust-zone pool and probe `/json/version` to verify the browser process is reachable. The TypeScript CDP adapter can then create a real browser context and target for the leased task/session, capture screenshots, and store screenshots/downloads as SparseKernel artifacts. That is a local integration seam, not agent authority: agents receive leases, context ids, and artifact ids, not raw CDP endpoints.
 

@@ -10,6 +10,7 @@ import type {
   ArtifactRecord,
   ArtifactRecordInput,
   BrowserContextRecord,
+  ClaimTaskByIdInput,
   CapabilityCheckInput,
   EnqueueTaskInput,
   GrantCapabilityInput,
@@ -862,6 +863,35 @@ export class LocalKernelDatabase {
         createdAt: now,
       });
       return this.getTask(row.id) ?? null;
+    });
+  }
+
+  claimTask(input: ClaimTaskByIdInput): KernelTaskRecord | null {
+    const now = input.now ?? nowIso();
+    const leaseUntil = futureIso(now, input.leaseMs ?? 60_000);
+    return this.withTransaction(() => {
+      const updated = changes(
+        this.db
+          .prepare(
+            `UPDATE tasks
+             SET status = 'running', lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated_at = ?
+             WHERE id = ? AND status = 'queued'`,
+          )
+          .run(input.workerId, leaseUntil, now, input.taskId),
+      );
+      if (updated !== 1) {
+        return null;
+      }
+      this.recordTaskEvent(input.taskId, "claimed", { workerId: input.workerId, leaseUntil }, now);
+      this.recordAudit({
+        actor: { type: "worker", id: input.workerId },
+        action: "task.claimed",
+        objectType: "task",
+        objectId: input.taskId,
+        payload: { leaseUntil },
+        createdAt: now,
+      });
+      return this.getTask(input.taskId) ?? null;
     });
   }
 

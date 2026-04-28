@@ -21,12 +21,15 @@ import { formatErrorMessage } from "../../../infra/errors.js";
 import { resolveHeartbeatSummaryForAgent } from "../../../infra/heartbeat-summary.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import {
+  materializeEmbeddedRunInKernel,
+  type EmbeddedRunKernelLedger,
+} from "../../../local-kernel/run-ledger-runtime.js";
+import {
   accountSandboxForRun,
   type AccountedSandboxRun,
 } from "../../../local-kernel/sandbox-broker-runtime.js";
 import {
-  brokerToolsForRun,
-  shouldUseRuntimeToolBroker,
+  brokerEffectiveToolsForRun,
   type BrokeredToolsForRun,
 } from "../../../local-kernel/tool-broker-runtime.js";
 import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
@@ -620,12 +623,29 @@ export async function runEmbeddedAttempt(
   let idleTimedOut = false;
   let timedOutDuringCompaction = false;
   let promptError: unknown = null;
+  let runKernelAssistantTexts: string[] = [];
+  let runKernelAttemptUsage: NormalizedUsage | undefined;
+  let runKernelMessageCount = 0;
+  let runKernelPromptErrorSource: "prompt" | "compaction" | "precheck" | null = null;
+  let runKernelLedger: EmbeddedRunKernelLedger | undefined;
   let brokeredToolRun: BrokeredToolsForRun | undefined;
   let accountedSandboxRun: AccountedSandboxRun | undefined;
   let emitDiagnosticRunCompleted:
     | ((outcome: "completed" | "aborted" | "error", err?: unknown) => void)
     | undefined;
   try {
+    runKernelLedger = await materializeEmbeddedRunInKernel({
+      agentId: sessionAgentId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      channel: params.messageChannel ?? params.messageProvider,
+      runId: params.runId,
+      provider: params.provider,
+      modelId: params.modelId,
+      trigger: params.trigger,
+      timeoutMs: params.timeoutMs,
+      onWarning: (message) => log.warn(message),
+    });
     if (sandbox?.enabled) {
       try {
         accountedSandboxRun = accountSandboxForRun({
@@ -633,6 +653,7 @@ export async function runEmbeddedAttempt(
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           runId: params.runId,
+          taskId: runKernelLedger?.taskId,
           backendId: sandbox.backendId,
           leaseMs: params.timeoutMs,
         });
@@ -944,25 +965,18 @@ export async function runEmbeddedAttempt(
       warn: (message) => log.warn(message),
     });
     const effectiveTools = [...tools, ...filteredBundledTools];
-    const brokeredEffectiveTools = (() => {
-      if (!shouldUseRuntimeToolBroker()) {
-        return effectiveTools;
-      }
-      try {
-        brokeredToolRun = brokerToolsForRun({
-          tools: effectiveTools,
-          agentId: sessionAgentId,
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          runId: params.runId,
-        });
-        return brokeredToolRun.tools;
-      } catch (err) {
-        log.warn(
-          `runtime tool broker unavailable; continuing with existing in-process tool execution: ${formatErrorMessage(err)}`,
-        );
-        return effectiveTools;
-      }
+    const brokeredEffectiveTools = await (async () => {
+      brokeredToolRun = await brokerEffectiveToolsForRun({
+        tools: effectiveTools,
+        agentId: sessionAgentId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        channel: params.messageChannel ?? params.messageProvider,
+        runId: params.runId,
+        taskId: runKernelLedger?.taskId,
+        onWarning: (message) => log.warn(message),
+      });
+      return brokeredToolRun?.tools ?? effectiveTools;
     })();
     const allowedToolNames = collectAllowedToolNames({
       tools: brokeredEffectiveTools,
@@ -2460,6 +2474,16 @@ export async function runEmbeddedAttempt(
             effectivePrompt,
             transcriptPrompt: params.transcriptPrompt,
           });
+          await runKernelLedger?.appendTranscriptEvent({
+            role: "user",
+            eventType: "prompt.submitted",
+            content: {
+              prompt: promptSubmission.prompt,
+              runtimeOnly: promptSubmission.runtimeOnly,
+              hasRuntimeSystemContext: Boolean(promptSubmission.runtimeSystemContext?.trim()),
+              imageCount: params.images?.length ?? 0,
+            },
+          });
           const runtimeSystemContext = promptSubmission.runtimeSystemContext?.trim();
           if (promptSubmission.runtimeOnly && runtimeSystemContext) {
             const runtimeSystemPrompt = composeSystemPromptWithHookContext({
@@ -3205,6 +3229,10 @@ export async function runEmbeddedAttempt(
         promptError: promptError ? formatErrorMessage(promptError) : undefined,
       });
       trajectoryEndRecorded = true;
+      runKernelAssistantTexts = [...assistantTexts];
+      runKernelAttemptUsage = attemptUsage;
+      runKernelMessageCount = messagesSnapshot.length;
+      runKernelPromptErrorSource = promptErrorSource;
 
       return {
         replayMetadata,
@@ -3291,6 +3319,36 @@ export async function runEmbeddedAttempt(
         brokeredToolRun?.close();
         brokeredToolRun = undefined;
       }
+      if (runKernelLedger) {
+        for (const text of runKernelAssistantTexts) {
+          await runKernelLedger.appendTranscriptEvent({
+            role: "assistant",
+            eventType: "message",
+            content: {
+              text,
+              runId: params.runId,
+            },
+          });
+        }
+        const ledgerFailure = cleanupError ?? promptError;
+        if (ledgerFailure) {
+          await runKernelLedger.fail(ledgerFailure);
+        } else {
+          await runKernelLedger.complete({
+            output: {
+              aborted,
+              externalAbort,
+              timedOut,
+              idleTimedOut,
+              timedOutDuringCompaction,
+              usage: runKernelAttemptUsage,
+              assistantTextCount: runKernelAssistantTexts.length,
+              messageCount: runKernelMessageCount,
+              promptErrorSource: runKernelPromptErrorSource,
+            },
+          });
+        }
+      }
       emitDiagnosticRunCompleted?.(
         cleanupError || promptError
           ? "error"
@@ -3309,6 +3367,8 @@ export async function runEmbeddedAttempt(
       promptError ?? new Error("run exited before diagnostic completion"),
     );
     brokeredToolRun?.close();
+    await runKernelLedger?.fail(promptError ?? new Error("run exited before kernel completion"));
+    runKernelLedger?.close();
     accountedSandboxRun?.release();
     accountedSandboxRun?.close();
     restoreSkillEnv?.();

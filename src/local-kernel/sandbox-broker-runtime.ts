@@ -7,6 +7,7 @@ export type AccountSandboxForRunInput = {
   sessionId: string;
   sessionKey?: string;
   runId?: string;
+  taskId?: string;
   backendId?: string;
   leaseMs?: number;
   dbPath?: string;
@@ -69,7 +70,7 @@ export function accountSandboxForRun(input: AccountSandboxForRunInput): Accounte
       new LocalSandboxBroker(db).releaseSandbox(allocation.id);
     }
   };
-  const taskId = input.runId?.trim() || input.sessionId;
+  const taskId = input.taskId?.trim() || input.runId?.trim() || input.sessionId;
   const leaseUntil = new Date(Date.now() + (input.leaseMs ?? 60 * 60 * 1000)).toISOString();
   db.upsertSession({
     id: input.sessionId,

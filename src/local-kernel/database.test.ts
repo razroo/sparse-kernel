@@ -127,16 +127,31 @@ describe("local runtime kernel database", () => {
   it("claims queued tasks atomically and reclaims expired leases", () => {
     const db = openTempDb();
     db.enqueueTask({ id: "task-a", kind: "demo", priority: 1 });
+    db.enqueueTask({ id: "task-b", kind: "demo", priority: 10 });
+    const claimedById = db.claimTask({
+      taskId: "task-a",
+      workerId: "worker-id",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 1000,
+    });
+    expect(claimedById).toMatchObject({
+      id: "task-a",
+      status: "running",
+      leaseOwner: "worker-id",
+    });
+    expect(db.claimTask({ taskId: "task-a", workerId: "worker-other" })).toBeNull();
+    expect(db.completeTask("task-a", "worker-id", {})).toBe(true);
+
     const claimed = db.claimNextTask({
       workerId: "worker-a",
       now: "2026-01-01T00:00:00.000Z",
       leaseMs: 1000,
     });
-    expect(claimed).toMatchObject({ id: "task-a", status: "running", leaseOwner: "worker-a" });
+    expect(claimed).toMatchObject({ id: "task-b", status: "running", leaseOwner: "worker-a" });
     expect(db.claimNextTask({ workerId: "worker-b" })).toBeNull();
     expect(db.releaseExpiredLeases("2026-01-01T00:00:02.000Z")).toBe(1);
     const reclaimed = db.claimNextTask({ workerId: "worker-b" });
-    expect(reclaimed).toMatchObject({ id: "task-a", status: "running", leaseOwner: "worker-b" });
+    expect(reclaimed).toMatchObject({ id: "task-b", status: "running", leaseOwner: "worker-b" });
   });
 
   it("records artifact metadata, dedupes blobs, and enforces access", async () => {

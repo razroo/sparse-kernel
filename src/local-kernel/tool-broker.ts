@@ -26,6 +26,11 @@ export type CapabilityToolBrokerOptions = {
   env?: NodeJS.ProcessEnv;
 };
 
+type BrowserToolLease = {
+  id: string;
+  release: () => Promise<void> | void;
+};
+
 function resolveOutputArtifactThresholdBytes(options: CapabilityToolBrokerOptions): number {
   if (options.outputArtifactThresholdBytes !== undefined) {
     return Math.max(0, Math.floor(options.outputArtifactThresholdBytes));
@@ -86,7 +91,7 @@ export class CapabilityToolBroker {
           throw err;
         }
         this.db.startToolCall(toolCallDbId);
-        const browserContext = this.maybeAcquireBrowserContext(tool, context, params);
+        const browserContext = await this.maybeAcquireBrowserContext(tool, context, params);
         try {
           const result = await execute(toolCallId, params, signal, onUpdate);
           const ledgerOutput = await this.prepareToolOutputForLedger(toolCallDbId, context, result);
@@ -97,7 +102,7 @@ export class CapabilityToolBroker {
           throw err;
         } finally {
           if (browserContext) {
-            new LocalBrowserBroker(this.db).releaseContext(browserContext.id);
+            await browserContext.release();
           }
         }
       },
@@ -171,11 +176,11 @@ export class CapabilityToolBroker {
     };
   }
 
-  private maybeAcquireBrowserContext(
+  private async maybeAcquireBrowserContext(
     tool: AnyAgentTool,
     context: ToolBrokerContext,
     params: unknown,
-  ) {
+  ): Promise<BrowserToolLease | null> {
     if (tool.name !== "browser" || !context.agentId) {
       return null;
     }
@@ -195,15 +200,57 @@ export class CapabilityToolBroker {
         : typeof record.url === "string"
           ? record.url
           : undefined;
+    const env = this.options.env ?? process.env;
     const shouldEnforceNetwork =
-      process.env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "1" ||
-      process.env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "true";
+      env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "1" ||
+      env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "true";
     const allowedOrigins =
       shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")
         ? [urlCandidate]
         : undefined;
+    const cdpEndpoint = env.OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT?.trim();
+    const browserBrokerMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
+    const shouldUseCdpBroker =
+      Boolean(cdpEndpoint) &&
+      (browserBrokerMode === "cdp" ||
+        browserBrokerMode === "sparsekernel" ||
+        browserBrokerMode === "sparse-kernel");
     try {
-      return new LocalBrowserBroker(this.db).acquireContext({
+      if (shouldUseCdpBroker && cdpEndpoint) {
+        const { createSparseKernelCdpBrowserBroker } =
+          await import("../../packages/browser-broker/src/index.js");
+        const broker = createSparseKernelCdpBrowserBroker({
+          baseUrl: env.OPENCLAW_SPARSEKERNEL_BASE_URL ?? env.SPARSEKERNEL_BASE_URL,
+        });
+        const materialized = await broker.acquireContext({
+          agent_id: context.agentId,
+          session_id: context.sessionId,
+          task_id: context.taskId,
+          trust_zone_id: trustZoneId,
+          cdp_endpoint: cdpEndpoint,
+          initial_url:
+            urlCandidate && (action === "open" || action === "navigate") ? urlCandidate : undefined,
+        });
+        this.db.recordAudit({
+          actor: { type: "agent", id: context.agentId },
+          action: "browser_context.materialized_cdp",
+          objectType: "browser_context",
+          objectId: materialized.ledger_context.id,
+          payload: {
+            trustZoneId,
+            taskId: context.taskId,
+            sessionId: context.sessionId,
+          },
+        });
+        return {
+          id: materialized.ledger_context.id,
+          release: async () => {
+            await broker.releaseContext(materialized.ledger_context.id);
+          },
+        };
+      }
+      const localBroker = new LocalBrowserBroker(this.db);
+      const record = localBroker.acquireContext({
         agentId: context.agentId,
         sessionId: context.sessionId,
         taskId: context.taskId,
@@ -211,6 +258,12 @@ export class CapabilityToolBroker {
         profileMode: profile === "user" ? "user" : "ephemeral",
         allowedOrigins,
       });
+      return {
+        id: record.id,
+        release: () => {
+          localBroker.releaseContext(record.id);
+        },
+      };
     } catch (err) {
       this.db.recordAudit({
         actor: { type: "agent", id: context.agentId },

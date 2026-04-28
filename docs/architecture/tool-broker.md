@@ -32,6 +32,8 @@ The `@openclaw/openclaw-sparsekernel-adapter` package wraps OpenClaw-shaped tool
 
 Embedded OpenClaw runs keep the local SQLite broker as the default compatibility path. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` or `OPENCLAW_SPARSEKERNEL_TOOL_BROKER=1` to route the embedded run through `sparsekerneld`; set `OPENCLAW_SPARSEKERNEL_BASE_URL` or `SPARSEKERNEL_BASE_URL` when the daemon is not on the default localhost URL. If daemon setup fails, OpenClaw falls back to the local runtime broker and logs the reason.
 
+The compatibility path auto-grants per-run tool invoke capabilities by default so existing behavior keeps working. Set `OPENCLAW_RUNTIME_TOOL_CAPABILITY_MODE=strict` to fail closed for sensitive tools (`exec`, `read`, `write`, `browser`, and filesystem/sandbox-shaped tool names) unless capabilities are granted by another policy path. `OPENCLAW_RUNTIME_TOOL_ALLOW_SENSITIVE=1` temporarily restores auto-grants for those tools.
+
 Before tools are wrapped, the embedded runner now creates a SparseKernel task for the active run, claims it with a worker lease, and appends transcript events for run start, prompt submission, assistant output, and completion or failure. Browser and sandbox allocations can attach to the same task id, so the ledger can answer which active step owned each expensive resource.
 
 V0 does not move native plugins out of process. It establishes the ledger and API contract so OpenClaw adapters can route invocation through SparseKernel now, then move untrusted or community plugins behind stronger process or sandbox boundaries later.

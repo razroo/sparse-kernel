@@ -117,7 +117,7 @@ const entrySpecs: readonly CommandGroupDescriptorSpec<SubCliRegistrar>[] = [
       exportName: "registerSandboxCli",
     },
     {
-      commandNames: ["runtime"],
+      commandNames: ["runtime", "sparsekernel"],
       loadModule: () => import("../runtime-cli.js"),
       exportName: "registerRuntimeCli",
     },

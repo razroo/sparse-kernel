@@ -36,6 +36,10 @@ Use:
 ```bash
 openclaw runtime migrate
 openclaw runtime inspect
+openclaw sparsekernel sessions
+openclaw sparsekernel tasks --kind openclaw.embedded_run
+openclaw sparsekernel transcript --session <session-id>
+openclaw sparsekernel recover
 openclaw runtime budget
 openclaw runtime budget set --trust-zone code_execution --max-runtime-seconds 600
 openclaw runtime vacuum
@@ -65,7 +69,7 @@ Retention policies are:
 - `durable`
 - `debug`
 
-`openclaw runtime prune` currently prunes old `ephemeral` and `debug` artifacts.
+`openclaw runtime prune` currently prunes old `ephemeral` and `debug` artifacts by default. Pass `--retention ephemeral,debug,session` only when session-scoped artifacts should also be removed.
 
 ## Trust zones
 
@@ -92,11 +96,11 @@ The browser broker model is:
 
 Important boundary: BrowserContext isolation is session isolation, not host isolation. Playwright route blocking and SSRF guards are useful controls, but they are not hard security boundaries.
 
-The broker applies configured trust-zone network policy to explicit allowed origins before allocating a context. This is an egress guard for brokered contexts, not a kernel or VM boundary.
+The broker applies configured trust-zone network policy to explicit allowed origins before allocating a context. This is an egress guard for brokered contexts, not a kernel or VM boundary. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=cdp` and `OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT=<loopback endpoint>` to make the OpenClaw browser tool acquire a real SparseKernel CDP context around the tool call.
 
 ## Sandbox broker
 
-The sandbox broker records allocations and leases behind a backend abstraction. Current v0 includes a local/no-isolation accounting backend, detects Docker/bwrap/minijail availability when those backends are requested, and preserves existing Docker/SSH/OpenShell sandbox systems for later wrapping.
+The sandbox broker records allocations and leases behind a backend abstraction. Current v0 includes a local/no-isolation accounting backend, detects Docker/bwrap/minijail availability when those backends are requested, and preserves existing Docker/SSH/OpenShell sandbox systems for later wrapping. In daemon broker mode, embedded runs grant sandbox allocation capability and allocate/release the `code_execution` sandbox lease through the SparseKernel daemon API before falling back to local accounting.
 
 Important boundary: `local/no_isolation` means accounting only. It does not provide process, filesystem, network, kernel, or VM isolation. Docker, bwrap, minijail, gVisor, or VM backends must be described by their actual guarantees when implemented.
 
@@ -109,7 +113,7 @@ Sensitive operations should check capabilities before they mutate state or alloc
 - sandbox allocation;
 - tool invocation.
 
-Capability grants, revokes, and denied checks are audited. Embedded agent runs now materialize the active step as a task lease and transcript events, then wrap the effective tool set with the local ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` to use the `sparsekerneld` run-ledger and ToolBroker path; daemon setup failures fall back to the local runtime broker. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
+Capability grants, revokes, and denied checks are audited. Embedded agent runs now materialize the active step as a task lease and transcript events, then wrap the effective tool set with the local ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` to use the `sparsekerneld` run-ledger and ToolBroker path; daemon setup failures fall back to the local runtime broker. Set `OPENCLAW_RUNTIME_TOOL_CAPABILITY_MODE=strict` to stop auto-granting sensitive tools such as `exec`, `read`, `write`, and `browser`; those tools then fail closed unless a capability already exists or `OPENCLAW_RUNTIME_TOOL_ALLOW_SENSITIVE=1` is set for compatibility. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
 
 The SparseKernel daemon now exposes the v0 run and ToolBroker lifecycle over local JSON: session upsert/list, transcript append/list, task enqueue/claim-by-id/claim-next/heartbeat/complete/fail, tool-call create/start/complete/fail/list, browser acquire/release, sandbox allocate/release, and artifact access. Tool-call create checks `tool` / `<tool-name>` / `invoke`; completion records small structured output plus `artifact_ids`; and every transition writes audit records. See [Tool Broker](/architecture/tool-broker).
 

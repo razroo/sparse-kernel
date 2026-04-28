@@ -48,6 +48,7 @@ export type OpenClawSparseKernelToolBrokerOptions = {
   runId?: string;
   taskId?: string;
   capabilityExpiresAt?: string;
+  autoGrantToolCapability?: (toolName: string) => boolean;
   outputArtifactThresholdBytes?: number;
 };
 
@@ -162,6 +163,10 @@ export class OpenClawSparseKernelToolBroker {
 
   private async ensureToolCapability(toolName: string): Promise<void> {
     if (this.preparedTools.has(toolName)) {
+      return;
+    }
+    if (this.options.autoGrantToolCapability?.(toolName) === false) {
+      this.preparedTools.add(toolName);
       return;
     }
     await this.options.kernel.grantCapability({

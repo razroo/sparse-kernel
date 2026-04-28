@@ -6,16 +6,30 @@ export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
 export { checkTrustZoneNetworkUrl } from "./network-policy.js";
 export type { NetworkPolicyDecision } from "./network-policy.js";
-export { compactLedgerContent, materializeEmbeddedRunInKernel } from "./run-ledger-runtime.js";
+export {
+  compactLedgerContent,
+  materializeEmbeddedRunInKernel,
+  recoverEmbeddedRunTasks,
+} from "./run-ledger-runtime.js";
 export type {
   EmbeddedRunKernelLedger,
   EmbeddedRunKernelLedgerClient,
   KernelTranscriptEventInput,
   MaterializeEmbeddedRunInKernelInput,
+  RecoverEmbeddedRunTasksInput,
+  RecoverEmbeddedRunTasksResult,
 } from "./run-ledger-runtime.js";
 export { LocalSandboxBroker } from "./sandbox-broker.js";
-export { accountSandboxForRun } from "./sandbox-broker-runtime.js";
-export type { AccountedSandboxRun, AccountSandboxForRunInput } from "./sandbox-broker-runtime.js";
+export {
+  accountSandboxForRun,
+  accountSandboxForRunEffective,
+  accountSandboxForRunWithDaemon,
+} from "./sandbox-broker-runtime.js";
+export type {
+  AccountedSandboxRun,
+  AccountSandboxForRunInput,
+  SparseKernelSandboxAccountingClient,
+} from "./sandbox-broker-runtime.js";
 export type {
   SandboxAllocationRequest,
   SandboxBackendKind,

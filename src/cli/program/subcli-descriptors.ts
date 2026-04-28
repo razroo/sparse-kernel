@@ -69,6 +69,11 @@ const subCliCommandCatalog = defineCommandDescriptorCatalog([
     hasSubcommands: true,
   },
   {
+    name: "sparsekernel",
+    description: "Manage the SparseKernel runtime ledger",
+    hasSubcommands: true,
+  },
+  {
     name: "tui",
     description: "Open a terminal UI connected to the Gateway",
     hasSubcommands: false,

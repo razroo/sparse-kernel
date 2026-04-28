@@ -8,11 +8,13 @@ import {
 } from "../config/sessions/runtime-ledger.js";
 import {
   accountSandboxForRun,
+  accountSandboxForRunEffective,
   checkTrustZoneNetworkUrl,
   ContentAddressedArtifactStore,
   LocalBrowserBroker,
   LocalKernelDatabase,
   LocalSandboxBroker,
+  recoverEmbeddedRunTasks,
 } from "./index.js";
 import { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat.js";
 
@@ -152,6 +154,36 @@ describe("local runtime kernel database", () => {
     expect(db.releaseExpiredLeases("2026-01-01T00:00:02.000Z")).toBe(1);
     const reclaimed = db.claimNextTask({ workerId: "worker-b" });
     expect(reclaimed).toMatchObject({ id: "task-b", status: "running", leaseOwner: "worker-b" });
+  });
+
+  it("recovers dead-owner embedded run tasks for restart claim", () => {
+    const db = openTempDb();
+    db.upsertSession({ id: "session-a", agentId: "main" });
+    db.enqueueTask({
+      id: "run-a",
+      kind: "openclaw.embedded_run",
+      sessionId: "session-a",
+    });
+    expect(
+      db.claimTask({
+        taskId: "run-a",
+        workerId: "openclaw:424242:run-a",
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      }),
+    ).toMatchObject({ status: "running" });
+    const result = recoverEmbeddedRunTasks({
+      db,
+      taskId: "run-a",
+      now: "2026-01-01T00:00:10.000Z",
+      isProcessAlive: () => false,
+    });
+    expect(result).toEqual({ recovered: 1, expired: 0, deadOwners: 1 });
+    expect(db.getTask("run-a")).toMatchObject({ status: "queued" });
+    expect(db.claimTask({ taskId: "run-a", workerId: "openclaw:1:run-a" })).toMatchObject({
+      status: "running",
+      leaseOwner: "openclaw:1:run-a",
+    });
   });
 
   it("records artifact metadata, dedupes blobs, and enforces access", async () => {
@@ -337,18 +369,66 @@ describe("local runtime kernel database", () => {
         backend: "local/no_isolation",
         status: "active",
       });
-      const lease = run.db.db
+      const db = run.db;
+      if (!db) {
+        throw new Error("expected local sandbox accounting DB");
+      }
+      const lease = db.db
         .prepare("SELECT status, owner_task_id FROM resource_leases WHERE id = ?")
         .get(allocation.id) as { status: string; owner_task_id: string | null };
       expect(lease).toEqual({ status: "active", owner_task_id: null });
       run.release();
-      const released = run.db.db
+      const released = db.db
         .prepare("SELECT status FROM resource_leases WHERE id = ?")
         .get(allocation.id) as { status: string };
       expect(released.status).toBe("released");
     } finally {
       run.close();
     }
+  });
+
+  it("can account sandbox allocations through the SparseKernel daemon API", async () => {
+    const calls: string[] = [];
+    const run = await accountSandboxForRunEffective({
+      agentId: "main",
+      sessionId: "session-a",
+      runId: "run-a",
+      taskId: "task-a",
+      backendId: "docker",
+      env: { OPENCLAW_RUNTIME_TOOL_BROKER: "daemon" } as NodeJS.ProcessEnv,
+      daemonKernel: {
+        async grantCapability(input) {
+          calls.push(`grant:${input.resource_type}:${input.resource_id}`);
+          return {
+            id: "cap-a",
+            subject_type: input.subject_type,
+            subject_id: input.subject_id,
+            resource_type: input.resource_type,
+            resource_id: input.resource_id,
+            action: input.action,
+            created_at: "2026-01-01T00:00:00.000Z",
+          };
+        },
+        async allocateSandbox(input) {
+          calls.push(`allocate:${input.backend}`);
+          return {
+            id: "sandbox-a",
+            task_id: input.task_id,
+            trust_zone_id: input.trust_zone_id,
+            backend: input.backend ?? "local/no_isolation",
+            status: "active",
+            created_at: "2026-01-01T00:00:00.000Z",
+          };
+        },
+        async releaseSandbox(id) {
+          calls.push(`release:${id}`);
+          return true;
+        },
+      },
+    });
+    expect(run.allocation).toMatchObject({ id: "sandbox-a", backend: "docker" });
+    await run.release();
+    expect(calls).toEqual(["grant:sandbox:code_execution", "allocate:docker", "release:sandbox-a"]);
   });
 
   it("imports legacy sessions and exports JSONL compatibility output", async () => {

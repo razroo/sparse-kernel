@@ -25,9 +25,9 @@ import {
   resolveRuntimeToolBrokerMode,
 } from "./index.js";
 
-function makeTool(): AnyAgentTool {
+function makeTool(name = "sensitive_tool"): AnyAgentTool {
   return {
-    name: "sensitive_tool",
+    name,
     label: "Sensitive Tool",
     description: "test",
     parameters: Type.Object({}),
@@ -291,6 +291,26 @@ describe("CapabilityToolBroker", () => {
       expect(row.status).toBe("succeeded");
     } finally {
       db.close();
+    }
+  });
+
+  it("does not auto-grant sensitive tools in strict capability mode", async () => {
+    const run = brokerToolsForRun({
+      tools: [makeTool("exec")],
+      agentId: "main",
+      sessionId: "session-a",
+      runId: "run-a",
+      dbPath: ":memory:",
+      env: { OPENCLAW_RUNTIME_TOOL_CAPABILITY_MODE: "strict" } as NodeJS.ProcessEnv,
+    });
+    try {
+      await expect(run.tools[0]?.execute("call-exec", {})).rejects.toThrow(/denied/);
+      const grants = run.db.db
+        .prepare("SELECT COUNT(*) AS count FROM capabilities WHERE resource_type = 'tool'")
+        .get() as { count: number };
+      expect(grants.count).toBe(0);
+    } finally {
+      run.close();
     }
   });
 

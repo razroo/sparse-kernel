@@ -151,6 +151,22 @@ function makeBroker(kernel: FakeKernel, overrides: Partial<OpenClawSparseKernelT
   return { broker, tool };
 }
 
+function makeStrictBroker(kernel: FakeKernel) {
+  const broker = new OpenClawSparseKernelToolBroker({
+    kernel,
+    agentId: "agent-a",
+    sessionId: "session-a",
+    runId: "run-a",
+    taskId: "task-a",
+    autoGrantToolCapability: () => false,
+  });
+  const tool: OpenClawSparseKernelTool = {
+    name: "exec",
+    execute: async () => ({ ok: true }),
+  };
+  return { broker, tool };
+}
+
 describe("@openclaw/openclaw-sparsekernel-adapter", () => {
   it("wraps a real tool execution with daemon session, capability, and tool-call lifecycle", async () => {
     const kernel = new FakeKernel();
@@ -246,5 +262,16 @@ describe("@openclaw/openclaw-sparsekernel-adapter", () => {
       },
       artifact_ids: ["artifact_1"],
     });
+  });
+
+  it("can fail closed by withholding automatic sensitive tool grants", async () => {
+    const kernel = new FakeKernel();
+    const { broker, tool } = makeStrictBroker(kernel);
+
+    const wrapped = broker.wrapTool(tool);
+    await expect(wrapped.execute("provider-call-4", {})).rejects.toThrow("denied: exec");
+
+    expect(kernel.grants).toEqual([]);
+    expect(kernel.creates).toEqual([]);
   });
 });

@@ -10,7 +10,9 @@ import {
   exportSessionAsJsonl,
   importLegacySessionStore,
   openLocalKernelDatabase,
+  recoverEmbeddedRunTasks,
 } from "../local-kernel/index.js";
+import type { RuntimeRetentionPolicy } from "../local-kernel/index.js";
 import type { OutputRuntimeEnv, RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
 
@@ -83,7 +85,7 @@ export async function runtimeVacuumCommand(
 }
 
 export async function runtimePruneCommand(
-  opts: { olderThan?: string; json?: boolean },
+  opts: { olderThan?: string; retention?: string; json?: boolean },
   runtime: RuntimeEnv,
 ): Promise<void> {
   const olderThanRaw = opts.olderThan ?? "7d";
@@ -96,13 +98,22 @@ export async function runtimePruneCommand(
     return;
   }
   const olderThan = new Date(Date.now() - olderThanMs).toISOString();
+  let retentionPolicies: RuntimeRetentionPolicy[] | undefined;
+  try {
+    retentionPolicies = parseRetentionPolicies(opts.retention);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
   const db = openLocalKernelDatabase();
   try {
     const store = new ContentAddressedArtifactStore(db);
-    const result = store.prune({ olderThan });
+    const result = store.prune({ olderThan, retentionPolicies });
     if (opts.json) {
       writeRuntimeJson(runtime, {
         olderThan,
+        retentionPolicies,
         prunedArtifacts: result.artifacts.length,
         deletedFiles: result.deletedFiles,
       });
@@ -110,6 +121,169 @@ export async function runtimePruneCommand(
     }
     runtime.log(
       `Pruned ${result.artifacts.length} runtime artifact record(s), deleted ${result.deletedFiles} file(s).`,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function parseLimit(value: string | undefined, defaultValue: number): number {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error("limit must be a positive integer");
+  }
+  return Math.min(1000, parsed);
+}
+
+function parseRetentionPolicies(raw: string | undefined): RuntimeRetentionPolicy[] | undefined {
+  if (!raw?.trim()) {
+    return undefined;
+  }
+  const policies = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const valid = new Set(["ephemeral", "session", "durable", "debug"]);
+  const invalid = policies.find((policy) => !valid.has(policy));
+  if (invalid) {
+    throw new Error(`Unsupported retention policy: ${invalid}`);
+  }
+  return policies as RuntimeRetentionPolicy[];
+}
+
+export async function runtimeSessionsCommand(
+  opts: { agent?: string; limit?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let limit: number;
+  try {
+    limit = parseLimit(opts.limit, 50);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const sessions = db.listSessions({ agentId: opts.agent, limit });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { sessions });
+      return;
+    }
+    if (sessions.length === 0) {
+      runtime.log("No SparseKernel sessions found.");
+      return;
+    }
+    for (const session of sessions) {
+      runtime.log(
+        `${session.id} agent=${session.agentId} status=${session.status} updated=${session.updatedAt}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeTasksCommand(
+  opts: { status?: string; kind?: string; limit?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let limit: number;
+  try {
+    limit = parseLimit(opts.limit, 50);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const tasks = db.listTasks({ status: opts.status, kind: opts.kind, limit });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { tasks });
+      return;
+    }
+    if (tasks.length === 0) {
+      runtime.log("No SparseKernel tasks found.");
+      return;
+    }
+    for (const task of tasks) {
+      runtime.log(
+        `${task.id} kind=${task.kind} status=${task.status} priority=${task.priority} updated=${task.updatedAt}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeTranscriptCommand(
+  opts: { session?: string; limit?: string; json?: boolean; format?: string },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const sessionId = opts.session?.trim();
+  if (!sessionId) {
+    runtime.error("--session <id> is required");
+    runtime.exit(1);
+    return;
+  }
+  if (opts.format && opts.format !== "events" && opts.format !== "jsonl") {
+    runtime.error("--format must be events or jsonl");
+    runtime.exit(1);
+    return;
+  }
+  let limit: number;
+  try {
+    limit = parseLimit(opts.limit, 100);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    if (opts.format === "jsonl") {
+      writeText(runtime, exportSessionAsJsonl({ db, sessionId }));
+      return;
+    }
+    const events = db.listTranscriptEvents(sessionId).slice(-limit);
+    if (opts.json) {
+      writeRuntimeJson(runtime, { sessionId, events });
+      return;
+    }
+    if (events.length === 0) {
+      runtime.log(`No transcript events found for ${sessionId}.`);
+      return;
+    }
+    for (const event of events) {
+      runtime.log(`#${event.seq} ${event.role}/${event.eventType} ${event.createdAt}`);
+      if (event.content !== undefined) {
+        runtime.log(JSON.stringify(event.content));
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeRecoverCommand(
+  opts: { task?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const db = openLocalKernelDatabase();
+  try {
+    const released = db.releaseExpiredLeases();
+    const embeddedRuns = recoverEmbeddedRunTasks({ db, taskId: opts.task });
+    const result = { releasedExpiredLeases: released, embeddedRuns };
+    if (opts.json) {
+      writeRuntimeJson(runtime, result);
+      return;
+    }
+    runtime.log(
+      `Recovered ${embeddedRuns.recovered} embedded run task(s); released ${released} expired lease(s).`,
     );
   } finally {
     db.close();

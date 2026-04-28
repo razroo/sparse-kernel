@@ -92,6 +92,19 @@ type LedgerBackend =
       kernel: EmbeddedRunKernelLedgerClient;
     };
 
+export type RecoverEmbeddedRunTasksInput = {
+  db: LocalKernelDatabase;
+  taskId?: string;
+  now?: string;
+  isProcessAlive?: (pid: number) => boolean;
+};
+
+export type RecoverEmbeddedRunTasksResult = {
+  recovered: number;
+  expired: number;
+  deadOwners: number;
+};
+
 export function compactLedgerContent(
   content: unknown,
   limitBytes = DEFAULT_LEDGER_CONTENT_LIMIT_BYTES,
@@ -185,6 +198,60 @@ function runTaskInput(input: MaterializeEmbeddedRunInKernelInput): unknown {
     modelId: input.modelId,
     trigger: input.trigger,
   };
+}
+
+function parseOpenClawWorkerPid(leaseOwner: string | undefined): number | undefined {
+  const match = /^openclaw:(\d+):/.exec(leaseOwner ?? "");
+  if (!match) {
+    return undefined;
+  }
+  const pid = Number.parseInt(match[1] ?? "", 10);
+  return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+}
+
+function defaultIsProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
+export function recoverEmbeddedRunTasks(
+  input: RecoverEmbeddedRunTasksInput,
+): RecoverEmbeddedRunTasksResult {
+  const now = input.now ?? new Date().toISOString();
+  const tasks = input.taskId
+    ? input.db
+        .listTasks({ kind: EMBEDDED_RUN_TASK_KIND, status: "running", limit: 1000 })
+        .filter((task) => task.id === input.taskId)
+    : input.db.listTasks({ kind: EMBEDDED_RUN_TASK_KIND, status: "running", limit: 1000 });
+  const isProcessAlive = input.isProcessAlive ?? defaultIsProcessAlive;
+  let recovered = 0;
+  let expired = 0;
+  let deadOwners = 0;
+  for (const task of tasks) {
+    const leaseExpired = Boolean(task.leaseUntil && task.leaseUntil <= now);
+    const ownerPid = parseOpenClawWorkerPid(task.leaseOwner);
+    const ownerDead = ownerPid !== undefined && !isProcessAlive(ownerPid);
+    if (!leaseExpired && !ownerDead) {
+      continue;
+    }
+    const reason = leaseExpired
+      ? "expired embedded-run lease"
+      : `dead embedded-run worker pid ${ownerPid}`;
+    if (input.db.recoverTaskLease({ taskId: task.id, reason, now })) {
+      recovered += 1;
+      if (leaseExpired) {
+        expired += 1;
+      } else {
+        deadOwners += 1;
+      }
+    }
+  }
+  return { recovered, expired, deadOwners };
 }
 
 function createHeartbeat(params: {
@@ -434,6 +501,7 @@ function createLocalRunLedger(
   const leaseSeconds = resolveLeaseSeconds(input);
   const db = openLocalKernelDatabase({ dbPath: input.dbPath, env: input.env });
   try {
+    recoverEmbeddedRunTasks({ db, taskId });
     db.upsertSession({
       id: input.sessionId,
       agentId: input.agentId,

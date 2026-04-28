@@ -51,6 +51,46 @@ function isFalsyBrokerFlag(raw: string | undefined): boolean {
   return normalized === "off" || normalized === "0" || normalized === "false";
 }
 
+const SENSITIVE_TOOL_NAMES = new Set([
+  "browser",
+  "exec",
+  "bash",
+  "shell",
+  "read",
+  "write",
+  "edit",
+  "patch",
+  "apply_patch",
+]);
+
+export function isSparseKernelSensitiveTool(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase();
+  if (SENSITIVE_TOOL_NAMES.has(normalized)) {
+    return true;
+  }
+  return (
+    normalized.startsWith("mcp__") ||
+    normalized.includes("filesystem") ||
+    normalized.includes("sandbox")
+  );
+}
+
+export function shouldAutoGrantToolCapability(
+  toolName: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const mode =
+    env.OPENCLAW_RUNTIME_TOOL_CAPABILITY_MODE?.trim().toLowerCase() ??
+    env.OPENCLAW_SPARSEKERNEL_TOOL_CAPABILITY_MODE?.trim().toLowerCase();
+  if (mode !== "strict" && mode !== "fail-closed") {
+    return true;
+  }
+  if (!isSparseKernelSensitiveTool(toolName)) {
+    return true;
+  }
+  return isTruthyBrokerFlag(env.OPENCLAW_RUNTIME_TOOL_ALLOW_SENSITIVE);
+}
+
 export function resolveRuntimeToolBrokerMode(
   env: NodeJS.ProcessEnv = process.env,
 ): RuntimeToolBrokerMode {
@@ -105,20 +145,22 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
       subjectId: input.runId?.trim() || input.sessionId,
     };
     for (const tool of input.tools) {
-      db.grantCapability({
-        subjectType: subject.subjectType,
-        subjectId: subject.subjectId,
-        resourceType: "tool",
-        resourceId: tool.name,
-        action: "invoke",
-        constraints: {
-          agentId: input.agentId,
-          sessionId: input.sessionId,
-          sessionKey: input.sessionKey,
-          runId: input.runId,
-        },
-        expiresAt: capabilityExpiresAt,
-      });
+      if (shouldAutoGrantToolCapability(tool.name, input.env)) {
+        db.grantCapability({
+          subjectType: subject.subjectType,
+          subjectId: subject.subjectId,
+          resourceType: "tool",
+          resourceId: tool.name,
+          action: "invoke",
+          constraints: {
+            agentId: input.agentId,
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+            runId: input.runId,
+          },
+          expiresAt: capabilityExpiresAt,
+        });
+      }
       if (tool.name === "browser") {
         for (const trustZoneId of ["public_web", "authenticated_web", "user_browser_profile"]) {
           db.grantCapability({
@@ -175,6 +217,7 @@ export async function brokerToolsForRunWithDaemon(
         runId: input.runId,
         taskId: input.taskId,
         capabilityExpiresAt,
+        autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
         outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
       })
     : createOpenClawSparseKernelToolBroker({
@@ -189,6 +232,7 @@ export async function brokerToolsForRunWithDaemon(
         runId: input.runId,
         taskId: input.taskId,
         capabilityExpiresAt,
+        autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
         outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
       });
   await broker.prepareRun(input.tools);

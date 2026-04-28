@@ -14,6 +14,7 @@ import type {
   CapabilityCheckInput,
   EnqueueTaskInput,
   GrantCapabilityInput,
+  KernelActor,
   KernelAgentInput,
   KernelAuditInput,
   KernelSessionInput,
@@ -75,6 +76,17 @@ type TaskRow = {
   result_artifact_id: string | null;
   created_at: string;
   updated_at: string;
+};
+
+type AuditRow = {
+  id: number | bigint;
+  actor_type: string | null;
+  actor_id: string | null;
+  action: string;
+  object_type: string | null;
+  object_id: string | null;
+  payload_json: string | null;
+  created_at: string;
 };
 
 type ArtifactRow = {
@@ -253,6 +265,19 @@ function toTask(row: TaskRow): KernelTaskRecord {
     ...(optionalText(row.result_artifact_id) ? { resultArtifactId: row.result_artifact_id! } : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function toAudit(row: AuditRow) {
+  return {
+    id: numberFromSql(row.id) ?? 0,
+    ...(optionalText(row.actor_type) ? { actorType: row.actor_type! } : {}),
+    ...(optionalText(row.actor_id) ? { actorId: row.actor_id! } : {}),
+    action: row.action,
+    ...(optionalText(row.object_type) ? { objectType: row.object_type! } : {}),
+    ...(optionalText(row.object_id) ? { objectId: row.object_id! } : {}),
+    ...(row.payload_json ? { payload: parseJsonText(row.payload_json) } : {}),
+    createdAt: row.created_at,
   };
 }
 
@@ -552,6 +577,19 @@ export class LocalKernelDatabase {
       );
   }
 
+  listAudit(input: { limit?: number } = {}) {
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 100)));
+    const rows = this.db
+      .prepare(
+        `SELECT id, actor_type, actor_id, action, object_type, object_id, payload_json, created_at
+         FROM audit_log
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(limit) as AuditRow[];
+    return rows.map(toAudit);
+  }
+
   ensureAgent(input: KernelAgentInput): void {
     const now = input.now ?? nowIso();
     this.db
@@ -607,6 +645,27 @@ export class LocalKernelDatabase {
       | SessionRow
       | undefined;
     return row ? toSession(row) : undefined;
+  }
+
+  listSessions(input: { agentId?: string; limit?: number } = {}): KernelSessionRecord[] {
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 50)));
+    const rows = input.agentId?.trim()
+      ? (this.db
+          .prepare(
+            `SELECT * FROM sessions
+             WHERE agent_id = ?
+             ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, id ASC
+             LIMIT ?`,
+          )
+          .all(input.agentId.trim(), limit) as SessionRow[])
+      : (this.db
+          .prepare(
+            `SELECT * FROM sessions
+             ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, id ASC
+             LIMIT ?`,
+          )
+          .all(limit) as SessionRow[]);
+    return rows.map(toSession);
   }
 
   appendTranscriptEvent(input: TranscriptEventInput): TranscriptEventRecord {
@@ -817,6 +876,60 @@ export class LocalKernelDatabase {
   getTask(id: string): KernelTaskRecord | undefined {
     const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow | undefined;
     return row ? toTask(row) : undefined;
+  }
+
+  listTasks(input: { status?: string; kind?: string; limit?: number } = {}): KernelTaskRecord[] {
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 50)));
+    const predicates: string[] = [];
+    const args: SQLInputValue[] = [];
+    if (input.status?.trim()) {
+      predicates.push("status = ?");
+      args.push(input.status.trim());
+    }
+    if (input.kind?.trim()) {
+      predicates.push("kind = ?");
+      args.push(input.kind.trim());
+    }
+    const where = predicates.length > 0 ? `WHERE ${predicates.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM tasks
+         ${where}
+         ORDER BY priority DESC, created_at DESC, id ASC
+         LIMIT ?`,
+      )
+      .all(...args, limit) as TaskRow[];
+    return rows.map(toTask);
+  }
+
+  recoverTaskLease(input: {
+    taskId: string;
+    reason: string;
+    actor?: KernelActor;
+    now?: string;
+  }): boolean {
+    const now = input.now ?? nowIso();
+    const updated = changes(
+      this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'queued', lease_owner = NULL, lease_until = NULL, updated_at = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(now, input.taskId),
+    );
+    if (updated === 1) {
+      this.recordTaskEvent(input.taskId, "recovered", { reason: input.reason }, now);
+      this.recordAudit({
+        actor: input.actor ?? { type: "runtime" },
+        action: "task.recovered",
+        objectType: "task",
+        objectId: input.taskId,
+        payload: { reason: input.reason },
+        createdAt: now,
+      });
+    }
+    return updated === 1;
   }
 
   claimNextTask(input: {

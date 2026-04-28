@@ -5,6 +5,10 @@ import {
   runtimeInspectCommand,
   runtimeMigrateCommand,
   runtimePruneCommand,
+  runtimeRecoverCommand,
+  runtimeSessionsCommand,
+  runtimeTasksCommand,
+  runtimeTranscriptCommand,
   runtimeVacuumCommand,
 } from "../commands/runtime.js";
 import { defaultRuntime } from "../runtime.js";
@@ -28,6 +32,7 @@ function createRunner(
 export function registerRuntimeCli(program: Command) {
   const runtime = program
     .command("runtime")
+    .alias("sparsekernel")
     .description("Manage the local runtime kernel ledger")
     .addHelpText(
       "after",
@@ -35,6 +40,10 @@ export function registerRuntimeCli(program: Command) {
         `\n${theme.heading("Examples:")}\n${formatHelpExamples([
           ["openclaw runtime migrate", "Create or update the runtime SQLite DB."],
           ["openclaw runtime inspect --json", "Inspect runtime ledger counts."],
+          ["openclaw sparsekernel sessions --json", "List SparseKernel sessions."],
+          ["openclaw sparsekernel tasks --kind openclaw.embedded_run", "List runtime tasks."],
+          ["openclaw sparsekernel transcript --session <id>", "Show transcript events."],
+          ["openclaw sparsekernel recover", "Recover expired or dead embedded-run leases."],
           ["openclaw runtime budget", "List trust-zone budgets and usage."],
           [
             "openclaw runtime budget set --trust-zone code_execution --max-runtime-seconds 600",
@@ -81,6 +90,84 @@ export function registerRuntimeCli(program: Command) {
     );
 
   runtime
+    .command("sessions")
+    .description("List SparseKernel ledger sessions")
+    .option("--agent <id>", "Filter by agent id")
+    .option("--limit <n>", "Maximum rows to return", "50")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeSessionsCommand(
+          {
+            agent: opts.agent as string | undefined,
+            limit: opts.limit as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("tasks")
+    .description("List SparseKernel ledger tasks")
+    .option("--status <status>", "Filter by task status")
+    .option("--kind <kind>", "Filter by task kind")
+    .option("--limit <n>", "Maximum rows to return", "50")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeTasksCommand(
+          {
+            status: opts.status as string | undefined,
+            kind: opts.kind as string | undefined,
+            limit: opts.limit as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("transcript")
+    .description("Show SparseKernel transcript events")
+    .requiredOption("--session <id>", "Runtime session id")
+    .option("--limit <n>", "Maximum events to return", "100")
+    .option("--format <format>", "events or jsonl", "events")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeTranscriptCommand(
+          {
+            session: opts.session as string | undefined,
+            limit: opts.limit as string | undefined,
+            format: opts.format as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("recover")
+    .description("Recover expired SparseKernel leases and dead embedded-run tasks")
+    .option("--task <id>", "Only recover one embedded-run task")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeRecoverCommand(
+          {
+            task: opts.task as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
     .command("budget")
     .description("Inspect runtime trust-zone budgets and usage")
     .option("--since <duration>", "Only summarize usage newer than this duration")
@@ -122,12 +209,17 @@ export function registerRuntimeCli(program: Command) {
     .command("prune")
     .description("Prune old ephemeral/debug runtime artifacts")
     .option("--older-than <duration>", "Artifact age cutoff (default: 7d)", "7d")
+    .option(
+      "--retention <policies>",
+      "Comma-separated retention policies (default: ephemeral,debug)",
+    )
     .option("--json", "Output JSON", false)
     .action(
       createRunner((opts) =>
         runtimePruneCommand(
           {
             olderThan: opts.olderThan as string | undefined,
+            retention: opts.retention as string | undefined,
             json: Boolean(opts.json),
           },
           defaultRuntime,

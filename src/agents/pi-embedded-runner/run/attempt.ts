@@ -25,7 +25,7 @@ import {
   type EmbeddedRunKernelLedger,
 } from "../../../local-kernel/run-ledger-runtime.js";
 import {
-  accountSandboxForRun,
+  accountSandboxForRunEffective,
   type AccountedSandboxRun,
 } from "../../../local-kernel/sandbox-broker-runtime.js";
 import {
@@ -648,7 +648,7 @@ export async function runEmbeddedAttempt(
     });
     if (sandbox?.enabled) {
       try {
-        accountedSandboxRun = accountSandboxForRun({
+        accountedSandboxRun = await accountSandboxForRunEffective({
           agentId: sessionAgentId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -656,6 +656,7 @@ export async function runEmbeddedAttempt(
           taskId: runKernelLedger?.taskId,
           backendId: sandbox.backendId,
           leaseMs: params.timeoutMs,
+          onWarning: (message) => log.warn(message),
         });
       } catch (err) {
         log.warn(
@@ -3369,7 +3370,7 @@ export async function runEmbeddedAttempt(
     brokeredToolRun?.close();
     await runKernelLedger?.fail(promptError ?? new Error("run exited before kernel completion"));
     runKernelLedger?.close();
-    accountedSandboxRun?.release();
+    await accountedSandboxRun?.release();
     accountedSandboxRun?.close();
     restoreSkillEnv?.();
   }

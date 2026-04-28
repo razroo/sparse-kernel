@@ -4,6 +4,7 @@ import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
 import { ContentAddressedArtifactStore } from "./artifact-store.js";
 import { LocalBrowserBroker } from "./browser-broker.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
+import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
 import { attachSparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 import type { LocalKernelDatabase } from "./database.js";
@@ -31,6 +32,7 @@ export type CapabilityToolBrokerOptions = {
   browserCdpProxyFactory?: (
     input: SparseKernelBrowserToolCdpProxyInput,
   ) => Promise<BrowserToolLease>;
+  browserNativeAcquire?: typeof acquireNativeBrowserProcess;
 };
 
 export type BrowserToolLease = {
@@ -65,6 +67,32 @@ function resolveOutputArtifactThresholdBytes(options: CapabilityToolBrokerOption
 function isBrowserBrokerDisabled(raw: string | undefined): boolean {
   const normalized = raw?.trim().toLowerCase();
   return normalized === "off" || normalized === "0" || normalized === "false";
+}
+
+function isTruthyBrowserFlag(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "on" || normalized === "1" || normalized === "true";
+}
+
+function wrapBrowserProcessRelease(
+  lease: BrowserToolLease,
+  releaseBrowserProcess: () => Promise<void>,
+): BrowserToolLease {
+  let released = false;
+  return {
+    ...lease,
+    release: async () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      try {
+        await lease.release();
+      } finally {
+        await releaseBrowserProcess();
+      }
+    },
+  };
 }
 
 export class CapabilityToolBroker {
@@ -248,7 +276,9 @@ export class CapabilityToolBroker {
         ? await resolveSparseKernelBrowserCdpEndpoint({
             env,
             fetchImpl: this.options.browserControlFetch,
+            nativeAcquire: this.options.browserNativeAcquire,
             profile: profile || undefined,
+            trustZoneId,
           })
         : null;
     const shouldUseCdpBroker =
@@ -261,6 +291,11 @@ export class CapabilityToolBroker {
         browserBrokerMode === "managed" ||
         browserBrokerMode === "managed-cdp" ||
         browserBrokerMode === "sparsekernel-managed" ||
+        browserBrokerMode === "native" ||
+        browserBrokerMode === "native-cdp" ||
+        browserBrokerMode === "sparsekernel-native" ||
+        browserBrokerMode === "sparse-kernel-native" ||
+        isTruthyBrowserFlag(env.OPENCLAW_SPARSEKERNEL_BROWSER_NATIVE) ||
         Boolean(env.OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL?.trim()) ||
         Boolean(env.OPENCLAW_BROWSER_CONTROL_URL?.trim()));
     const leaseKey = [
@@ -284,7 +319,7 @@ export class CapabilityToolBroker {
               await import("./browser-tool-cdp-proxy.js");
             return await createSparseKernelBrowserToolCdpProxy(input);
           });
-        const lease = await createBrowserProxy({
+        const proxyLease = await createBrowserProxy({
           agentId: context.agentId,
           sessionId: context.sessionId,
           taskId: context.taskId,
@@ -299,6 +334,9 @@ export class CapabilityToolBroker {
             permission: "read",
           },
         });
+        const lease = managedCdp.release
+          ? wrapBrowserProcessRelease(proxyLease, managedCdp.release)
+          : proxyLease;
         this.db.recordAudit({
           actor: { type: "agent", id: context.agentId },
           action: "browser_context.materialized_cdp",

@@ -6,6 +6,7 @@ import {
 } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
+import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import { openLocalKernelDatabase, type LocalKernelDatabase } from "./database.js";
 import { CapabilityToolBroker } from "./tool-broker.js";
 
@@ -25,6 +26,7 @@ export type BrokerToolsForRunInput = {
   sparseKernelBaseUrl?: string;
   daemonKernel?: OpenClawSparseKernelToolBrokerClient;
   env?: NodeJS.ProcessEnv;
+  browserNativeAcquire?: typeof acquireNativeBrowserProcess;
 };
 
 export type BrokeredToolsForRun = {
@@ -191,6 +193,7 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
       artifactRootDir: input.artifactRootDir,
       outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
       env: input.env,
+      browserNativeAcquire: input.browserNativeAcquire,
     });
     return {
       tools: broker.wrapTools(input.tools, {
@@ -309,6 +312,11 @@ function createDaemonBrowserProxyFactory(
       browserBrokerMode === "managed" ||
       browserBrokerMode === "managed-cdp" ||
       browserBrokerMode === "sparsekernel-managed" ||
+      browserBrokerMode === "native" ||
+      browserBrokerMode === "native-cdp" ||
+      browserBrokerMode === "sparsekernel-native" ||
+      browserBrokerMode === "sparse-kernel-native" ||
+      isTruthyBrokerFlag(env.OPENCLAW_SPARSEKERNEL_BROWSER_NATIVE) ||
       Boolean(env.OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL?.trim()) ||
       Boolean(env.OPENCLAW_BROWSER_CONTROL_URL?.trim()));
   if (!shouldUseCdpBroker) {
@@ -340,13 +348,15 @@ function createDaemonBrowserProxyFactory(
           : "public_web";
     const managedCdp = await resolveSparseKernelBrowserCdpEndpoint({
       env,
+      nativeAcquire: input.browserNativeAcquire,
       profile: profile || undefined,
+      trustZoneId,
     });
     if (!managedCdp?.cdpEndpoint) {
       return null;
     }
     const { createSparseKernelBrowserToolCdpProxy } = await import("./browser-tool-cdp-proxy.js");
-    return await createSparseKernelBrowserToolCdpProxy({
+    const proxyLease = await createSparseKernelBrowserToolCdpProxy({
       agentId,
       sessionId,
       taskId,
@@ -364,5 +374,18 @@ function createDaemonBrowserProxyFactory(
         permission: "read",
       },
     });
+    if (!managedCdp.release) {
+      return proxyLease;
+    }
+    return {
+      ...proxyLease,
+      release: async () => {
+        try {
+          await proxyLease.release();
+        } finally {
+          await managedCdp.release?.();
+        }
+      },
+    };
   };
 }

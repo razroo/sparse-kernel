@@ -13,6 +13,10 @@ export function resolveArtifactStoreRoot(env: NodeJS.ProcessEnv = process.env): 
   return path.join(resolveStateDir(env), "artifacts");
 }
 
+export function resolveRuntimeBrowserPoolRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(resolveRuntimeKernelDir(env), "browser-pools");
+}
+
 export function resolveArtifactStorageRef(sha256: string): string {
   const normalized = sha256.trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(normalized)) {

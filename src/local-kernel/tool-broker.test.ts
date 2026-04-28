@@ -17,6 +17,10 @@ import type {
   SparseKernelUpsertSessionInput,
 } from "../../packages/sparsekernel-client/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import type {
+  NativeBrowserProcessAcquireInput,
+  NativeBrowserProcessLease,
+} from "./browser-process-pool.js";
 import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
 import { SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL } from "./browser-tool-proxy.js";
 import {
@@ -718,6 +722,108 @@ describe("CapabilityToolBroker", () => {
         cdpEndpoint: "http://127.0.0.1:18800",
         trustZoneId: "authenticated_web",
       });
+    } finally {
+      await broker.close();
+      db.close();
+    }
+  });
+
+  it("can materialize a native SparseKernel browser process for CDP brokered tools", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    const processRelease = vi.fn(async () => {});
+    const proxyRelease = vi.fn(async () => {});
+    const nativeAcquire = vi.fn(
+      async (input: NativeBrowserProcessAcquireInput): Promise<NativeBrowserProcessLease> => {
+        expect(input.trustZoneId).toBe("authenticated_web");
+        return {
+          cdpEndpoint: "http://127.0.0.1:19222",
+          trustZoneId: input.trustZoneId,
+          poolKey: `${input.trustZoneId}:default`,
+          userDataDir: "/tmp/openclaw-browser-pool",
+          release: processRelease,
+        };
+      },
+    );
+    const proxyInputs: SparseKernelBrowserToolCdpProxyInput[] = [];
+    const broker = new CapabilityToolBroker(db, {
+      env: { OPENCLAW_RUNTIME_BROWSER_BROKER: "native" } as NodeJS.ProcessEnv,
+      browserNativeAcquire: nativeAcquire,
+      browserCdpProxyFactory: async (input) => {
+        proxyInputs.push(input);
+        return {
+          id: "browser_ctx_native",
+          proxyRequest: async () => ({ ok: true, transport: "sparsekernel-cdp" }),
+          release: proxyRelease,
+        };
+      },
+    });
+    try {
+      db.upsertSession({
+        id: "session-a",
+        agentId: "main",
+        status: "active",
+      });
+      db.enqueueTask({
+        id: "task-a",
+        agentId: "main",
+        sessionId: "session-a",
+        kind: "test",
+      });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "browser",
+        action: "invoke",
+      });
+      const tool = broker.wrapTool(
+        {
+          name: "browser",
+          label: "Browser",
+          description: "test",
+          parameters: Type.Object({}),
+          execute: async (_toolCallId, params) => {
+            const injected =
+              params && typeof params === "object"
+                ? (params as Record<PropertyKey, unknown>)[
+                    SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL
+                  ]
+                : undefined;
+            if (typeof injected !== "function") {
+              throw new Error("missing SparseKernel browser proxy");
+            }
+            return {
+              content: [{ type: "text", text: "ok" }],
+              details: await injected({ method: "GET", path: "/" }),
+            };
+          },
+        } as AnyAgentTool,
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          taskId: "task-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
+
+      await expect(
+        tool.execute("call-browser", {
+          action: "status",
+          target: "host",
+        }),
+      ).resolves.toMatchObject({
+        details: { ok: true, transport: "sparsekernel-cdp" },
+      });
+
+      expect(nativeAcquire).toHaveBeenCalledTimes(1);
+      expect(proxyInputs[0]).toMatchObject({
+        cdpEndpoint: "http://127.0.0.1:19222",
+        trustZoneId: "authenticated_web",
+      });
+      await broker.close();
+      expect(proxyRelease).toHaveBeenCalledTimes(1);
+      expect(processRelease).toHaveBeenCalledTimes(1);
     } finally {
       await broker.close();
       db.close();

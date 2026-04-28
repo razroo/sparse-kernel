@@ -1,14 +1,19 @@
+import { acquireNativeBrowserProcess } from "./browser-process-pool.js";
+
 export type ManagedBrowserCdpEndpointInput = {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   profile?: string;
+  trustZoneId?: string;
   timeoutMs?: number;
+  nativeAcquire?: typeof acquireNativeBrowserProcess;
 };
 
 export type ManagedBrowserCdpEndpoint = {
   cdpEndpoint: string;
-  source: "static" | "managed-control";
+  source: "static" | "native-pool" | "managed-control";
   controlUrl?: string;
+  release?: () => Promise<void>;
 };
 
 type BrowserControlStatus = {
@@ -33,6 +38,22 @@ export async function resolveSparseKernelBrowserCdpEndpoint(
   }
 
   const mode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
+  const fetchImpl = input.fetchImpl ?? fetch;
+  if (shouldUseNativeBrowserPool(mode, env)) {
+    const lease = await (input.nativeAcquire ?? acquireNativeBrowserProcess)({
+      env,
+      fetchImpl,
+      profile: input.profile,
+      trustZoneId: input.trustZoneId ?? "public_web",
+      readyTimeoutMs: input.timeoutMs,
+    });
+    return {
+      cdpEndpoint: lease.cdpEndpoint,
+      source: "native-pool",
+      release: lease.release,
+    };
+  }
+
   const configuredControlUrl =
     env.OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL?.trim() ??
     env.OPENCLAW_BROWSER_CONTROL_URL?.trim() ??
@@ -49,7 +70,6 @@ export async function resolveSparseKernelBrowserCdpEndpoint(
   const controlUrl = normalizeLoopbackControlUrl(
     configuredControlUrl || DEFAULT_BROWSER_CONTROL_URL,
   );
-  const fetchImpl = input.fetchImpl ?? fetch;
   const query = input.profile?.trim() ? `?profile=${encodeURIComponent(input.profile.trim())}` : "";
   await fetchBrowserControlJson(`${controlUrl}/start${query}`, {
     method: "POST",
@@ -80,6 +100,16 @@ export async function resolveSparseKernelBrowserCdpEndpoint(
     source: "managed-control",
     controlUrl,
   };
+}
+
+function shouldUseNativeBrowserPool(mode: string | undefined, env: NodeJS.ProcessEnv): boolean {
+  return (
+    mode === "native" ||
+    mode === "native-cdp" ||
+    mode === "sparsekernel-native" ||
+    mode === "sparse-kernel-native" ||
+    isTruthy(env.OPENCLAW_SPARSEKERNEL_BROWSER_NATIVE)
+  );
 }
 
 function normalizeLoopbackControlUrl(raw: string): string {
@@ -138,4 +168,9 @@ async function fetchBrowserControlJson<T = unknown>(
 function isLoopbackHost(host: string): boolean {
   const normalized = host.toLowerCase();
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function isTruthy(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "on";
 }

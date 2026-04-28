@@ -2,6 +2,15 @@ export { ContentAddressedArtifactStore } from "./artifact-store.js";
 export type { ArtifactStoreFileInput, ArtifactStoreWriteInput } from "./artifact-store.js";
 export { LocalBrowserBroker } from "./browser-broker.js";
 export type { BrowserBroker, BrowserContextLeaseRequest } from "./browser-broker.js";
+export {
+  acquireNativeBrowserProcess,
+  resolveNativeBrowserExecutable,
+  stopAllNativeBrowserProcesses,
+} from "./browser-process-pool.js";
+export type {
+  NativeBrowserProcessAcquireInput,
+  NativeBrowserProcessLease,
+} from "./browser-process-pool.js";
 export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
 export { checkTrustZoneNetworkUrl } from "./network-policy.js";
@@ -58,6 +67,7 @@ export type {
 export {
   resolveArtifactStorageRef,
   resolveArtifactStoreRoot,
+  resolveRuntimeBrowserPoolRoot,
   resolveRuntimeKernelDbPath,
   resolveRuntimeKernelDir,
 } from "./paths.js";

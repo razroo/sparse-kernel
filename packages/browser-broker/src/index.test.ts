@@ -65,6 +65,8 @@ class FakeCdpTransport implements CdpTransport {
   private readonly errorListeners: Array<(error: Error) => void> = [];
   private downloadPath: string | undefined;
   private currentUrl = "about:blank";
+  private nextActionNavigationUrl: string | undefined;
+  private nextActionNewTarget: { targetId: string; url: string } | undefined;
 
   send(data: string): void {
     const message = JSON.parse(data) as {
@@ -89,6 +91,7 @@ class FakeCdpTransport implements CdpTransport {
       case "Runtime.enable":
       case "Network.enable":
       case "Log.enable":
+      case "Target.setDiscoverTargets":
         this.respond(message.id, {});
         break;
       case "Browser.setDownloadBehavior":
@@ -189,6 +192,14 @@ class FakeCdpTransport implements CdpTransport {
     });
   }
 
+  queueActionNavigation(url: string): void {
+    this.nextActionNavigationUrl = url;
+  }
+
+  queueActionNewTarget(url: string, targetId = "target-popup"): void {
+    this.nextActionNewTarget = { targetId, url };
+  }
+
   private respondRuntimeEvaluate(message: { id: number; params?: Record<string, unknown> }): void {
     const expression = String(message.params?.expression ?? "");
     if (expression.includes("const links =")) {
@@ -235,6 +246,22 @@ class FakeCdpTransport implements CdpTransport {
       this.respond(message.id, {
         result: { value: 42 },
       });
+      return;
+    }
+    if (expression.includes("waitForActionTarget")) {
+      const navigationUrl = this.nextActionNavigationUrl;
+      const newTarget = this.nextActionNewTarget;
+      this.nextActionNavigationUrl = undefined;
+      this.nextActionNewTarget = undefined;
+      this.respond(message.id, {
+        result: { value: { ok: true } },
+      });
+      if (navigationUrl) {
+        setTimeout(() => this.emitFrameNavigation(navigationUrl), 0);
+      }
+      if (newTarget) {
+        setTimeout(() => this.emitNewTarget(newTarget.targetId, newTarget.url), 0);
+      }
       return;
     }
     this.respond(message.id, {
@@ -294,6 +321,41 @@ class FakeCdpTransport implements CdpTransport {
         sessionId: "session-1",
       });
     }, 0);
+  }
+
+  private emitFrameNavigation(url: string): void {
+    this.currentUrl = url;
+    this.emit({
+      method: "Page.frameNavigated",
+      params: {
+        frame: {
+          id: "frame-1",
+          url,
+        },
+      },
+      sessionId: "session-1",
+    });
+    setTimeout(() => {
+      this.emit({
+        method: "Page.loadEventFired",
+        params: {},
+        sessionId: "session-1",
+      });
+    }, 0);
+  }
+
+  private emitNewTarget(targetId: string, url: string): void {
+    this.emit({
+      method: "Target.targetCreated",
+      params: {
+        targetInfo: {
+          targetId,
+          type: "page",
+          browserContextId: "cdp-context-1",
+          url,
+        },
+      },
+    });
   }
 }
 
@@ -623,6 +685,106 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     );
   });
 
+  it("accepts same-origin post-action navigation within the context policy", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.queueActionNavigation("https://example.com/next");
+
+    await expect(
+      broker.actContext(context.ledger_context.id, {
+        kind: "click",
+        selector: "#continue",
+      }),
+    ).resolves.toMatchObject({ ok: true, kind: "click" });
+    await expect(broker.listTabs(context.ledger_context.id)).resolves.toEqual([
+      expect.objectContaining({ url: "https://example.com/next" }),
+    ]);
+  });
+
+  it("releases a context when post-action navigation leaves the allowed origins", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.queueActionNavigation("https://blocked.example/next");
+
+    await expect(
+      broker.actContext(context.ledger_context.id, {
+        kind: "click",
+        selector: "#escape",
+      }),
+    ).rejects.toThrow(/post-action navigation blocked by allowed origins/);
+    await expect(broker.listTabs(context.ledger_context.id)).rejects.toThrow(/not materialized/);
+    expect(kernel.releasedContextIds).toEqual(["browser_ctx_1"]);
+  });
+
+  it("closes new tabs opened by brokered actions instead of accepting unleased targets", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.queueActionNewTarget("https://example.com/popup", "target-popup");
+
+    await expect(
+      broker.actContext(context.ledger_context.id, {
+        kind: "click",
+        selector: "#popup",
+      }),
+    ).rejects.toThrow(/opened a new tab\/window/);
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "Target.closeTarget",
+          params: expect.objectContaining({ targetId: "target-popup" }),
+        }),
+      ]),
+    );
+    await expect(broker.listTabs(context.ledger_context.id)).resolves.toEqual([
+      expect.objectContaining({ targetId: "target-1" }),
+    ]);
+  });
+
   it("performs the broader brokered action contract against the leased context", async () => {
     const kernel = new FakeKernel();
     const transport = new FakeCdpTransport();
@@ -740,7 +902,10 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
         (message as { method?: unknown }).method === "Runtime.evaluate" &&
         typeof (message as { params?: { expression?: unknown } }).params?.expression === "string",
     );
-    const actionExpression = runtimeEvaluations.at(-1)?.params.expression ?? "";
+    const actionExpression =
+      runtimeEvaluations.find((message) =>
+        message.params.expression.includes("waitForActionTarget"),
+      )?.params.expression ?? "";
     expect(actionExpression).toContain("waitForActionTarget");
     expect(actionExpression).toContain("const timeoutMs = 1234");
     expect(actionExpression).toContain("document.querySelector(selector)");

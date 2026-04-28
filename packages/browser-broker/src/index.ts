@@ -62,6 +62,7 @@ export type AcquireMaterializedBrowserContextInput = {
   initial_url?: string;
   max_contexts?: number;
   download_dir?: string;
+  allowed_origins?: unknown;
 };
 
 export type MaterializedBrowserContext = {
@@ -274,6 +275,11 @@ type CdpEventWaiter = {
   timeout: NodeJS.Timeout;
 };
 
+type CdpEventWatch = {
+  promise: Promise<CdpEventMessage | undefined>;
+  cancel: () => void;
+};
+
 type CdpEventMessage = {
   method: string;
   params: JsonRecord;
@@ -289,9 +295,16 @@ type LiveBrowserContext = MaterializedBrowserContext & {
   console_messages: SparseKernelBrowserConsoleMessage[];
   network_request_ids: Set<string>;
   last_network_activity_at: number;
+  allowed_origins: string[];
 };
 
 const NETWORK_IDLE_QUIET_MS = 500;
+const POST_ACTION_NAVIGATION_SETTLE_MS = 300;
+const POST_ACTION_LOAD_TIMEOUT_MS = 5_000;
+
+type PostActionNavigationObservation =
+  | { kind: "same-target"; url?: string }
+  | { kind: "new-target"; targetId: string; url?: string };
 
 export class SparseKernelCdpBrowserBroker {
   private readonly kernel: SparseKernelBrowserKernelClient;
@@ -309,6 +322,10 @@ export class SparseKernelCdpBrowserBroker {
     input: AcquireMaterializedBrowserContextInput,
   ): Promise<MaterializedBrowserContext> {
     const cdpEndpoint = normalizeLoopbackCdpEndpoint(input.cdp_endpoint);
+    const allowedOrigins = normalizeAllowedOrigins(input.allowed_origins);
+    if (input.initial_url) {
+      assertUrlAllowedByOrigins(input.initial_url, allowedOrigins, "initial navigation");
+    }
     const probe = await this.kernel.probeBrowserPool({ cdp_endpoint: cdpEndpoint });
     if (!probe.reachable) {
       throw new Error(`CDP endpoint is not reachable: ${probe.error ?? cdpEndpoint}`);
@@ -321,6 +338,7 @@ export class SparseKernelCdpBrowserBroker {
       trust_zone_id: input.trust_zone_id,
       max_contexts: input.max_contexts,
       cdp_endpoint: cdpEndpoint,
+      allowed_origins: input.allowed_origins,
     });
 
     let connection: CdpConnection | undefined;
@@ -347,6 +365,7 @@ export class SparseKernelCdpBrowserBroker {
       await connection.command("Runtime.enable", {}, sessionId);
       await connection.command("Network.enable", {}, sessionId).catch(() => {});
       await connection.command("Log.enable", {}, sessionId).catch(() => {});
+      await connection.command("Target.setDiscoverTargets", { discover: true }).catch(() => {});
       if (input.download_dir) {
         downloadDir = input.download_dir;
       } else {
@@ -373,6 +392,7 @@ export class SparseKernelCdpBrowserBroker {
         console_messages: [],
         network_request_ids: new Set(),
         last_network_activity_at: Date.now(),
+        allowed_origins: allowedOrigins,
       };
       connection.onEvent((event) => {
         recordConsoleEvent(materialized, event);
@@ -659,135 +679,145 @@ export class SparseKernelCdpBrowserBroker {
       case "hover":
       case "scrollIntoView":
       case "select": {
-        const selector = this.resolveActionSelector(context, request);
-        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
-          "Runtime.evaluate",
-          {
-            expression: buildActionExpression(
-              request,
-              selector,
-              resolveCdpActionTimeoutMs(request.timeoutMs),
-            ),
-            returnByValue: true,
-            awaitPromise: true,
-          },
-          context.page_session_id,
-          resolveCdpCommandTimeoutMs(request.timeoutMs),
-        );
-        return {
-          ok: true,
-          targetId: context.target_id,
-          kind: request.kind,
-          value: evaluated.result?.value,
-        };
+        return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
+          const selector = this.resolveActionSelector(context, request);
+          const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+            "Runtime.evaluate",
+            {
+              expression: buildActionExpression(
+                request,
+                selector,
+                resolveCdpActionTimeoutMs(request.timeoutMs),
+              ),
+              returnByValue: true,
+              awaitPromise: true,
+            },
+            context.page_session_id,
+            resolveCdpCommandTimeoutMs(request.timeoutMs),
+          );
+          return {
+            ok: true,
+            targetId: context.target_id,
+            kind: request.kind,
+            value: evaluated.result?.value,
+          };
+        });
       }
       case "clickCoords": {
-        const button = normalizeMouseButton(request.button);
-        const clickCount = request.doubleClick ? 2 : 1;
-        await context.connection.command(
-          "Input.dispatchMouseEvent",
-          {
-            type: "mouseMoved",
-            x: request.x,
-            y: request.y,
-            button: "none",
-          },
-          context.page_session_id,
-        );
-        await context.connection.command(
-          "Input.dispatchMouseEvent",
-          {
-            type: "mousePressed",
-            x: request.x,
-            y: request.y,
-            button,
-            clickCount,
-          },
-          context.page_session_id,
-        );
-        if (request.delayMs && request.delayMs > 0) {
-          await delay(Math.min(5_000, Math.floor(request.delayMs)));
-        }
-        await context.connection.command(
-          "Input.dispatchMouseEvent",
-          {
-            type: "mouseReleased",
-            x: request.x,
-            y: request.y,
-            button,
-            clickCount,
-          },
-          context.page_session_id,
-        );
-        return { ok: true, targetId: context.target_id, kind: request.kind };
+        return await this.withPostActionNavigationGuard(context, undefined, async () => {
+          const button = normalizeMouseButton(request.button);
+          const clickCount = request.doubleClick ? 2 : 1;
+          await context.connection.command(
+            "Input.dispatchMouseEvent",
+            {
+              type: "mouseMoved",
+              x: request.x,
+              y: request.y,
+              button: "none",
+            },
+            context.page_session_id,
+          );
+          await context.connection.command(
+            "Input.dispatchMouseEvent",
+            {
+              type: "mousePressed",
+              x: request.x,
+              y: request.y,
+              button,
+              clickCount,
+            },
+            context.page_session_id,
+          );
+          if (request.delayMs && request.delayMs > 0) {
+            await delay(Math.min(5_000, Math.floor(request.delayMs)));
+          }
+          await context.connection.command(
+            "Input.dispatchMouseEvent",
+            {
+              type: "mouseReleased",
+              x: request.x,
+              y: request.y,
+              button,
+              clickCount,
+            },
+            context.page_session_id,
+          );
+          return { ok: true, targetId: context.target_id, kind: request.kind };
+        });
       }
       case "press": {
-        await context.connection.command(
-          "Input.dispatchKeyEvent",
-          { type: "keyDown", key: request.key },
-          context.page_session_id,
-        );
-        if (request.delayMs && request.delayMs > 0) {
-          await delay(Math.min(5_000, Math.floor(request.delayMs)));
-        }
-        await context.connection.command(
-          "Input.dispatchKeyEvent",
-          { type: "keyUp", key: request.key },
-          context.page_session_id,
-        );
-        return { ok: true, targetId: context.target_id, kind: request.kind };
+        return await this.withPostActionNavigationGuard(context, undefined, async () => {
+          await context.connection.command(
+            "Input.dispatchKeyEvent",
+            { type: "keyDown", key: request.key },
+            context.page_session_id,
+          );
+          if (request.delayMs && request.delayMs > 0) {
+            await delay(Math.min(5_000, Math.floor(request.delayMs)));
+          }
+          await context.connection.command(
+            "Input.dispatchKeyEvent",
+            { type: "keyUp", key: request.key },
+            context.page_session_id,
+          );
+          return { ok: true, targetId: context.target_id, kind: request.kind };
+        });
       }
       case "drag": {
-        const startSelector = this.resolveActionSelector(context, {
-          ref: request.startRef,
-          selector: request.startSelector,
+        return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
+          const startSelector = this.resolveActionSelector(context, {
+            ref: request.startRef,
+            selector: request.startSelector,
+          });
+          const endSelector = this.resolveActionSelector(context, {
+            ref: request.endRef,
+            selector: request.endSelector,
+          });
+          const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+            "Runtime.evaluate",
+            {
+              expression: buildDragExpression(
+                startSelector,
+                endSelector,
+                resolveCdpActionTimeoutMs(request.timeoutMs),
+              ),
+              returnByValue: true,
+              awaitPromise: true,
+            },
+            context.page_session_id,
+            resolveCdpCommandTimeoutMs(request.timeoutMs),
+          );
+          return {
+            ok: true,
+            targetId: context.target_id,
+            kind: request.kind,
+            value: evaluated.result?.value,
+          };
         });
-        const endSelector = this.resolveActionSelector(context, {
-          ref: request.endRef,
-          selector: request.endSelector,
-        });
-        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
-          "Runtime.evaluate",
-          {
-            expression: buildDragExpression(
-              startSelector,
-              endSelector,
-              resolveCdpActionTimeoutMs(request.timeoutMs),
-            ),
-            returnByValue: true,
-            awaitPromise: true,
-          },
-          context.page_session_id,
-          resolveCdpCommandTimeoutMs(request.timeoutMs),
-        );
-        return {
-          ok: true,
-          targetId: context.target_id,
-          kind: request.kind,
-          value: evaluated.result?.value,
-        };
       }
       case "fill": {
-        const fields = request.fields.map((field) => ({
-          ...field,
-          selector: this.resolveActionSelector(context, { ref: field.ref }),
-        }));
-        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
-          "Runtime.evaluate",
-          {
-            expression: buildFillExpression(fields, resolveCdpActionTimeoutMs(request.timeoutMs)),
-            returnByValue: true,
-            awaitPromise: true,
-          },
-          context.page_session_id,
-          resolveCdpCommandTimeoutMs(request.timeoutMs),
-        );
-        return {
-          ok: true,
-          targetId: context.target_id,
-          kind: request.kind,
-          value: evaluated.result?.value,
-        };
+        return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
+          const fields = request.fields.map((field) => ({
+            ...field,
+            selector: this.resolveActionSelector(context, { ref: field.ref }),
+          }));
+          const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+            "Runtime.evaluate",
+            {
+              expression: buildFillExpression(fields, resolveCdpActionTimeoutMs(request.timeoutMs)),
+              returnByValue: true,
+              awaitPromise: true,
+            },
+            context.page_session_id,
+            resolveCdpCommandTimeoutMs(request.timeoutMs),
+          );
+          return {
+            ok: true,
+            targetId: context.target_id,
+            kind: request.kind,
+            value: evaluated.result?.value,
+          };
+        });
       }
       case "wait": {
         return {
@@ -798,25 +828,27 @@ export class SparseKernelCdpBrowserBroker {
         };
       }
       case "evaluate": {
-        const selector = request.ref
-          ? this.resolveActionSelector(context, { ref: request.ref })
-          : undefined;
-        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
-          "Runtime.evaluate",
-          {
-            expression: buildEvaluateExpression(request, selector),
-            returnByValue: true,
-            awaitPromise: true,
-          },
-          context.page_session_id,
-          resolveCdpCommandTimeoutMs(request.timeoutMs),
-        );
-        return {
-          ok: true,
-          targetId: context.target_id,
-          kind: request.kind,
-          value: evaluated.result?.value,
-        };
+        return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
+          const selector = request.ref
+            ? this.resolveActionSelector(context, { ref: request.ref })
+            : undefined;
+          const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+            "Runtime.evaluate",
+            {
+              expression: buildEvaluateExpression(request, selector),
+              returnByValue: true,
+              awaitPromise: true,
+            },
+            context.page_session_id,
+            resolveCdpCommandTimeoutMs(request.timeoutMs),
+          );
+          return {
+            ok: true,
+            targetId: context.target_id,
+            kind: request.kind,
+            value: evaluated.result?.value,
+          };
+        });
       }
       case "resize":
         await context.connection.command(
@@ -893,6 +925,7 @@ export class SparseKernelCdpBrowserBroker {
     timeoutMs = 10_000,
     options: { allowDownloadAbort?: boolean } = {},
   ): Promise<void> {
+    assertUrlAllowedByOrigins(url, context.allowed_origins, "navigation");
     const load = options.allowDownloadAbort
       ? undefined
       : context.connection.waitForEvent(
@@ -914,6 +947,146 @@ export class SparseKernelCdpBrowserBroker {
     if (load) {
       await load;
     }
+  }
+
+  private async withPostActionNavigationGuard<T extends SparseKernelBrowserActResult>(
+    context: LiveBrowserContext,
+    timeoutMs: number | undefined,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const beforeUrl = await this.readCurrentUrl(context);
+    const watchTimeoutMs = resolveCdpCommandTimeoutMs(timeoutMs);
+    const frameNavigation = this.watchSameTargetNavigation(context, beforeUrl, watchTimeoutMs);
+    const newTarget = this.watchNewTarget(context, watchTimeoutMs);
+    try {
+      const result = await action();
+      const observation = await Promise.race([
+        frameNavigation.promise,
+        newTarget.promise,
+        delay(POST_ACTION_NAVIGATION_SETTLE_MS).then(() => undefined),
+      ]);
+      await this.enforcePostActionNavigation(context, beforeUrl, observation);
+      return result;
+    } finally {
+      frameNavigation.cancel();
+      newTarget.cancel();
+    }
+  }
+
+  private watchSameTargetNavigation(
+    context: LiveBrowserContext,
+    beforeUrl: string | undefined,
+    timeoutMs: number,
+  ): { promise: Promise<PostActionNavigationObservation | undefined>; cancel: () => void } {
+    const watch = context.connection.watchForNextEvent(
+      "Page.frameNavigated",
+      (event) => {
+        if (event.sessionId && event.sessionId !== context.page_session_id) {
+          return false;
+        }
+        const frame = isRecord(event.params.frame) ? event.params.frame : undefined;
+        if (!frame || readString(frame.parentId)) {
+          return false;
+        }
+        const url = readString(frame.url);
+        return Boolean(url && url !== beforeUrl);
+      },
+      timeoutMs,
+    );
+    return {
+      promise: watch.promise
+        .then((event) => {
+          if (!event) {
+            return undefined;
+          }
+          const frame = isRecord(event.params.frame) ? event.params.frame : undefined;
+          return {
+            kind: "same-target" as const,
+            url: frame ? readString(frame.url) : undefined,
+          };
+        })
+        .catch(() => undefined),
+      cancel: watch.cancel,
+    };
+  }
+
+  private watchNewTarget(
+    context: LiveBrowserContext,
+    timeoutMs: number,
+  ): { promise: Promise<PostActionNavigationObservation | undefined>; cancel: () => void } {
+    const watch = context.connection.watchForNextEvent(
+      "Target.targetCreated",
+      (event) => {
+        const targetInfo = isRecord(event.params.targetInfo) ? event.params.targetInfo : undefined;
+        if (!targetInfo) {
+          return false;
+        }
+        return (
+          readString(targetInfo.browserContextId) === context.cdp_browser_context_id &&
+          readString(targetInfo.type) === "page" &&
+          Boolean(readString(targetInfo.targetId)) &&
+          readString(targetInfo.targetId) !== context.target_id
+        );
+      },
+      timeoutMs,
+    );
+    return {
+      promise: watch.promise
+        .then((event) => {
+          if (!event) {
+            return undefined;
+          }
+          const targetInfo = isRecord(event.params.targetInfo) ? event.params.targetInfo : {};
+          return {
+            kind: "new-target" as const,
+            targetId: requiredString(
+              targetInfo.targetId,
+              "Target.targetCreated.targetInfo.targetId",
+            ),
+            url: readString(targetInfo.url),
+          };
+        })
+        .catch(() => undefined),
+      cancel: watch.cancel,
+    };
+  }
+
+  private async enforcePostActionNavigation(
+    context: LiveBrowserContext,
+    beforeUrl: string | undefined,
+    observation: PostActionNavigationObservation | undefined,
+  ): Promise<void> {
+    if (observation?.kind === "new-target") {
+      await context.connection
+        .command("Target.closeTarget", { targetId: observation.targetId })
+        .catch(() => {});
+      throw new Error(
+        `SparseKernel browser action opened a new tab/window (${observation.targetId}); new targets are not accepted by the v0 broker.`,
+      );
+    }
+    if (observation?.kind === "same-target") {
+      await context.connection
+        .waitForEvent(
+          "Page.loadEventFired",
+          (event) => event.sessionId === context.page_session_id,
+          POST_ACTION_LOAD_TIMEOUT_MS,
+        )
+        .catch(() => {});
+    }
+    const afterUrl = observation?.url ?? (await this.readCurrentUrl(context));
+    if (!afterUrl || afterUrl === beforeUrl) {
+      return;
+    }
+    try {
+      assertUrlAllowedByOrigins(afterUrl, context.allowed_origins, "post-action navigation");
+    } catch (error) {
+      await this.releaseContext(context.ledger_context.id).catch(() => false);
+      throw error;
+    }
+  }
+
+  private async readCurrentUrl(context: LiveBrowserContext): Promise<string | undefined> {
+    return (await this.describeContextTab(context)).url;
   }
 
   private async describeContextTab(context: LiveBrowserContext): Promise<SparseKernelBrowserTab> {
@@ -1147,20 +1320,75 @@ class CdpConnection {
     if (existing) {
       return Promise.resolve(existing);
     }
-    return new Promise((resolve, reject) => {
+    return this.waitForFutureEvent(method, predicate, timeoutMs);
+  }
+
+  waitForNextEvent(
+    method: string,
+    predicate: (message: CdpEventMessage) => boolean,
+    timeoutMs = 10_000,
+  ): Promise<CdpEventMessage> {
+    const watch = this.watchForNextEvent(method, predicate, timeoutMs);
+    return watch.promise.then((event) => {
+      if (!event) {
+        throw new Error(`CDP event cancelled: ${method}`);
+      }
+      return event;
+    });
+  }
+
+  watchForNextEvent(
+    method: string,
+    predicate: (message: CdpEventMessage) => boolean,
+    timeoutMs: number,
+  ): CdpEventWatch {
+    let settled = false;
+    let waiter: CdpEventWaiter | undefined;
+    let resolveWatch: ((value: CdpEventMessage | undefined) => void) | undefined;
+    const promise = new Promise<CdpEventMessage | undefined>((resolve, reject) => {
+      resolveWatch = resolve;
       const timeout = setTimeout(() => {
-        this.removeEventWaiter(waiter);
+        settled = true;
+        if (waiter) {
+          this.removeEventWaiter(waiter);
+        }
         reject(new Error(`CDP event timed out: ${method}`));
       }, timeoutMs);
-      const waiter: CdpEventWaiter = {
+      waiter = {
         method,
         predicate,
-        resolve,
-        reject,
+        resolve: (message) => {
+          settled = true;
+          resolve(message);
+        },
+        reject: (error) => {
+          settled = true;
+          reject(error);
+        },
         timeout,
       };
       this.eventWaiters.push(waiter);
     });
+    return {
+      promise,
+      cancel: () => {
+        if (settled || !waiter) {
+          return;
+        }
+        settled = true;
+        clearTimeout(waiter.timeout);
+        this.removeEventWaiter(waiter);
+        resolveWatch?.(undefined);
+      },
+    };
+  }
+
+  private waitForFutureEvent(
+    method: string,
+    predicate: (message: CdpEventMessage) => boolean,
+    timeoutMs: number,
+  ): Promise<CdpEventMessage> {
+    return this.waitForNextEvent(method, predicate, timeoutMs);
   }
 
   onEvent(listener: (message: CdpEventMessage) => void): void {
@@ -1333,6 +1561,83 @@ function delay(ms: number): Promise<void> {
 function normalizeMouseButton(button: string | undefined): "left" | "right" | "middle" {
   const normalized = button?.trim().toLowerCase();
   return normalized === "right" || normalized === "middle" ? normalized : "left";
+}
+
+function normalizeAllowedOrigins(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const origins = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const origin = normalizeAllowedOrigin(item);
+    if (origin) {
+      origins.add(origin);
+    }
+  }
+  return [...origins].sort();
+}
+
+function normalizeAllowedOrigin(raw: string): string | undefined {
+  const text = raw.trim();
+  if (!text) {
+    return undefined;
+  }
+  if (text === "*") {
+    throw new Error("SparseKernel browser allowed origins must not use wildcard '*'.");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw new Error(`SparseKernel browser allowed origin is not a valid URL: ${text}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`SparseKernel browser allowed origin must use http(s): ${text}`);
+  }
+  return parsed.origin;
+}
+
+function assertUrlAllowedByOrigins(url: string, allowedOrigins: string[], label: string): void {
+  if (allowedOrigins.length === 0) {
+    return;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`SparseKernel browser ${label} URL is not valid: ${url}`);
+  }
+  if (parsed.protocol === "about:" && parsed.href === "about:blank") {
+    return;
+  }
+  if (parsed.protocol === "data:") {
+    return;
+  }
+  const origin =
+    parsed.protocol === "blob:"
+      ? normalizeBlobOrigin(parsed.href)
+      : parsed.protocol === "http:" || parsed.protocol === "https:"
+        ? parsed.origin
+        : undefined;
+  if (origin && allowedOrigins.includes(origin)) {
+    return;
+  }
+  throw new Error(
+    `SparseKernel browser ${label} blocked by allowed origins: ${url} is not in ${allowedOrigins.join(", ")}`,
+  );
+}
+
+function normalizeBlobOrigin(url: string): string | undefined {
+  const withoutScheme = url.slice("blob:".length);
+  try {
+    const parsed = new URL(withoutScheme);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.origin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function publicContext(context: LiveBrowserContext): MaterializedBrowserContext {

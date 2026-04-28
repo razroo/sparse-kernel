@@ -340,6 +340,13 @@ function createDaemonBrowserProxyFactory(
         : typeof record.url === "string"
           ? record.url
           : undefined;
+    const shouldEnforceNetwork =
+      env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "1" ||
+      env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "true";
+    const allowedOrigins =
+      shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")
+        ? [urlCandidate]
+        : undefined;
     const trustZoneId =
       profile === "user"
         ? "user_browser_profile"
@@ -368,6 +375,7 @@ function createDaemonBrowserProxyFactory(
         env.SPARSEKERNEL_BASE_URL,
       initialUrl:
         urlCandidate && (action === "open" || action === "navigate") ? urlCandidate : undefined,
+      allowedOrigins,
       subject: {
         subject_type: "agent",
         subject_id: agentId,

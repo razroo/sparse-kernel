@@ -22,6 +22,7 @@ export type SparseKernelBrowserToolCdpProxyInput = {
   initialUrl?: string;
   baseUrl?: string;
   maxContexts?: number;
+  allowedOrigins?: unknown;
   subject?: SparseKernelArtifactSubject;
 };
 
@@ -48,6 +49,7 @@ export async function createSparseKernelBrowserToolCdpProxy(
     cdp_endpoint: input.cdpEndpoint,
     initial_url: input.initialUrl,
     max_contexts: input.maxContexts,
+    allowed_origins: input.allowedOrigins,
   });
   const tempDir = await mkdtemp(join(tmpdir(), "openclaw-sparsekernel-browser-"));
   let releasePromise: Promise<void> | undefined;

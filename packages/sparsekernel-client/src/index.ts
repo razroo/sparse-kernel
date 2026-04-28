@@ -144,6 +144,8 @@ export type SparseKernelBrowserContext = {
   session_id?: string | null;
   task_id?: string | null;
   profile_mode: string;
+  allowed_origins?: unknown;
+  allowedOrigins?: unknown;
   status: string;
   created_at: string;
 };
@@ -175,6 +177,7 @@ export type SparseKernelAcquireBrowserContextInput = {
   trust_zone_id: string;
   max_contexts?: number;
   cdp_endpoint?: string | null;
+  allowed_origins?: unknown;
 };
 
 export type SparseKernelEnqueueTaskInput = {

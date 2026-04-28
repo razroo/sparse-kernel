@@ -328,6 +328,7 @@ export class CapabilityToolBroker {
           baseUrl: env.OPENCLAW_SPARSEKERNEL_BASE_URL ?? env.SPARSEKERNEL_BASE_URL,
           initialUrl:
             urlCandidate && (action === "open" || action === "navigate") ? urlCandidate : undefined,
+          allowedOrigins,
           subject: {
             subject_type: context.subject.subjectType,
             subject_id: context.subject.subjectId,

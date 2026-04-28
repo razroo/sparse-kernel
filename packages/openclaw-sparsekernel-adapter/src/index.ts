@@ -29,6 +29,35 @@ export type OpenClawSparseKernelTool = {
   ) => Promise<unknown>;
 };
 
+export type OpenClawSparseKernelBrowserProxyRequest = (opts: {
+  method: string;
+  path: string;
+  query?: Record<string, string | number | boolean | undefined>;
+  body?: unknown;
+  timeoutMs?: number;
+  profile?: string;
+}) => Promise<unknown>;
+
+export type OpenClawSparseKernelBrowserProxyLease = {
+  id: string;
+  proxyRequest: OpenClawSparseKernelBrowserProxyRequest;
+  release: () => Promise<void> | void;
+};
+
+export type OpenClawSparseKernelBrowserProxyFactoryInput = {
+  toolName: string;
+  toolParams: unknown;
+  agentId: string;
+  sessionId: string;
+  sessionKey?: string;
+  runId?: string;
+  taskId?: string;
+};
+
+export type OpenClawSparseKernelBrowserProxyFactory = (
+  input: OpenClawSparseKernelBrowserProxyFactoryInput,
+) => Promise<OpenClawSparseKernelBrowserProxyLease | null>;
+
 export type OpenClawSparseKernelToolBrokerClient = {
   upsertSession(input: SparseKernelUpsertSessionInput): Promise<SparseKernelSession>;
   grantCapability(input: SparseKernelGrantCapabilityInput): Promise<SparseKernelCapability>;
@@ -50,6 +79,7 @@ export type OpenClawSparseKernelToolBrokerOptions = {
   capabilityExpiresAt?: string;
   autoGrantToolCapability?: (toolName: string) => boolean;
   outputArtifactThresholdBytes?: number;
+  browserProxyFactory?: OpenClawSparseKernelBrowserProxyFactory;
 };
 
 export type OpenClawSparseKernelToolBrokerFactoryOptions = Omit<
@@ -83,6 +113,7 @@ export function createOpenClawSparseKernelToolBroker(
 
 export class OpenClawSparseKernelToolBroker {
   private readonly preparedTools = new Set<string>();
+  private readonly activeBrowserLeases = new Map<string, OpenClawSparseKernelBrowserProxyLease>();
   private sessionPrepared = false;
   private artifactWriteCapabilityPrepared = false;
   private readonly outputArtifactThresholdBytes: number;
@@ -114,7 +145,11 @@ export class OpenClawSparseKernelToolBroker {
         });
         try {
           await this.options.kernel.startToolCall(ledgerToolCallId);
-          const result = await execute(toolCallId, params, signal, onUpdate);
+          const browserProxy = await this.maybeAcquireBrowserProxy(tool.name, params);
+          const executionParams = browserProxy
+            ? attachSparseKernelBrowserProxyRequest(params, browserProxy.proxyRequest)
+            : params;
+          const result = await execute(toolCallId, executionParams, signal, onUpdate);
           const { output, artifactIds } = await this.prepareCompletionOutput(result);
           await this.options.kernel.completeToolCall({
             id: ledgerToolCallId,
@@ -132,6 +167,18 @@ export class OpenClawSparseKernelToolBroker {
 
   wrapTools<T extends OpenClawSparseKernelTool>(tools: T[]): T[] {
     return tools.map((tool) => this.wrapTool(tool));
+  }
+
+  async close(): Promise<void> {
+    const leases = [...this.activeBrowserLeases.values()];
+    this.activeBrowserLeases.clear();
+    const results = await Promise.allSettled(
+      leases.map((lease) => Promise.resolve(lease.release())),
+    );
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected?.status === "rejected") {
+      throw rejected.reason;
+    }
   }
 
   async prepareRun(tools: OpenClawSparseKernelTool[]): Promise<void> {
@@ -211,6 +258,33 @@ export class OpenClawSparseKernelToolBroker {
     return this.options.runId ? `${this.options.runId}:${providerToolCallId}` : providerToolCallId;
   }
 
+  private async maybeAcquireBrowserProxy(
+    toolName: string,
+    params: unknown,
+  ): Promise<OpenClawSparseKernelBrowserProxyLease | null> {
+    if (toolName !== "browser" || !this.options.browserProxyFactory) {
+      return null;
+    }
+    const key = browserProxyLeaseKey(params, this.options.sessionId, this.options.taskId);
+    const active = this.activeBrowserLeases.get(key);
+    if (active) {
+      return active;
+    }
+    const lease = await this.options.browserProxyFactory({
+      toolName,
+      toolParams: params,
+      agentId: this.options.agentId,
+      sessionId: this.options.sessionId,
+      sessionKey: this.options.sessionKey,
+      runId: this.options.runId,
+      taskId: this.options.taskId,
+    });
+    if (lease) {
+      this.activeBrowserLeases.set(key, lease);
+    }
+    return lease;
+  }
+
   private async prepareCompletionOutput(
     result: unknown,
   ): Promise<{ output: unknown; artifactIds: string[] }> {
@@ -270,4 +344,30 @@ function serializeToolOutput(result: unknown): SerializedToolOutput {
 
 function formatError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+const SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL = Symbol.for(
+  "openclaw.sparsekernel.browserProxyRequest",
+);
+
+function attachSparseKernelBrowserProxyRequest(
+  params: unknown,
+  proxyRequest: OpenClawSparseKernelBrowserProxyRequest,
+): unknown {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return params;
+  }
+  const copy = { ...(params as Record<string, unknown>) };
+  Object.defineProperty(copy, SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL, {
+    value: proxyRequest,
+    enumerable: false,
+  });
+  return copy;
+}
+
+function browserProxyLeaseKey(params: unknown, sessionId: string, taskId?: string): string {
+  const record = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+  const profile = typeof record.profile === "string" ? record.profile.trim() : "";
+  const target = typeof record.target === "string" ? record.target.trim() : "";
+  return [sessionId, taskId ?? "", profile || "default", target || "default"].join(":");
 }

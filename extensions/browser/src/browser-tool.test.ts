@@ -310,6 +310,29 @@ function registerBrowserToolAfterEachReset() {
   });
 }
 
+const SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL = Symbol.for(
+  "openclaw.sparsekernel.browserProxyRequest",
+);
+
+function withSparseKernelBrowserProxy(
+  params: Record<string, unknown>,
+  proxyRequest: (opts: {
+    method: string;
+    path: string;
+    query?: Record<string, string | number | boolean | undefined>;
+    body?: unknown;
+    timeoutMs?: number;
+    profile?: string;
+  }) => Promise<unknown>,
+): Record<string | symbol, unknown> {
+  const copy = { ...params } as Record<string | symbol, unknown>;
+  Object.defineProperty(copy, SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL, {
+    value: proxyRequest,
+    enumerable: false,
+  });
+  return copy;
+}
+
 async function runSnapshotToolCall(params: {
   snapshotFormat?: "ai" | "aria";
   refs?: "aria" | "dom";
@@ -633,6 +656,183 @@ describe("browser tool snapshot maxChars", () => {
       }),
     );
     expect(browserClientMocks.browserDoctor).not.toHaveBeenCalled();
+  });
+
+  it("routes navigation through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async (request: { body?: unknown }) => ({
+      ok: true,
+      targetId: "target-1",
+      url:
+        typeof request.body === "object" &&
+        request.body !== null &&
+        "url" in request.body &&
+        typeof request.body.url === "string"
+          ? request.body.url
+          : undefined,
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "navigate",
+          url: "https://example.com",
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({
+      ok: true,
+      targetId: "target-1",
+      url: "https://example.com",
+    });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/navigate",
+        body: expect.objectContaining({ url: "https://example.com" }),
+      }),
+    );
+    expect(browserActionsMocks.browserNavigate).not.toHaveBeenCalled();
+    expect(nodesUtilsMocks.listNodes).not.toHaveBeenCalled();
+  });
+
+  it("routes screenshots through the hidden SparseKernel browser proxy", async () => {
+    toolCommonMocks.imageResultFromFile.mockResolvedValueOnce({
+      content: [{ type: "text", text: "image" }],
+      details: { ok: true },
+    });
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      path: "/tmp/sparsekernel-screenshot.png",
+      targetId: "target-1",
+      artifactId: "artifact_1",
+      artifact: {
+        id: "artifact_1",
+        sha256: "sha_1",
+        size_bytes: 6,
+        storage_ref: "sha256/aa/bb/sha_1",
+      },
+    }));
+    const tool = createBrowserTool();
+
+    await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "screenshot",
+          targetId: "target-1",
+          timeoutMs: 12_345,
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/screenshot",
+        timeoutMs: 12_345,
+        body: expect.objectContaining({
+          targetId: "target-1",
+          timeoutMs: 12_345,
+        }),
+      }),
+    );
+    expect(browserActionsMocks.browserScreenshotAction).not.toHaveBeenCalled();
+    expect(toolCommonMocks.imageResultFromFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        label: "browser:screenshot",
+        path: "/tmp/sparsekernel-screenshot.png",
+        details: expect.objectContaining({ artifactId: "artifact_1" }),
+      }),
+    );
+  });
+
+  it("routes snapshots through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      format: "ai",
+      targetId: "target-1",
+      url: "https://example.com",
+      snapshot: "Example page body",
+      stats: { textChars: 17 },
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "snapshot",
+          targetId: "target-1",
+          snapshotFormat: "ai",
+          maxChars: 1000,
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({
+      ok: true,
+      format: "ai",
+      targetId: "target-1",
+      url: "https://example.com",
+    });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "GET",
+        path: "/snapshot",
+        query: expect.objectContaining({
+          format: "ai",
+          targetId: "target-1",
+          maxChars: 1000,
+        }),
+      }),
+    );
+    expect(browserClientMocks.browserSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("routes actions through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      targetId: "target-1",
+      kind: "click",
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "act",
+          request: {
+            kind: "click",
+            ref: "e1",
+          },
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({
+      ok: true,
+      targetId: "target-1",
+      kind: "click",
+    });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/act",
+        body: expect.objectContaining({
+          kind: "click",
+          ref: "e1",
+        }),
+      }),
+    );
+    expect(browserActionsMocks.browserAct).not.toHaveBeenCalled();
   });
 
   it("passes screenshot timeoutMs to the host browser client", async () => {

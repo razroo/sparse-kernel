@@ -96,7 +96,7 @@ The browser broker model is:
 
 Important boundary: BrowserContext isolation is session isolation, not host isolation. Playwright route blocking and SSRF guards are useful controls, but they are not hard security boundaries.
 
-The broker applies configured trust-zone network policy to explicit allowed origins before allocating a context. This is an egress guard for brokered contexts, not a kernel or VM boundary. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=cdp` and `OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT=<loopback endpoint>` to make the OpenClaw browser tool acquire a real SparseKernel CDP context around the tool call.
+The broker applies configured trust-zone network policy to explicit allowed origins before allocating a context. This is an egress guard for brokered contexts, not a kernel or VM boundary. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=cdp` and `OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT=<loopback endpoint>` to make the OpenClaw browser tool acquire a real SparseKernel CDP context for the active run. The runtime injects an internal browser proxy for supported navigation, tab, snapshot, and screenshot actions instead of exposing raw CDP to the agent, and screenshot output goes through the artifact store.
 
 ## Sandbox broker
 

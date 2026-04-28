@@ -3,6 +3,8 @@ import type { AnyAgentTool } from "../agents/tools/common.js";
 import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
 import { ContentAddressedArtifactStore } from "./artifact-store.js";
 import { LocalBrowserBroker } from "./browser-broker.js";
+import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
+import { attachSparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 import type { LocalKernelDatabase } from "./database.js";
 
 const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
@@ -24,10 +26,21 @@ export type CapabilityToolBrokerOptions = {
   artifactRootDir?: string;
   outputArtifactThresholdBytes?: number;
   env?: NodeJS.ProcessEnv;
+  browserCdpProxyFactory?: (
+    input: SparseKernelBrowserToolCdpProxyInput,
+  ) => Promise<BrowserToolLease>;
 };
 
-type BrowserToolLease = {
+export type BrowserToolLease = {
   id: string;
+  proxyRequest?: (opts: {
+    method: string;
+    path: string;
+    query?: Record<string, string | number | boolean | undefined>;
+    body?: unknown;
+    timeoutMs?: number;
+    profile?: string;
+  }) => Promise<unknown>;
   release: () => Promise<void> | void;
 };
 
@@ -49,6 +62,7 @@ function resolveOutputArtifactThresholdBytes(options: CapabilityToolBrokerOption
 
 export class CapabilityToolBroker {
   private readonly outputArtifactThresholdBytes: number;
+  private readonly activeBrowserLeases = new Map<string, BrowserToolLease>();
 
   constructor(
     private readonly db: LocalKernelDatabase,
@@ -93,17 +107,16 @@ export class CapabilityToolBroker {
         this.db.startToolCall(toolCallDbId);
         const browserContext = await this.maybeAcquireBrowserContext(tool, context, params);
         try {
-          const result = await execute(toolCallId, params, signal, onUpdate);
+          const executionParams = browserContext?.proxyRequest
+            ? attachSparseKernelBrowserProxyRequest(params, browserContext.proxyRequest)
+            : params;
+          const result = await execute(toolCallId, executionParams, signal, onUpdate);
           const ledgerOutput = await this.prepareToolOutputForLedger(toolCallDbId, context, result);
           this.db.finishToolCall(toolCallDbId, ledgerOutput);
           return result;
         } catch (err) {
           this.db.failToolCall(toolCallDbId, err);
           throw err;
-        } finally {
-          if (browserContext) {
-            await browserContext.release();
-          }
         }
       },
     };
@@ -113,6 +126,18 @@ export class CapabilityToolBroker {
 
   wrapTools(tools: AnyAgentTool[], context: ToolBrokerContext): AnyAgentTool[] {
     return tools.map((tool) => this.wrapTool(tool, context));
+  }
+
+  async close(): Promise<void> {
+    const leases = [...this.activeBrowserLeases.values()];
+    this.activeBrowserLeases.clear();
+    const results = await Promise.allSettled(
+      leases.map((lease) => Promise.resolve(lease.release())),
+    );
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected?.status === "rejected") {
+      throw rejected.reason;
+    }
   }
 
   private async prepareToolOutputForLedger(
@@ -210,44 +235,62 @@ export class CapabilityToolBroker {
         : undefined;
     const cdpEndpoint = env.OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT?.trim();
     const browserBrokerMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
+    const cdpEligibleTarget = !target || target === "host";
     const shouldUseCdpBroker =
+      cdpEligibleTarget &&
       Boolean(cdpEndpoint) &&
       (browserBrokerMode === "cdp" ||
         browserBrokerMode === "sparsekernel" ||
         browserBrokerMode === "sparse-kernel");
+    const leaseKey = [
+      shouldUseCdpBroker ? "cdp" : "local",
+      trustZoneId,
+      profile || "default",
+      target || "default",
+      context.sessionId ?? "",
+      context.taskId ?? "",
+    ].join(":");
+    const activeLease = this.activeBrowserLeases.get(leaseKey);
+    if (activeLease) {
+      return activeLease;
+    }
     try {
       if (shouldUseCdpBroker && cdpEndpoint) {
-        const { createSparseKernelCdpBrowserBroker } =
-          await import("../../packages/browser-broker/src/index.js");
-        const broker = createSparseKernelCdpBrowserBroker({
+        const createBrowserProxy =
+          this.options.browserCdpProxyFactory ??
+          (async (input: SparseKernelBrowserToolCdpProxyInput) => {
+            const { createSparseKernelBrowserToolCdpProxy } =
+              await import("./browser-tool-cdp-proxy.js");
+            return await createSparseKernelBrowserToolCdpProxy(input);
+          });
+        const lease = await createBrowserProxy({
+          agentId: context.agentId,
+          sessionId: context.sessionId,
+          taskId: context.taskId,
+          trustZoneId,
+          cdpEndpoint,
           baseUrl: env.OPENCLAW_SPARSEKERNEL_BASE_URL ?? env.SPARSEKERNEL_BASE_URL,
-        });
-        const materialized = await broker.acquireContext({
-          agent_id: context.agentId,
-          session_id: context.sessionId,
-          task_id: context.taskId,
-          trust_zone_id: trustZoneId,
-          cdp_endpoint: cdpEndpoint,
-          initial_url:
+          initialUrl:
             urlCandidate && (action === "open" || action === "navigate") ? urlCandidate : undefined,
+          subject: {
+            subject_type: context.subject.subjectType,
+            subject_id: context.subject.subjectId,
+            permission: "read",
+          },
         });
         this.db.recordAudit({
           actor: { type: "agent", id: context.agentId },
           action: "browser_context.materialized_cdp",
           objectType: "browser_context",
-          objectId: materialized.ledger_context.id,
+          objectId: lease.id,
           payload: {
             trustZoneId,
             taskId: context.taskId,
             sessionId: context.sessionId,
           },
         });
-        return {
-          id: materialized.ledger_context.id,
-          release: async () => {
-            await broker.releaseContext(materialized.ledger_context.id);
-          },
-        };
+        this.activeBrowserLeases.set(leaseKey, lease);
+        return lease;
       }
       const localBroker = new LocalBrowserBroker(this.db);
       const record = localBroker.acquireContext({
@@ -258,12 +301,14 @@ export class CapabilityToolBroker {
         profileMode: profile === "user" ? "user" : "ephemeral",
         allowedOrigins,
       });
-      return {
+      const lease = {
         id: record.id,
         release: () => {
           localBroker.releaseContext(record.id);
         },
       };
+      this.activeBrowserLeases.set(leaseKey, lease);
+      return lease;
     } catch (err) {
       this.db.recordAudit({
         actor: { type: "agent", id: context.agentId },

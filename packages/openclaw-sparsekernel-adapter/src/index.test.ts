@@ -274,4 +274,60 @@ describe("@openclaw/openclaw-sparsekernel-adapter", () => {
     expect(kernel.grants).toEqual([]);
     expect(kernel.creates).toEqual([]);
   });
+
+  it("injects and releases brokered browser proxies in daemon mode", async () => {
+    const kernel = new FakeKernel();
+    const released: string[] = [];
+    const proxyRequests: unknown[] = [];
+    const proxySymbol = Symbol.for("openclaw.sparsekernel.browserProxyRequest");
+    const broker = new OpenClawSparseKernelToolBroker({
+      kernel,
+      agentId: "agent-a",
+      sessionId: "session-a",
+      runId: "run-a",
+      taskId: "task-a",
+      browserProxyFactory: async () => ({
+        id: "browser_ctx_1",
+        proxyRequest: async (request) => {
+          proxyRequests.push(request);
+          return { ok: true, transport: "sparsekernel-cdp" };
+        },
+        release: () => {
+          released.push("browser_ctx_1");
+        },
+      }),
+    });
+    const tool: OpenClawSparseKernelTool = {
+      name: "browser",
+      execute: async (_toolCallId, params) => {
+        const proxy =
+          params && typeof params === "object"
+            ? (params as Record<PropertyKey, unknown>)[proxySymbol]
+            : undefined;
+        if (typeof proxy !== "function") {
+          throw new Error("missing browser proxy");
+        }
+        return {
+          content: [{ type: "text", text: "ok" }],
+          details: await proxy({ method: "GET", path: "/" }),
+        };
+      },
+    };
+
+    const wrapped = broker.wrapTool(tool);
+    await expect(wrapped.execute("provider-call-5", { action: "status" })).resolves.toMatchObject({
+      details: { ok: true, transport: "sparsekernel-cdp" },
+    });
+    await expect(wrapped.execute("provider-call-6", { action: "tabs" })).resolves.toMatchObject({
+      details: { ok: true, transport: "sparsekernel-cdp" },
+    });
+    await broker.close();
+
+    expect(proxyRequests).toHaveLength(2);
+    expect(released).toEqual(["browser_ctx_1"]);
+    expect(kernel.completes.map((entry) => entry.id)).toEqual([
+      "run-a:provider-call-5",
+      "run-a:provider-call-6",
+    ]);
+  });
 });

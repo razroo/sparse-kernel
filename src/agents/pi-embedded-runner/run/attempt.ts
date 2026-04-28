@@ -3317,7 +3317,7 @@ export async function runEmbeddedAttempt(
       } catch (err) {
         cleanupError = err;
       } finally {
-        brokeredToolRun?.close();
+        await brokeredToolRun?.close();
         brokeredToolRun = undefined;
       }
       if (runKernelLedger) {
@@ -3367,7 +3367,7 @@ export async function runEmbeddedAttempt(
       aborted ? "aborted" : "error",
       promptError ?? new Error("run exited before diagnostic completion"),
     );
-    brokeredToolRun?.close();
+    await brokeredToolRun?.close();
     await runKernelLedger?.fail(promptError ?? new Error("run exited before kernel completion"));
     runKernelLedger?.close();
     await accountedSandboxRun?.release();

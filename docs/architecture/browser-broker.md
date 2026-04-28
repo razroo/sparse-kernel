@@ -15,6 +15,8 @@ V0 also has a concrete local-browser attachment point: callers may register and 
 
 The `@openclaw/sparsekernel-browser-broker` adapter materializes the ledger lease into a real CDP browser context with `Target.createBrowserContext`, creates a target for the task/session, captures screenshots through `Page.captureScreenshot`, and writes screenshots/downloads through the SparseKernel artifact API. Callers can construct it directly with a kernel-shaped client or use `createSparseKernelCdpBrowserBroker` to wire it to `sparsekerneld`. Download capture uses CDP download events and the content-addressed artifact store rather than exposing arbitrary download paths to agents.
 
+When `OPENCLAW_RUNTIME_BROWSER_BROKER=cdp` and `OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT=<loopback endpoint>` are set, the embedded OpenClaw browser tool receives an internal SparseKernel proxy instead of raw CDP access. Supported v0 actions (`status`, `doctor`, `profiles`, `tabs`, `open`, `navigate`, `focus`, `close`, `snapshot`, `screenshot`, and basic `act`) operate against the leased CDP context. Snapshots use a bounded CDP `Runtime.evaluate` DOM read, basic actions resolve refs from the latest brokered snapshot, and screenshots are captured as SparseKernel artifacts, read back through artifact access, and converted to the existing tool image result format for compatibility. The context is retained for the active embedded run and released during broker cleanup, not opened and closed for every browser tool call.
+
 The current daemon does not launch or supervise a Playwright browser process yet. The next backend should:
 
 - keep browser processes scarce and pooled by trust zone;

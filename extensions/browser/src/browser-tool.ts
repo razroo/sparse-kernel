@@ -70,6 +70,26 @@ const browserToolDeps = {
   untrackSessionBrowserTab,
 };
 
+const SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL = Symbol.for(
+  "openclaw.sparsekernel.browserProxyRequest",
+);
+
+type BrowserProxyRequest = (opts: {
+  method: string;
+  path: string;
+  query?: Record<string, string | number | boolean | undefined>;
+  body?: unknown;
+  timeoutMs?: number;
+  profile?: string;
+}) => Promise<unknown>;
+
+function readSparseKernelProxyRequest(
+  params: Record<string | symbol, unknown>,
+): BrowserProxyRequest | null {
+  const value = params[SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL];
+  return typeof value === "function" ? (value as BrowserProxyRequest) : null;
+}
+
 export const __testing = {
   setDepsForTest(
     overrides: Partial<{
@@ -442,12 +462,13 @@ export function createBrowserTool(opts?: {
     ].join(" "),
     parameters: BrowserToolSchema,
     execute: async (_toolCallId, args) => {
-      const params = args as Record<string, unknown>;
+      const params = args as Record<string | symbol, unknown>;
       const action = readStringParam(params, "action", { required: true });
       const profile = readStringParam(params, "profile");
       const requestedNode = readStringParam(params, "node");
       const requestedTimeoutMs = readToolTimeoutMs(params);
       let target = readStringParam(params, "target") as "sandbox" | "host" | "node" | undefined;
+      const sparseKernelProxyRequest = readSparseKernelProxyRequest(params);
       const configuredNode = browserToolDeps
         .getRuntimeConfig()
         .gateway?.nodes?.browser?.node?.trim();
@@ -467,17 +488,19 @@ export function createBrowserTool(opts?: {
       }
 
       let nodeTarget: BrowserNodeTarget | null = null;
-      try {
-        nodeTarget = await resolveBrowserNodeTarget({
-          requestedNode: requestedNode ?? undefined,
-          target,
-          sandboxBridgeUrl: opts?.sandboxBridgeUrl,
-        });
-      } catch (error) {
-        // Keep the logged-in user browser usable on the host when auto-discovery
-        // of browser nodes fails transiently. Explicit node requests still fail.
-        if (!(isUserBrowserProfile && !target && !requestedNode && !configuredNode)) {
-          throw error;
+      if (!sparseKernelProxyRequest) {
+        try {
+          nodeTarget = await resolveBrowserNodeTarget({
+            requestedNode: requestedNode ?? undefined,
+            target,
+            sandboxBridgeUrl: opts?.sandboxBridgeUrl,
+          });
+        } catch (error) {
+          // Keep the logged-in user browser usable on the host when auto-discovery
+          // of browser nodes fails transiently. Explicit node requests still fail.
+          if (!(isUserBrowserProfile && !target && !requestedNode && !configuredNode)) {
+            throw error;
+          }
         }
       }
       if (isUserBrowserProfile && !target && !requestedNode && !nodeTarget) {
@@ -485,37 +508,40 @@ export function createBrowserTool(opts?: {
       }
 
       const resolvedTarget = target === "node" ? undefined : target;
-      const baseUrl = nodeTarget
-        ? undefined
-        : resolveBrowserBaseUrl({
-            target: resolvedTarget,
-            sandboxBridgeUrl: opts?.sandboxBridgeUrl,
-            allowHostControl: opts?.allowHostControl,
-          });
-
-      const proxyRequest = nodeTarget
-        ? async (opts: {
-            method: string;
-            path: string;
-            query?: Record<string, string | number | boolean | undefined>;
-            body?: unknown;
-            timeoutMs?: number;
-            profile?: string;
-          }) => {
-            const proxy = await callBrowserProxy({
-              nodeId: nodeTarget.nodeId,
-              method: opts.method,
-              path: opts.path,
-              query: opts.query,
-              body: opts.body,
-              timeoutMs: opts.timeoutMs,
-              profile: opts.profile,
+      const baseUrl =
+        sparseKernelProxyRequest || nodeTarget
+          ? undefined
+          : resolveBrowserBaseUrl({
+              target: resolvedTarget,
+              sandboxBridgeUrl: opts?.sandboxBridgeUrl,
+              allowHostControl: opts?.allowHostControl,
             });
-            const mapping = await persistProxyFiles(proxy.files);
-            applyProxyPaths(proxy.result, mapping);
-            return proxy.result;
-          }
-        : null;
+
+      const proxyRequest =
+        sparseKernelProxyRequest ??
+        (nodeTarget
+          ? async (opts: {
+              method: string;
+              path: string;
+              query?: Record<string, string | number | boolean | undefined>;
+              body?: unknown;
+              timeoutMs?: number;
+              profile?: string;
+            }) => {
+              const proxy = await callBrowserProxy({
+                nodeId: nodeTarget.nodeId,
+                method: opts.method,
+                path: opts.path,
+                query: opts.query,
+                body: opts.body,
+                timeoutMs: opts.timeoutMs,
+                profile: opts.profile,
+              });
+              const mapping = await persistProxyFiles(proxy.files);
+              applyProxyPaths(proxy.result, mapping);
+              return proxy.result;
+            }
+          : null);
       const toolTimeoutMs =
         requestedTimeoutMs ??
         (usesExistingSessionManageFlow({ action, profileName: profile })

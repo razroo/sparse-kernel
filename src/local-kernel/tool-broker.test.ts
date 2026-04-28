@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OpenClawSparseKernelToolBrokerClient } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
 import type {
   SparseKernelArtifact,
@@ -17,6 +17,8 @@ import type {
   SparseKernelUpsertSessionInput,
 } from "../../packages/sparsekernel-client/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
+import { SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL } from "./browser-tool-proxy.js";
 import {
   brokerEffectiveToolsForRun,
   brokerToolsForRun,
@@ -238,7 +240,7 @@ describe("CapabilityToolBroker", () => {
         .get("run-a:provider-call") as { status: string };
       expect(row.status).toBe("succeeded");
     } finally {
-      run?.close();
+      await run?.close();
     }
   });
 
@@ -310,7 +312,7 @@ describe("CapabilityToolBroker", () => {
         .get() as { count: number };
       expect(grants.count).toBe(0);
     } finally {
-      run.close();
+      await run.close();
     }
   });
 
@@ -371,8 +373,29 @@ describe("CapabilityToolBroker", () => {
   });
 
   it("accounts browser tool invocations with brokered context leases", async () => {
-    const run = brokerToolsForRun({
-      tools: [
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    const broker = new CapabilityToolBroker(db);
+    try {
+      db.upsertSession({
+        id: "session-a",
+        agentId: "main",
+        status: "active",
+      });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "browser",
+        action: "invoke",
+      });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "browser_context",
+        resourceId: "public_web",
+        action: "allocate",
+      });
+      const tool = broker.wrapTool(
         {
           name: "browser",
           label: "Browser",
@@ -380,31 +403,148 @@ describe("CapabilityToolBroker", () => {
           parameters: Type.Object({}),
           execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
         } as AnyAgentTool,
-      ],
-      agentId: "main",
-      sessionId: "session-a",
-      sessionKey: "agent:main:main",
-      runId: "run-a",
-      dbPath: ":memory:",
-    });
-    try {
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
       await expect(
-        run.tools[0]?.execute("call-browser", {
+        tool.execute("call-browser", {
           action: "status",
         }),
       ).resolves.toMatchObject({ details: {} });
-      const context = run.db.db
+      const context = db.db
         .prepare("SELECT status FROM browser_contexts ORDER BY created_at DESC LIMIT 1")
         .get() as { status: string };
-      expect(context.status).toBe("released");
-      const lease = run.db.db
+      expect(context.status).toBe("active");
+      const lease = db.db
         .prepare(
           "SELECT status FROM resource_leases WHERE resource_type = 'browser_context' LIMIT 1",
         )
         .get() as { status: string };
-      expect(lease.status).toBe("released");
+      expect(lease.status).toBe("active");
+      await broker.close();
+      const releasedContext = db.db
+        .prepare("SELECT status FROM browser_contexts ORDER BY created_at DESC LIMIT 1")
+        .get() as { status: string };
+      expect(releasedContext.status).toBe("released");
+      const releasedLease = db.db
+        .prepare(
+          "SELECT status FROM resource_leases WHERE resource_type = 'browser_context' LIMIT 1",
+        )
+        .get() as { status: string };
+      expect(releasedLease.status).toBe("released");
     } finally {
-      run.close();
+      await broker.close();
+      db.close();
+    }
+  });
+
+  it("injects the SparseKernel CDP proxy into browser tool execution", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    const proxyRequest = vi.fn(async () => ({ ok: true, transport: "sparsekernel-cdp" }));
+    const proxyInputs: SparseKernelBrowserToolCdpProxyInput[] = [];
+    const released: string[] = [];
+    const broker = new CapabilityToolBroker(db, {
+      env: {
+        OPENCLAW_RUNTIME_BROWSER_BROKER: "cdp",
+        OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT: "http://127.0.0.1:9222",
+      } as NodeJS.ProcessEnv,
+      browserCdpProxyFactory: async (input) => {
+        proxyInputs.push(input);
+        return {
+          id: "browser_ctx_cdp",
+          proxyRequest,
+          release: async () => {
+            released.push("browser_ctx_cdp");
+          },
+        };
+      },
+    });
+    try {
+      db.upsertSession({
+        id: "session-a",
+        agentId: "main",
+        status: "active",
+      });
+      db.enqueueTask({
+        id: "task-a",
+        agentId: "main",
+        sessionId: "session-a",
+        kind: "test",
+      });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "browser",
+        action: "invoke",
+      });
+      const tool = broker.wrapTool(
+        {
+          name: "browser",
+          label: "Browser",
+          description: "test",
+          parameters: Type.Object({}),
+          execute: async (_toolCallId, params) => {
+            const injected =
+              params && typeof params === "object"
+                ? (params as Record<PropertyKey, unknown>)[
+                    SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL
+                  ]
+                : undefined;
+            if (typeof injected !== "function") {
+              throw new Error("missing SparseKernel browser proxy");
+            }
+            return {
+              content: [{ type: "text", text: "ok" }],
+              details: await injected({ method: "GET", path: "/" }),
+            };
+          },
+        } as AnyAgentTool,
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          taskId: "task-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
+
+      await expect(
+        tool.execute("call-browser", {
+          action: "status",
+          target: "host",
+        }),
+      ).resolves.toMatchObject({
+        details: { ok: true, transport: "sparsekernel-cdp" },
+      });
+      await expect(
+        tool.execute("call-browser-2", {
+          action: "tabs",
+          target: "host",
+        }),
+      ).resolves.toMatchObject({
+        details: { ok: true, transport: "sparsekernel-cdp" },
+      });
+
+      expect(proxyInputs).toEqual([
+        expect.objectContaining({
+          agentId: "main",
+          sessionId: "session-a",
+          taskId: "task-a",
+          trustZoneId: "authenticated_web",
+          cdpEndpoint: "http://127.0.0.1:9222",
+        }),
+      ]);
+      expect(proxyRequest).toHaveBeenCalledTimes(2);
+      await broker.close();
+      expect(released).toEqual(["browser_ctx_cdp"]);
+    } finally {
+      await broker.close();
+      db.close();
     }
   });
 });

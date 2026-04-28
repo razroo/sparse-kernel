@@ -1,6 +1,7 @@
 import {
   createOpenClawSparseKernelToolBroker,
   OpenClawSparseKernelToolBroker,
+  type OpenClawSparseKernelBrowserProxyFactory,
   type OpenClawSparseKernelToolBrokerClient,
 } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
@@ -29,7 +30,7 @@ export type BrokeredToolsForRun = {
   tools: AnyAgentTool[];
   mode: "local" | "daemon";
   db?: LocalKernelDatabase;
-  close: () => void;
+  close: () => void | Promise<void>;
 };
 
 export type LocalBrokeredToolsForRun = BrokeredToolsForRun & {
@@ -124,12 +125,17 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
   const db = openLocalKernelDatabase({ dbPath: input.dbPath, env: input.env });
   const capabilityExpiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
   let closed = false;
-  const close = () => {
+  let broker: CapabilityToolBroker | undefined;
+  const close = async () => {
     if (closed) {
       return;
     }
     closed = true;
-    db.close();
+    try {
+      await broker?.close();
+    } finally {
+      db.close();
+    }
   };
   try {
     db.upsertSession({
@@ -180,7 +186,7 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
         }
       }
     }
-    const broker = new CapabilityToolBroker(db, {
+    broker = new CapabilityToolBroker(db, {
       artifactRootDir: input.artifactRootDir,
       outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
       env: input.env,
@@ -198,7 +204,8 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
       close,
     };
   } catch (err) {
-    close();
+    closed = true;
+    db.close();
     throw err;
   }
 }
@@ -207,6 +214,7 @@ export async function brokerToolsForRunWithDaemon(
   input: BrokerToolsForRunInput,
 ): Promise<BrokeredToolsForRun> {
   const capabilityExpiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+  const browserProxyFactory = createDaemonBrowserProxyFactory(input);
   const broker = input.daemonKernel
     ? new OpenClawSparseKernelToolBroker({
         kernel: input.daemonKernel,
@@ -219,6 +227,7 @@ export async function brokerToolsForRunWithDaemon(
         capabilityExpiresAt,
         autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
         outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
+        browserProxyFactory,
       })
     : createOpenClawSparseKernelToolBroker({
         baseUrl:
@@ -234,12 +243,13 @@ export async function brokerToolsForRunWithDaemon(
         capabilityExpiresAt,
         autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
         outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
+        browserProxyFactory,
       });
   await broker.prepareRun(input.tools);
   return {
     tools: broker.wrapTools(input.tools),
     mode: "daemon",
-    close: () => {},
+    close: () => broker.close(),
   };
 }
 
@@ -283,4 +293,64 @@ export async function brokerEffectiveToolsForRun(
 
 function formatBrokerError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function createDaemonBrowserProxyFactory(
+  input: BrokerToolsForRunInput,
+): OpenClawSparseKernelBrowserProxyFactory | undefined {
+  const env = input.env ?? process.env;
+  const cdpEndpoint = env.OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT?.trim();
+  const browserBrokerMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
+  const shouldUseCdpBroker =
+    Boolean(cdpEndpoint) &&
+    (browserBrokerMode === "cdp" ||
+      browserBrokerMode === "sparsekernel" ||
+      browserBrokerMode === "sparse-kernel");
+  if (!shouldUseCdpBroker || !cdpEndpoint) {
+    return undefined;
+  }
+  return async ({ toolName, toolParams, agentId, sessionId, taskId }) => {
+    if (toolName !== "browser") {
+      return null;
+    }
+    const record =
+      toolParams && typeof toolParams === "object" ? (toolParams as Record<string, unknown>) : {};
+    const target = typeof record.target === "string" ? record.target.trim().toLowerCase() : "";
+    if (target && target !== "host") {
+      return null;
+    }
+    const profile = typeof record.profile === "string" ? record.profile.trim().toLowerCase() : "";
+    const action = typeof record.action === "string" ? record.action.trim() : "";
+    const urlCandidate =
+      typeof record.targetUrl === "string"
+        ? record.targetUrl
+        : typeof record.url === "string"
+          ? record.url
+          : undefined;
+    const trustZoneId =
+      profile === "user"
+        ? "user_browser_profile"
+        : profile || target === "host"
+          ? "authenticated_web"
+          : "public_web";
+    const { createSparseKernelBrowserToolCdpProxy } = await import("./browser-tool-cdp-proxy.js");
+    return await createSparseKernelBrowserToolCdpProxy({
+      agentId,
+      sessionId,
+      taskId,
+      trustZoneId,
+      cdpEndpoint,
+      baseUrl:
+        input.sparseKernelBaseUrl ??
+        env.OPENCLAW_SPARSEKERNEL_BASE_URL ??
+        env.SPARSEKERNEL_BASE_URL,
+      initialUrl:
+        urlCandidate && (action === "open" || action === "navigate") ? urlCandidate : undefined,
+      subject: {
+        subject_type: "agent",
+        subject_id: agentId,
+        permission: "read",
+      },
+    });
+  };
 }

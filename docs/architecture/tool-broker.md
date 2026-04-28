@@ -36,4 +36,6 @@ The compatibility path auto-grants per-run tool invoke capabilities by default s
 
 Before tools are wrapped, the embedded runner now creates a SparseKernel task for the active run, claims it with a worker lease, and appends transcript events for run start, prompt submission, assistant output, and completion or failure. Browser and sandbox allocations can attach to the same task id, so the ledger can answer which active step owned each expensive resource.
 
+For browser tools, the local and daemon brokers can attach a hidden SparseKernel browser proxy to the tool parameters when CDP browser brokering is enabled. The tool still sees the existing OpenClaw browser action contract, but supported browser actions are routed through the leased SparseKernel context. Snapshot reads stay brokered and bounded, basic actions use refs from the latest brokered snapshot, and screenshot bytes are artifactized. Browser leases are cached for the active run and released from broker cleanup.
+
 V0 does not move native plugins out of process. It establishes the ledger and API contract so OpenClaw adapters can route invocation through SparseKernel now, then move untrusted or community plugins behind stronger process or sandbox boundaries later.

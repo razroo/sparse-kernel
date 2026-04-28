@@ -64,6 +64,7 @@ class FakeCdpTransport implements CdpTransport {
   private readonly closeListeners: Array<() => void> = [];
   private readonly errorListeners: Array<(error: Error) => void> = [];
   private downloadPath: string | undefined;
+  private currentUrl = "about:blank";
 
   send(data: string): void {
     const message = JSON.parse(data) as {
@@ -78,6 +79,7 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { browserContextId: "cdp-context-1" });
         break;
       case "Target.createTarget":
+        this.currentUrl = String(message.params?.url ?? this.currentUrl);
         this.respond(message.id, { targetId: "target-1" });
         break;
       case "Target.attachToTarget":
@@ -99,6 +101,38 @@ class FakeCdpTransport implements CdpTransport {
       case "Page.navigate":
         this.respond(message.id, { frameId: "frame-1" });
         this.handleNavigate(String(message.params?.url ?? ""));
+        break;
+      case "Runtime.evaluate":
+        this.respond(message.id, {
+          result: {
+            value: JSON.stringify({
+              title: this.currentUrl.includes("example.com") ? "Example" : "",
+              url: this.currentUrl,
+              text: "Example page body",
+              links: [
+                {
+                  text: "Example link",
+                  href: "https://example.com/link",
+                  selector: "body > a:nth-of-type(1)",
+                },
+              ],
+              buttons: [{ text: "Submit", selector: "body > button:nth-of-type(1)" }],
+              inputs: [
+                {
+                  label: "Search",
+                  name: "q",
+                  type: "text",
+                  selector: "body > input:nth-of-type(1)",
+                },
+              ],
+              truncated: false,
+            }),
+          },
+        });
+        break;
+      case "Input.dispatchKeyEvent":
+      case "Emulation.setDeviceMetricsOverride":
+        this.respond(message.id, {});
         break;
       case "Target.closeTarget":
       case "Target.disposeBrowserContext":
@@ -143,6 +177,7 @@ class FakeCdpTransport implements CdpTransport {
   }
 
   private handleNavigate(url: string): void {
+    this.currentUrl = url;
     if (url.endsWith("/download")) {
       const downloadPath = this.downloadPath;
       if (!downloadPath) {
@@ -267,6 +302,128 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       mime_type: "text/plain",
       retention_policy: "durable",
     });
+  });
+
+  it("navigates and lists the leased CDP context tab", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+    });
+    const tab = await broker.navigateContext(context.ledger_context.id, {
+      url: "https://example.com/",
+    });
+    const tabs = await broker.listTabs(context.ledger_context.id);
+
+    expect(tab).toMatchObject({
+      targetId: "target-1",
+      suggestedTargetId: "target-1",
+      title: "Example",
+      url: "https://example.com/",
+      sparsekernelContextId: "browser_ctx_1",
+    });
+    expect(tabs).toEqual([tab]);
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "Page.navigate" }),
+        expect.objectContaining({ method: "Runtime.evaluate" }),
+      ]),
+    );
+  });
+
+  it("captures a brokered text snapshot from the leased CDP context", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    const snapshot = await broker.snapshotContext(context.ledger_context.id, {
+      format: "ai",
+      max_chars: 1000,
+      interactive: true,
+    });
+
+    expect(snapshot).toMatchObject({
+      ok: true,
+      format: "ai",
+      targetId: "target-1",
+      url: "https://example.com/",
+      title: "Example",
+      truncated: false,
+    });
+    expect(snapshot.snapshot).toContain("Example page body");
+    expect(snapshot.refs).toMatchObject({
+      e1: { role: "link", name: "Example link", selector: "body > a:nth-of-type(1)" },
+      e2: { role: "button", name: "Submit", selector: "body > button:nth-of-type(1)" },
+    });
+    expect(snapshot.stats).toMatchObject({
+      linkCount: 1,
+      buttonCount: 1,
+      inputCount: 1,
+    });
+  });
+
+  it("performs basic actions against refs from the brokered snapshot", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    await broker.snapshotContext(context.ledger_context.id);
+    const clicked = await broker.actContext(context.ledger_context.id, {
+      kind: "click",
+      ref: "e1",
+    });
+    const pressed = await broker.actContext(context.ledger_context.id, {
+      kind: "press",
+      key: "Enter",
+    });
+
+    expect(clicked).toMatchObject({ ok: true, targetId: "target-1", kind: "click" });
+    expect(pressed).toMatchObject({ ok: true, targetId: "target-1", kind: "press" });
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "Runtime.evaluate",
+          params: expect.objectContaining({
+            expression: expect.stringContaining("body > a:nth-of-type(1)"),
+          }),
+        }),
+        expect.objectContaining({ method: "Input.dispatchKeyEvent" }),
+      ]),
+    );
   });
 
   it("constructs from the SparseKernel daemon client", async () => {

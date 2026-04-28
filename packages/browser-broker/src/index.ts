@@ -287,7 +287,11 @@ type LiveBrowserContext = MaterializedBrowserContext & {
   owns_download_dir: boolean;
   snapshot_refs: Map<string, SnapshotRef>;
   console_messages: SparseKernelBrowserConsoleMessage[];
+  network_request_ids: Set<string>;
+  last_network_activity_at: number;
 };
+
+const NETWORK_IDLE_QUIET_MS = 500;
 
 export class SparseKernelCdpBrowserBroker {
   private readonly kernel: SparseKernelBrowserKernelClient;
@@ -341,6 +345,7 @@ export class SparseKernelCdpBrowserBroker {
       );
       await connection.command("Page.enable", {}, sessionId);
       await connection.command("Runtime.enable", {}, sessionId);
+      await connection.command("Network.enable", {}, sessionId).catch(() => {});
       await connection.command("Log.enable", {}, sessionId).catch(() => {});
       if (input.download_dir) {
         downloadDir = input.download_dir;
@@ -366,8 +371,13 @@ export class SparseKernelCdpBrowserBroker {
         owns_download_dir: ownsDownloadDir,
         snapshot_refs: new Map(),
         console_messages: [],
+        network_request_ids: new Set(),
+        last_network_activity_at: Date.now(),
       };
-      connection.onEvent((event) => recordConsoleEvent(materialized, event));
+      connection.onEvent((event) => {
+        recordConsoleEvent(materialized, event);
+        recordNetworkEvent(materialized, event);
+      });
       this.contexts.set(ledgerContext.id, materialized);
       return publicContext(materialized);
     } catch (error) {
@@ -653,12 +663,16 @@ export class SparseKernelCdpBrowserBroker {
         const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
           "Runtime.evaluate",
           {
-            expression: buildActionExpression(request, selector),
+            expression: buildActionExpression(
+              request,
+              selector,
+              resolveCdpActionTimeoutMs(request.timeoutMs),
+            ),
             returnByValue: true,
             awaitPromise: true,
           },
           context.page_session_id,
-          "timeoutMs" in request ? request.timeoutMs : undefined,
+          resolveCdpCommandTimeoutMs(request.timeoutMs),
         );
         return {
           ok: true,
@@ -735,12 +749,16 @@ export class SparseKernelCdpBrowserBroker {
         const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
           "Runtime.evaluate",
           {
-            expression: buildDragExpression(startSelector, endSelector),
+            expression: buildDragExpression(
+              startSelector,
+              endSelector,
+              resolveCdpActionTimeoutMs(request.timeoutMs),
+            ),
             returnByValue: true,
             awaitPromise: true,
           },
           context.page_session_id,
-          request.timeoutMs,
+          resolveCdpCommandTimeoutMs(request.timeoutMs),
         );
         return {
           ok: true,
@@ -757,12 +775,12 @@ export class SparseKernelCdpBrowserBroker {
         const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
           "Runtime.evaluate",
           {
-            expression: buildFillExpression(fields),
+            expression: buildFillExpression(fields, resolveCdpActionTimeoutMs(request.timeoutMs)),
             returnByValue: true,
             awaitPromise: true,
           },
           context.page_session_id,
-          request.timeoutMs,
+          resolveCdpCommandTimeoutMs(request.timeoutMs),
         );
         return {
           ok: true,
@@ -772,21 +790,11 @@ export class SparseKernelCdpBrowserBroker {
         };
       }
       case "wait": {
-        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
-          "Runtime.evaluate",
-          {
-            expression: buildWaitExpression(request),
-            returnByValue: true,
-            awaitPromise: true,
-          },
-          context.page_session_id,
-          request.timeoutMs,
-        );
         return {
           ok: true,
           targetId: context.target_id,
           kind: request.kind,
-          value: evaluated.result?.value,
+          value: await this.waitForAction(context, request),
         };
       }
       case "evaluate": {
@@ -801,7 +809,7 @@ export class SparseKernelCdpBrowserBroker {
             awaitPromise: true,
           },
           context.page_session_id,
-          request.timeoutMs,
+          resolveCdpCommandTimeoutMs(request.timeoutMs),
         );
         return {
           ok: true,
@@ -958,6 +966,132 @@ export class SparseKernelCdpBrowserBroker {
       throw new Error(`SparseKernel browser ref is unknown or stale: ${ref}`);
     }
     throw new Error("SparseKernel browser action requires ref or selector");
+  }
+
+  private async waitForAction(
+    context: LiveBrowserContext,
+    request: Extract<SparseKernelBrowserActRequest, { kind: "wait" }>,
+  ): Promise<unknown> {
+    const timeoutMs = resolveCdpActionTimeoutMs(request.timeoutMs);
+    if (request.timeMs && request.timeMs > 0) {
+      await delay(Math.max(0, Math.min(60_000, Math.floor(request.timeMs))));
+    }
+    if (request.text) {
+      await this.waitForPagePredicate(
+        context,
+        buildTextPredicateExpression(request.text, false),
+        timeoutMs,
+        `text "${request.text}"`,
+      );
+    }
+    if (request.textGone) {
+      await this.waitForPagePredicate(
+        context,
+        buildTextPredicateExpression(request.textGone, true),
+        timeoutMs,
+        `text "${request.textGone}" to disappear`,
+      );
+    }
+    if (request.selector) {
+      await this.waitForPagePredicate(
+        context,
+        buildSelectorVisiblePredicateExpression(request.selector),
+        timeoutMs,
+        `selector "${request.selector}"`,
+      );
+    }
+    if (request.url) {
+      await this.waitForPagePredicate(
+        context,
+        buildUrlPredicateExpression(request.url),
+        timeoutMs,
+        `url "${request.url}"`,
+      );
+    }
+    if (request.loadState) {
+      if (request.loadState === "networkidle") {
+        await this.waitForPagePredicate(
+          context,
+          buildReadyStatePredicateExpression("complete"),
+          timeoutMs,
+          "document load",
+        );
+        await this.waitForNetworkIdle(context, timeoutMs);
+      } else {
+        await this.waitForPagePredicate(
+          context,
+          buildReadyStatePredicateExpression(request.loadState),
+          timeoutMs,
+          `load state "${request.loadState}"`,
+        );
+      }
+    }
+    if (request.fn) {
+      await this.waitForPagePredicate(
+        context,
+        buildFunctionPredicateExpression(request.fn),
+        timeoutMs,
+        "function predicate",
+      );
+    }
+    return { ok: true };
+  }
+
+  private async waitForPagePredicate(
+    context: LiveBrowserContext,
+    expression: string,
+    timeoutMs: number,
+    label: string,
+  ): Promise<unknown> {
+    const deadline = Date.now() + timeoutMs;
+    let lastError = "";
+    while (Date.now() <= deadline) {
+      try {
+        const remaining = Math.max(1, deadline - Date.now());
+        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+          "Runtime.evaluate",
+          {
+            expression,
+            returnByValue: true,
+            awaitPromise: true,
+          },
+          context.page_session_id,
+          Math.min(1_000, remaining),
+        );
+        const value = evaluated.result?.value;
+        if (value) {
+          return value;
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await delay(Math.min(100, remaining));
+    }
+    throw new Error(
+      `SparseKernel browser wait timed out waiting for ${label}${lastError ? `: ${lastError}` : ""}`,
+    );
+  }
+
+  private async waitForNetworkIdle(context: LiveBrowserContext, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      const quietForMs = Date.now() - context.last_network_activity_at;
+      if (context.network_request_ids.size === 0 && quietForMs >= NETWORK_IDLE_QUIET_MS) {
+        return;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await delay(Math.min(100, remaining));
+    }
+    throw new Error(
+      `SparseKernel browser wait timed out waiting for networkidle (${context.network_request_ids.size} request(s) still active)`,
+    );
   }
 }
 
@@ -1241,6 +1375,27 @@ function recordConsoleEvent(context: LiveBrowserContext, event: CdpEventMessage)
   }
   if (context.console_messages.length > 500) {
     context.console_messages.splice(0, context.console_messages.length - 500);
+  }
+}
+
+function recordNetworkEvent(context: LiveBrowserContext, event: CdpEventMessage): void {
+  if (event.sessionId && event.sessionId !== context.page_session_id) {
+    return;
+  }
+  const requestId = readString(event.params.requestId);
+  if (!requestId) {
+    return;
+  }
+  switch (event.method) {
+    case "Network.requestWillBeSent":
+      context.network_request_ids.add(requestId);
+      context.last_network_activity_at = Date.now();
+      break;
+    case "Network.loadingFinished":
+    case "Network.loadingFailed":
+      context.network_request_ids.delete(requestId);
+      context.last_network_activity_at = Date.now();
+      break;
   }
 }
 
@@ -1552,17 +1707,22 @@ function buildAiSnapshotText(
   };
 }
 
-function buildActionExpression(request: SparseKernelBrowserActRequest, selector: string): string {
+function buildActionExpression(
+  request: SparseKernelBrowserActRequest,
+  selector: string,
+  timeoutMs: number,
+): string {
   const selectorJson = JSON.stringify(selector);
+  const timeoutJson = JSON.stringify(timeoutMs);
   if (request.kind === "click" || request.kind === "hover" || request.kind === "scrollIntoView") {
     const eventName = request.kind === "hover" ? "mouseover" : "click";
     const repeat = request.kind === "click" && request.doubleClick ? 2 : 1;
     const button = JSON.stringify(
       normalizeMouseButton(request.kind === "click" ? request.button : undefined),
     );
-    return `(() => {
-  const node = document.querySelector(${selectorJson});
-  if (!node) throw new Error("SparseKernel browser action target not found");
+    return `(async () => {
+  ${buildActionTargetHelpers(selectorJson, timeoutJson)}
+  const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   if (${JSON.stringify(request.kind)} === "scrollIntoView") return { ok: true };
   for (let i = 0; i < ${repeat}; i += 1) {
@@ -1581,15 +1741,26 @@ function buildActionExpression(request: SparseKernelBrowserActRequest, selector:
   if (request.kind === "type") {
     const text = JSON.stringify(request.text);
     const submit = request.submit === true;
-    return `(() => {
-  const node = document.querySelector(${selectorJson});
-  if (!node) throw new Error("SparseKernel browser action target not found");
+    const slowly = request.slowly === true;
+    return `(async () => {
+  ${buildActionTargetHelpers(selectorJson, timeoutJson)}
+  const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   node.focus?.();
   const value = ${text};
+  const slowly = ${JSON.stringify(slowly)};
   if ("value" in node) {
-    node.value = value;
-    node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    node.value = "";
+    if (slowly) {
+      for (const char of Array.from(value)) {
+        node.value += char;
+        node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: char }));
+        await delay(75);
+      }
+    } else {
+      node.value = value;
+      node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    }
     node.dispatchEvent(new Event("change", { bubbles: true }));
   } else {
     node.textContent = value;
@@ -1605,9 +1776,9 @@ function buildActionExpression(request: SparseKernelBrowserActRequest, selector:
   }
   if (request.kind === "select") {
     const values = JSON.stringify(request.values);
-    return `(() => {
-  const node = document.querySelector(${selectorJson});
-  if (!node) throw new Error("SparseKernel browser action target not found");
+    return `(async () => {
+  ${buildActionTargetHelpers(selectorJson, timeoutJson)}
+  const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   const values = ${values};
   if (node instanceof HTMLSelectElement) {
@@ -1628,60 +1799,30 @@ function buildActionExpression(request: SparseKernelBrowserActRequest, selector:
   throw new Error(`SparseKernel CDP browser action does not support ${request.kind} yet.`);
 }
 
-function buildWaitExpression(request: Extract<SparseKernelBrowserActRequest, { kind: "wait" }>) {
-  const timeMs = Math.max(0, Math.min(60_000, Math.floor(request.timeMs ?? 0)));
-  const text = JSON.stringify(request.text ?? "");
-  const textGone = JSON.stringify(request.textGone ?? "");
-  const selector = JSON.stringify(request.selector ?? "");
-  const url = JSON.stringify(request.url ?? "");
-  const loadState = JSON.stringify(request.loadState ?? "");
-  const fn = JSON.stringify(request.fn ?? "");
+function buildDragExpression(
+  startSelector: string,
+  endSelector: string,
+  timeoutMs: number,
+): string {
   return `(async () => {
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const wanted = ${text};
-  const gone = ${textGone};
-  const selector = ${selector};
-  const wantedUrl = ${url};
-  const loadState = ${loadState};
-  const fnBody = ${fn};
-  const selectorMatches = () => {
-    if (!selector) return true;
-    try { return Boolean(document.querySelector(selector)); } catch { return false; }
+  const isVisible = (node) => {
+    if (!node?.isConnected) return false;
+    const style = getComputedStyle(node);
+    if (style.visibility === "hidden" || style.display === "none") return false;
+    return node.getClientRects().length > 0;
   };
-  const urlMatches = () => !wantedUrl || location.href.includes(String(wantedUrl).replace(/\\*/g, ""));
-  const loadStateMatches = () => {
-    if (!loadState) return true;
-    if (loadState === "domcontentloaded") return document.readyState === "interactive" || document.readyState === "complete";
-    return document.readyState === "complete";
-  };
-  const fnMatches = async () => {
-    if (!fnBody) return true;
-    try {
-      const candidate = eval("(" + fnBody + ")");
-      const result = typeof candidate === "function" ? candidate() : candidate;
-      return Boolean(await result);
-    } catch {
-      return false;
+  const waitFor = async (selector, label) => {
+    const deadline = Date.now() + ${JSON.stringify(timeoutMs)};
+    while (Date.now() <= deadline) {
+      const node = document.querySelector(selector);
+      if (node && isVisible(node)) return node;
+      await delay(100);
     }
+    throw new Error("SparseKernel browser drag target not found: " + label);
   };
-  if (${timeMs} > 0) await delay(${timeMs});
-  const deadline = Date.now() + ${Math.max(1, Math.floor(request.timeoutMs ?? 10_000))};
-  while (Date.now() < deadline) {
-    const body = document.body?.innerText || document.documentElement?.textContent || "";
-    const hasWanted = !wanted || body.includes(wanted);
-    const hasGone = gone ? body.includes(gone) : false;
-    if (hasWanted && !hasGone && selectorMatches() && urlMatches() && loadStateMatches() && await fnMatches()) return { ok: true };
-    await delay(100);
-  }
-  throw new Error("SparseKernel browser wait timed out");
-})()`;
-}
-
-function buildDragExpression(startSelector: string, endSelector: string): string {
-  return `(() => {
-  const start = document.querySelector(${JSON.stringify(startSelector)});
-  const end = document.querySelector(${JSON.stringify(endSelector)});
-  if (!start || !end) throw new Error("SparseKernel browser drag target not found");
+  const start = await waitFor(${JSON.stringify(startSelector)}, "start");
+  const end = await waitFor(${JSON.stringify(endSelector)}, "end");
   start.scrollIntoView({ block: "center", inline: "center" });
   end.scrollIntoView({ block: "center", inline: "center" });
   const data = typeof DataTransfer === "function" ? new DataTransfer() : undefined;
@@ -1697,13 +1838,23 @@ function buildDragExpression(startSelector: string, endSelector: string): string
 
 function buildFillExpression(
   fields: Array<SparseKernelBrowserFormField & { selector: string }>,
+  timeoutMs: number,
 ): string {
-  return `(() => {
+  return `(async () => {
   const fields = ${JSON.stringify(fields)};
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const waitFor = async (selector, ref) => {
+    const deadline = Date.now() + ${JSON.stringify(timeoutMs)};
+    while (Date.now() <= deadline) {
+      const node = document.querySelector(selector);
+      if (node?.isConnected) return node;
+      await delay(100);
+    }
+    throw new Error("SparseKernel browser fill target not found: " + ref);
+  };
   let changed = 0;
   for (const field of fields) {
-    const node = document.querySelector(field.selector);
-    if (!node) throw new Error("SparseKernel browser fill target not found: " + field.ref);
+    const node = await waitFor(field.selector, field.ref);
     const type = String(field.type || "").toLowerCase();
     const value = field.value;
     if (type === "checkbox" || type === "radio") {
@@ -1738,6 +1889,94 @@ function buildEvaluateExpression(
   const candidate = eval("(" + fnBody + ")");
   return typeof candidate === "function" ? (selector ? candidate(node) : candidate()) : candidate;
 })()`;
+}
+
+function buildActionTargetHelpers(selectorJson: string, timeoutJson: string): string {
+  return `const selector = ${selectorJson};
+  const timeoutMs = ${timeoutJson};
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (node) => {
+    if (!node?.isConnected) return false;
+    const style = getComputedStyle(node);
+    if (style.visibility === "hidden" || style.display === "none") return false;
+    return node.getClientRects().length > 0;
+  };
+  const waitForActionTarget = async () => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      const node = document.querySelector(selector);
+      if (node && isVisible(node)) return node;
+      await delay(100);
+    }
+    throw new Error("SparseKernel browser action target not found");
+  };`;
+}
+
+function buildTextPredicateExpression(text: string, gone: boolean): string {
+  return `(() => {
+  const body = document.body?.innerText || document.documentElement?.textContent || "";
+  return ${gone ? "!" : ""}body.includes(${JSON.stringify(text)});
+})()`;
+}
+
+function buildSelectorVisiblePredicateExpression(selector: string): string {
+  return `(() => {
+  try {
+    const node = document.querySelector(${JSON.stringify(selector)});
+    if (!node?.isConnected) return false;
+    const style = getComputedStyle(node);
+    if (style.visibility === "hidden" || style.display === "none") return false;
+    return node.getClientRects().length > 0;
+  } catch {
+    return false;
+  }
+})()`;
+}
+
+function buildUrlPredicateExpression(pattern: string): string {
+  const source = pattern.includes("*") ? globToRegExpSource(pattern) : "";
+  return `(() => {
+  const href = location.href;
+  const pattern = ${JSON.stringify(pattern)};
+  const source = ${JSON.stringify(source)};
+  return source ? new RegExp(source).test(href) : href.includes(pattern);
+})()`;
+}
+
+function buildReadyStatePredicateExpression(
+  loadState: "load" | "domcontentloaded" | "complete",
+): string {
+  if (loadState === "domcontentloaded") {
+    return `(() => document.readyState === "interactive" || document.readyState === "complete")()`;
+  }
+  return `(() => document.readyState === "complete")()`;
+}
+
+function buildFunctionPredicateExpression(fn: string): string {
+  return `(async () => {
+  try {
+    const candidate = eval("(" + ${JSON.stringify(fn)} + ")");
+    const result = typeof candidate === "function" ? candidate() : candidate;
+    return Boolean(await result);
+  } catch {
+    return false;
+  }
+})()`;
+}
+
+function resolveCdpActionTimeoutMs(timeoutMs: number | undefined): number {
+  return Math.max(1, Math.min(120_000, Math.floor(timeoutMs ?? 10_000)));
+}
+
+function resolveCdpCommandTimeoutMs(timeoutMs: number | undefined): number {
+  return resolveCdpActionTimeoutMs(timeoutMs) + 1_000;
+}
+
+function globToRegExpSource(pattern: string): string {
+  return `^${pattern
+    .split("*")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".*")}$`;
 }
 
 function rawDataToString(data: RawData): string {

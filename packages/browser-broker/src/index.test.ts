@@ -87,6 +87,7 @@ class FakeCdpTransport implements CdpTransport {
         break;
       case "Page.enable":
       case "Runtime.enable":
+      case "Network.enable":
       case "Log.enable":
         this.respond(message.id, {});
         break;
@@ -169,6 +170,22 @@ class FakeCdpTransport implements CdpTransport {
       params: {
         message: "Continue?",
       },
+    });
+  }
+
+  emitNetworkRequest(requestId: string): void {
+    this.emit({
+      method: "Network.requestWillBeSent",
+      sessionId: "session-1",
+      params: { requestId },
+    });
+  }
+
+  emitNetworkFinished(requestId: string): void {
+    this.emit({
+      method: "Network.loadingFinished",
+      sessionId: "session-1",
+      params: { requestId },
     });
   }
 
@@ -693,6 +710,78 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     );
   });
 
+  it("retries selector-backed actions inside the leased page context", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "click",
+      selector: "#eventual",
+      timeoutMs: 1_234,
+    });
+
+    const runtimeEvaluations = transport.sent.filter(
+      (message): message is { method: string; params: { expression: string } } =>
+        typeof message === "object" &&
+        message !== null &&
+        (message as { method?: unknown }).method === "Runtime.evaluate" &&
+        typeof (message as { params?: { expression?: unknown } }).params?.expression === "string",
+    );
+    const actionExpression = runtimeEvaluations.at(-1)?.params.expression ?? "";
+    expect(actionExpression).toContain("waitForActionTarget");
+    expect(actionExpression).toContain("const timeoutMs = 1234");
+    expect(actionExpression).toContain("document.querySelector(selector)");
+  });
+
+  it("waits for CDP network idle instead of treating document load as enough", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    transport.emitNetworkRequest("req-1");
+    const wait = broker.actContext(context.ledger_context.id, {
+      kind: "wait",
+      loadState: "networkidle",
+      timeoutMs: 2_500,
+    });
+
+    await expect(
+      Promise.race([wait.then(() => "resolved"), delay(150).then(() => "pending")]),
+    ).resolves.toBe("pending");
+
+    transport.emitNetworkFinished("req-1");
+    await expect(wait).resolves.toMatchObject({
+      ok: true,
+      kind: "wait",
+      value: { ok: true },
+    });
+  });
+
   it("constructs from the SparseKernel daemon client", async () => {
     const calls: Array<{ url: string; body?: unknown }> = [];
     const transport = new FakeCdpTransport();
@@ -766,3 +855,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     });
   });
 });
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

@@ -10,6 +10,10 @@ import type {
   ArtifactRecord,
   ArtifactRecordInput,
   BrowserContextRecord,
+  BrowserObservationInput,
+  BrowserObservationRecord,
+  BrowserTargetInput,
+  BrowserTargetRecord,
   ClaimTaskByIdInput,
   CapabilityCheckInput,
   EnqueueTaskInput,
@@ -113,6 +117,32 @@ type BrowserContextRow = {
   status: string;
   created_at: string;
   expires_at: string | null;
+};
+
+type BrowserTargetRow = {
+  id: string;
+  context_id: string;
+  target_id: string;
+  opener_target_id: string | null;
+  url: string | null;
+  title: string | null;
+  status: string;
+  close_reason: string | null;
+  console_count: number | bigint;
+  network_count: number | bigint;
+  artifact_count: number | bigint;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+};
+
+type BrowserObservationRow = {
+  id: number | bigint;
+  context_id: string;
+  target_id: string | null;
+  observation_type: string;
+  payload_json: string | null;
+  created_at: string;
 };
 
 type SessionEntryRow = {
@@ -315,6 +345,36 @@ function toBrowserContext(row: BrowserContextRow): BrowserContextRecord {
   };
 }
 
+function toBrowserTarget(row: BrowserTargetRow): BrowserTargetRecord {
+  return {
+    id: row.id,
+    contextId: row.context_id,
+    targetId: row.target_id,
+    ...(optionalText(row.opener_target_id) ? { openerTargetId: row.opener_target_id! } : {}),
+    ...(optionalText(row.url) ? { url: row.url! } : {}),
+    ...(optionalText(row.title) ? { title: row.title! } : {}),
+    status: row.status,
+    ...(optionalText(row.close_reason) ? { closeReason: row.close_reason! } : {}),
+    consoleCount: numberFromSql(row.console_count) ?? 0,
+    networkCount: numberFromSql(row.network_count) ?? 0,
+    artifactCount: numberFromSql(row.artifact_count) ?? 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(optionalText(row.closed_at) ? { closedAt: row.closed_at! } : {}),
+  };
+}
+
+function toBrowserObservation(row: BrowserObservationRow): BrowserObservationRecord {
+  return {
+    id: numberFromSql(row.id) ?? 0,
+    contextId: row.context_id,
+    ...(optionalText(row.target_id) ? { targetId: row.target_id! } : {}),
+    observationType: row.observation_type,
+    ...(row.payload_json ? { payload: parseJsonText(row.payload_json) } : {}),
+    createdAt: row.created_at,
+  };
+}
+
 function toTrustZone(row: TrustZoneRow): TrustZoneRecord {
   return {
     id: row.id,
@@ -429,6 +489,8 @@ export class LocalKernelDatabase {
       "tool_calls",
       "resource_leases",
       "browser_contexts",
+      "browser_targets",
+      "browser_observations",
       "artifacts",
       "capabilities",
       "audit_log",
@@ -1439,8 +1501,275 @@ export class LocalKernelDatabase {
         objectId: id,
         createdAt: now,
       });
+      this.db
+        .prepare(
+          `UPDATE browser_targets
+           SET status = 'closed',
+               close_reason = COALESCE(close_reason, 'context_released'),
+               updated_at = ?,
+               closed_at = COALESCE(closed_at, ?)
+           WHERE context_id = ? AND status = 'active'`,
+        )
+        .run(now, now, id);
     }
     return updated > 0;
+  }
+
+  recordBrowserTarget(input: BrowserTargetInput): BrowserTargetRecord {
+    const now = input.updatedAt ?? input.createdAt ?? nowIso();
+    const id = `${input.contextId}:${input.targetId}`;
+    this.db
+      .prepare(
+        `INSERT INTO browser_targets(
+          id, context_id, target_id, opener_target_id, url, title, status, close_reason,
+          created_at, updated_at, closed_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(context_id, target_id) DO UPDATE SET
+          opener_target_id = COALESCE(excluded.opener_target_id, browser_targets.opener_target_id),
+          url = COALESCE(excluded.url, browser_targets.url),
+          title = COALESCE(excluded.title, browser_targets.title),
+          status = excluded.status,
+          close_reason = COALESCE(excluded.close_reason, browser_targets.close_reason),
+          updated_at = excluded.updated_at,
+          closed_at = COALESCE(excluded.closed_at, browser_targets.closed_at)`,
+      )
+      .run(
+        id,
+        input.contextId,
+        input.targetId,
+        input.openerTargetId ?? null,
+        input.url ?? null,
+        input.title ?? null,
+        input.status ?? "active",
+        input.closeReason ?? null,
+        input.createdAt ?? now,
+        now,
+        input.closedAt ?? null,
+      );
+    this.recordAudit({
+      actor: { type: "runtime" },
+      action: "browser_target.recorded",
+      objectType: "browser_target",
+      objectId: id,
+      payload: {
+        contextId: input.contextId,
+        targetId: input.targetId,
+        status: input.status ?? "active",
+        url: input.url,
+      },
+      createdAt: now,
+    });
+    const target = this.getBrowserTarget(input.contextId, input.targetId);
+    if (!target) {
+      throw new Error(`Failed to record browser target ${input.targetId}`);
+    }
+    return target;
+  }
+
+  getBrowserTarget(contextId: string, targetId: string): BrowserTargetRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM browser_targets WHERE context_id = ? AND target_id = ?")
+      .get(contextId, targetId) as BrowserTargetRow | undefined;
+    return row ? toBrowserTarget(row) : undefined;
+  }
+
+  closeBrowserTarget(input: {
+    contextId: string;
+    targetId: string;
+    reason?: string;
+    closedAt?: string;
+  }): BrowserTargetRecord {
+    const now = input.closedAt ?? nowIso();
+    this.recordBrowserTarget({
+      contextId: input.contextId,
+      targetId: input.targetId,
+      status: "closed",
+      closeReason: input.reason ?? "closed",
+      updatedAt: now,
+      closedAt: now,
+    });
+    this.recordAudit({
+      actor: { type: "runtime" },
+      action: "browser_target.closed",
+      objectType: "browser_target",
+      objectId: `${input.contextId}:${input.targetId}`,
+      payload: { contextId: input.contextId, targetId: input.targetId, reason: input.reason },
+      createdAt: now,
+    });
+    const target = this.getBrowserTarget(input.contextId, input.targetId);
+    if (!target) {
+      throw new Error(`Failed to close browser target ${input.targetId}`);
+    }
+    return target;
+  }
+
+  recordBrowserObservation(input: BrowserObservationInput): BrowserObservationRecord {
+    const now = input.createdAt ?? nowIso();
+    if (input.targetId && !this.getBrowserTarget(input.contextId, input.targetId)) {
+      this.recordBrowserTarget({
+        contextId: input.contextId,
+        targetId: input.targetId,
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    const result = this.db
+      .prepare(
+        `INSERT INTO browser_observations(context_id, target_id, observation_type, payload_json, created_at)
+         VALUES(?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.contextId,
+        input.targetId ?? null,
+        input.observationType,
+        jsonToText(input.payload),
+        now,
+      );
+    if (input.targetId) {
+      const counter =
+        input.observationType === "browser_console" ||
+        input.observationType.startsWith("browser_console.")
+          ? "console_count"
+          : input.observationType.startsWith("browser_artifact")
+            ? "artifact_count"
+            : input.observationType.startsWith("browser_network")
+              ? "network_count"
+              : undefined;
+      if (counter) {
+        this.db
+          .prepare(
+            `UPDATE browser_targets
+             SET ${counter} = ${counter} + 1, updated_at = ?
+             WHERE context_id = ? AND target_id = ?`,
+          )
+          .run(now, input.contextId, input.targetId);
+      }
+    }
+    const id = numberFromSql(result.lastInsertRowid) ?? 0;
+    this.recordAudit({
+      actor: { type: "runtime" },
+      action: "browser_context.observation",
+      objectType: "browser_context",
+      objectId: input.contextId,
+      payload: {
+        targetId: input.targetId,
+        observationType: input.observationType,
+        payload: input.payload,
+      },
+      createdAt: now,
+    });
+    const row = this.db.prepare("SELECT * FROM browser_observations WHERE id = ?").get(id) as
+      | BrowserObservationRow
+      | undefined;
+    if (!row) {
+      throw new Error(`Failed to record browser observation ${id}`);
+    }
+    return toBrowserObservation(row);
+  }
+
+  listBrowserTargets(
+    input: {
+      contextId?: string;
+      sessionId?: string;
+      taskId?: string;
+      status?: string;
+      limit?: number;
+    } = {},
+  ): BrowserTargetRecord[] {
+    const conditions: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.contextId) {
+      conditions.push("bt.context_id = ?");
+      params.push(input.contextId);
+    }
+    if (input.sessionId) {
+      conditions.push("bc.session_id = ?");
+      params.push(input.sessionId);
+    }
+    if (input.taskId) {
+      conditions.push("bc.task_id = ?");
+      params.push(input.taskId);
+    }
+    if (input.status) {
+      conditions.push("bt.status = ?");
+      params.push(input.status);
+    }
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 100)));
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT bt.*
+         FROM browser_targets bt
+         JOIN browser_contexts bc ON bc.id = bt.context_id
+         ${where}
+         ORDER BY bt.updated_at DESC, bt.id ASC
+         LIMIT ?`,
+      )
+      .all(...params, limit) as BrowserTargetRow[];
+    return rows.map(toBrowserTarget);
+  }
+
+  listBrowserObservations(
+    input: {
+      contextId?: string;
+      targetId?: string;
+      observationType?: string;
+      since?: string;
+      limit?: number;
+    } = {},
+  ): BrowserObservationRecord[] {
+    const conditions: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.contextId) {
+      conditions.push("context_id = ?");
+      params.push(input.contextId);
+    }
+    if (input.targetId) {
+      conditions.push("target_id = ?");
+      params.push(input.targetId);
+    }
+    if (input.observationType) {
+      conditions.push("observation_type = ?");
+      params.push(input.observationType);
+    }
+    if (input.since) {
+      conditions.push("created_at >= ?");
+      params.push(input.since);
+    }
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 100)));
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM browser_observations
+         ${where}
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(...params, limit) as BrowserObservationRow[];
+    return rows.map(toBrowserObservation);
+  }
+
+  pruneBrowserObservations(params: { olderThan: string; observationTypes?: string[] }): number {
+    const types = params.observationTypes?.filter((type) => type.trim());
+    const typeWhere = types?.length
+      ? `AND observation_type IN (${types.map(() => "?").join(", ")})`
+      : "";
+    const deleted = changes(
+      this.db
+        .prepare(`DELETE FROM browser_observations WHERE created_at < ? ${typeWhere}`)
+        .run(params.olderThan, ...((types ?? []) as SQLInputValue[])),
+    );
+    if (deleted > 0) {
+      this.recordAudit({
+        actor: { type: "runtime" },
+        action: "browser_observations.pruned",
+        objectType: "browser_observation",
+        payload: { olderThan: params.olderThan, observationTypes: types, count: deleted },
+      });
+    }
+    return deleted;
   }
 
   createResourceLease(input: {

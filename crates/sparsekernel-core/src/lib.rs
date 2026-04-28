@@ -1,5 +1,5 @@
 use chrono::{Duration as ChronoDuration, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 1;
+pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 2;
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
+const MIGRATION_0002: &str =
+    include_str!("../../../migrations/0002_browser_targets_observations.sql");
 
 pub type Result<T> = std::result::Result<T, SparseKernelError>;
 
@@ -317,6 +319,75 @@ pub struct BrowserPoolRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserTargetRecord {
+    pub id: String,
+    pub context_id: String,
+    pub target_id: String,
+    pub opener_target_id: Option<String>,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub status: String,
+    pub close_reason: Option<String>,
+    pub console_count: i64,
+    pub network_count: i64,
+    pub artifact_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserObservationRecord {
+    pub id: i64,
+    pub context_id: String,
+    pub target_id: Option<String>,
+    pub observation_type: String,
+    pub payload: Option<Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordBrowserTargetInput {
+    pub context_id: String,
+    pub target_id: String,
+    pub opener_target_id: Option<String>,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub close_reason: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub closed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordBrowserObservationInput {
+    pub context_id: String,
+    pub target_id: Option<String>,
+    pub observation_type: String,
+    pub payload: Option<Value>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListBrowserTargetsInput {
+    pub context_id: Option<String>,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListBrowserObservationsInput {
+    pub context_id: Option<String>,
+    pub target_id: Option<String>,
+    pub observation_type: Option<String>,
+    pub since: Option<String>,
+    pub limit: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserEndpointProbe {
     pub endpoint: String,
@@ -364,16 +435,22 @@ impl SparseKernelDb {
 
     pub fn migrate(&self) -> Result<()> {
         let current = self.schema_version()?;
-        if current >= SPARSEKERNEL_SCHEMA_VERSION {
-            return Ok(());
-        }
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<()> {
-            self.conn.execute_batch(MIGRATION_0001)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
-                params![SPARSEKERNEL_SCHEMA_VERSION, now_iso()],
-            )?;
+            if current < 1 {
+                self.conn.execute_batch(MIGRATION_0001)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    params![1, now_iso()],
+                )?;
+            }
+            if current < 2 {
+                self.conn.execute_batch(MIGRATION_0002)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    params![2, now_iso()],
+                )?;
+            }
             Ok(())
         })();
         match result {
@@ -421,6 +498,8 @@ impl SparseKernelDb {
             "resource_leases",
             "browser_pools",
             "browser_contexts",
+            "browser_targets",
+            "browser_observations",
             "artifacts",
             "artifact_access",
             "capabilities",
@@ -1263,6 +1342,266 @@ impl SparseKernelDb {
             .map_err(SparseKernelError::from)
     }
 
+    pub fn record_browser_target(
+        &self,
+        input: RecordBrowserTargetInput,
+    ) -> Result<BrowserTargetRecord> {
+        let now = input
+            .updated_at
+            .clone()
+            .or_else(|| input.created_at.clone())
+            .unwrap_or_else(now_iso);
+        let id = format!("{}:{}", input.context_id, input.target_id);
+        self.conn.execute(
+            "INSERT INTO browser_targets(
+                id, context_id, target_id, opener_target_id, url, title, status, close_reason,
+                created_at, updated_at, closed_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(context_id, target_id) DO UPDATE SET
+                opener_target_id = COALESCE(excluded.opener_target_id, browser_targets.opener_target_id),
+                url = COALESCE(excluded.url, browser_targets.url),
+                title = COALESCE(excluded.title, browser_targets.title),
+                status = excluded.status,
+                close_reason = COALESCE(excluded.close_reason, browser_targets.close_reason),
+                updated_at = excluded.updated_at,
+                closed_at = COALESCE(excluded.closed_at, browser_targets.closed_at)",
+            params![
+                id,
+                input.context_id,
+                input.target_id,
+                input.opener_target_id,
+                input.url,
+                input.title,
+                input.status.unwrap_or_else(|| "active".to_string()),
+                input.close_reason,
+                input.created_at.unwrap_or_else(|| now.clone()),
+                now,
+                input.closed_at,
+            ],
+        )?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "browser_target.recorded".to_string(),
+            object_type: Some("browser_target".to_string()),
+            object_id: Some(id),
+            payload: None,
+        })?;
+        self.get_browser_target(&input.context_id, &input.target_id)
+    }
+
+    pub fn get_browser_target(
+        &self,
+        context_id: &str,
+        target_id: &str,
+    ) -> Result<BrowserTargetRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, context_id, target_id, opener_target_id, url, title, status, close_reason,
+                        console_count, network_count, artifact_count, created_at, updated_at, closed_at
+                 FROM browser_targets WHERE context_id = ? AND target_id = ?",
+                params![context_id, target_id],
+                browser_target_from_row,
+            )
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn close_browser_target(
+        &self,
+        context_id: &str,
+        target_id: &str,
+        reason: Option<&str>,
+        closed_at: Option<&str>,
+    ) -> Result<BrowserTargetRecord> {
+        let now = closed_at.map(str::to_string).unwrap_or_else(now_iso);
+        let target = self.record_browser_target(RecordBrowserTargetInput {
+            context_id: context_id.to_string(),
+            target_id: target_id.to_string(),
+            opener_target_id: None,
+            url: None,
+            title: None,
+            status: Some("closed".to_string()),
+            close_reason: Some(reason.unwrap_or("closed").to_string()),
+            created_at: None,
+            updated_at: Some(now.clone()),
+            closed_at: Some(now),
+        })?;
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "browser_target.closed".to_string(),
+            object_type: Some("browser_target".to_string()),
+            object_id: Some(target.id.clone()),
+            payload: Some(json!({ "reason": reason })),
+        })?;
+        Ok(target)
+    }
+
+    pub fn record_browser_observation(
+        &self,
+        input: RecordBrowserObservationInput,
+    ) -> Result<BrowserObservationRecord> {
+        let now = input.created_at.unwrap_or_else(now_iso);
+        let context_id = input.context_id;
+        let target_id = input.target_id;
+        let observation_type = input.observation_type;
+        let payload = input.payload;
+        if let Some(target_id) = &target_id {
+            let _ = self.record_browser_target(RecordBrowserTargetInput {
+                context_id: context_id.clone(),
+                target_id: target_id.clone(),
+                opener_target_id: None,
+                url: None,
+                title: None,
+                status: Some("active".to_string()),
+                close_reason: None,
+                created_at: Some(now.clone()),
+                updated_at: Some(now.clone()),
+                closed_at: None,
+            });
+        }
+        self.conn.execute(
+            "INSERT INTO browser_observations(context_id, target_id, observation_type, payload_json, created_at)
+             VALUES(?, ?, ?, ?, ?)",
+            params![
+                context_id.as_str(),
+                target_id.as_deref(),
+                observation_type.as_str(),
+                json_text(payload.as_ref()),
+                now.as_str(),
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        if let Some(target_id) = &target_id {
+            let counter = if observation_type.starts_with("browser_console") {
+                Some("console_count")
+            } else if observation_type.starts_with("browser_artifact") {
+                Some("artifact_count")
+            } else if observation_type.starts_with("browser_network") {
+                Some("network_count")
+            } else {
+                None
+            };
+            if let Some(counter) = counter {
+                self.conn.execute(
+                    &format!(
+                        "UPDATE browser_targets SET {counter} = {counter} + 1, updated_at = ? WHERE context_id = ? AND target_id = ?"
+                    ),
+                    params![now.as_str(), context_id.as_str(), target_id.as_str()],
+                )?;
+            }
+        }
+        self.record_audit(AuditInput {
+            actor_type: Some("runtime".to_string()),
+            actor_id: None,
+            action: "browser_context.observation".to_string(),
+            object_type: Some("browser_context".to_string()),
+            object_id: Some(context_id.clone()),
+            payload: Some(json!({
+                "targetId": target_id,
+                "observationType": observation_type,
+                "payload": payload,
+            })),
+        })?;
+        self.conn
+            .query_row(
+                "SELECT id, context_id, target_id, observation_type, payload_json, created_at
+                 FROM browser_observations WHERE id = ?",
+                params![id],
+                browser_observation_from_row,
+            )
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn list_browser_targets(
+        &self,
+        input: ListBrowserTargetsInput,
+    ) -> Result<Vec<BrowserTargetRecord>> {
+        let mut conditions = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        if let Some(value) = input.context_id {
+            conditions.push("bt.context_id = ?");
+            values.push(value);
+        }
+        if let Some(value) = input.session_id {
+            conditions.push("bc.session_id = ?");
+            values.push(value);
+        }
+        if let Some(value) = input.task_id {
+            conditions.push("bc.task_id = ?");
+            values.push(value);
+        }
+        if let Some(value) = input.status {
+            conditions.push("bt.status = ?");
+            values.push(value);
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let limit = input.limit.unwrap_or(100).clamp(1, 1000);
+        let sql = format!(
+            "SELECT bt.id, bt.context_id, bt.target_id, bt.opener_target_id, bt.url, bt.title,
+                    bt.status, bt.close_reason, bt.console_count, bt.network_count,
+                    bt.artifact_count, bt.created_at, bt.updated_at, bt.closed_at
+             FROM browser_targets bt
+             JOIN browser_contexts bc ON bc.id = bt.context_id
+             {where_clause}
+             ORDER BY bt.updated_at DESC, bt.id ASC
+             LIMIT ?"
+        );
+        let mut params = values;
+        params.push(limit.to_string());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), browser_target_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn list_browser_observations(
+        &self,
+        input: ListBrowserObservationsInput,
+    ) -> Result<Vec<BrowserObservationRecord>> {
+        let mut conditions = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        if let Some(value) = input.context_id {
+            conditions.push("context_id = ?");
+            values.push(value);
+        }
+        if let Some(value) = input.target_id {
+            conditions.push("target_id = ?");
+            values.push(value);
+        }
+        if let Some(value) = input.observation_type {
+            conditions.push("observation_type = ?");
+            values.push(value);
+        }
+        if let Some(value) = input.since {
+            conditions.push("created_at >= ?");
+            values.push(value);
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let limit = input.limit.unwrap_or(100).clamp(1, 1000);
+        let sql = format!(
+            "SELECT id, context_id, target_id, observation_type, payload_json, created_at
+             FROM browser_observations
+             {where_clause}
+             ORDER BY id DESC
+             LIMIT ?"
+        );
+        let mut params = values;
+        params.push(limit.to_string());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), browser_observation_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SparseKernelError::from)
+    }
+
     fn record_task_event(&self, task_id: &str, event_type: &str, payload: Value) -> Result<()> {
         self.conn.execute(
             "INSERT INTO task_events(task_id, event_type, payload_json, created_at) VALUES(?, ?, ?, ?)",
@@ -1372,6 +1711,38 @@ fn browser_pool_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserPoo
         cdp_endpoint: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+    })
+}
+
+fn browser_target_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserTargetRecord> {
+    Ok(BrowserTargetRecord {
+        id: row.get(0)?,
+        context_id: row.get(1)?,
+        target_id: row.get(2)?,
+        opener_target_id: row.get(3)?,
+        url: row.get(4)?,
+        title: row.get(5)?,
+        status: row.get(6)?,
+        close_reason: row.get(7)?,
+        console_count: row.get(8)?,
+        network_count: row.get(9)?,
+        artifact_count: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        closed_at: row.get(13)?,
+    })
+}
+
+fn browser_observation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BrowserObservationRecord> {
+    Ok(BrowserObservationRecord {
+        id: row.get(0)?,
+        context_id: row.get(1)?,
+        target_id: row.get(2)?,
+        observation_type: row.get(3)?,
+        payload: parse_json(row.get(4)?),
+        created_at: row.get(5)?,
     })
 }
 

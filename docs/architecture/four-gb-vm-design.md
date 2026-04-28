@@ -24,3 +24,5 @@ Five hundred logical agents are feasible because most are parked in SQLite as co
 Book-writing and file-writing agents can run at higher active counts than coding agents because they do not all need browsers, sandboxes, test runners, or heavy model contexts. Expensive work should be scarce, leased, and scheduled.
 
 Resource leases let SparseKernel answer which task owned which expensive resource and when it was released or expired.
+
+Browser targets and observations are compact ledger rows, not retained screenshots or traces. This lets small machines keep enough browser provenance to answer which target made a request, emitted console output, or produced an artifact while still pruning old observations with `openclaw runtime prune`.

@@ -9,7 +9,10 @@ import {
 import type {
   SparseKernelArtifact,
   SparseKernelBrowserContext,
+  SparseKernelBrowserObservationInput,
+  SparseKernelBrowserTarget,
   SparseKernelCreateArtifactInput,
+  SparseKernelRecordBrowserTargetInput,
 } from "../../packages/sparsekernel-client/src/index.js";
 import {
   acquireNativeBrowserProcess,
@@ -21,6 +24,8 @@ const LIVE = process.env.OPENCLAW_SPARSEKERNEL_BROWSER_LIVE === "1";
 const describeLive = LIVE ? describe : describe.skip;
 
 class LiveSmokeKernel implements SparseKernelBrowserKernelClient {
+  readonly observations: SparseKernelBrowserObservationInput[] = [];
+  readonly targets: SparseKernelRecordBrowserTargetInput[] = [];
   private nextContext = 1;
 
   async probeBrowserPool(input: { cdp_endpoint: string }) {
@@ -58,6 +63,27 @@ class LiveSmokeKernel implements SparseKernelBrowserKernelClient {
       created_at: new Date().toISOString(),
     };
   }
+
+  async recordBrowserObservation(input: SparseKernelBrowserObservationInput): Promise<void> {
+    this.observations.push(input);
+  }
+
+  async recordBrowserTarget(
+    input: SparseKernelRecordBrowserTargetInput,
+  ): Promise<SparseKernelBrowserTarget> {
+    this.targets.push(input);
+    return {
+      id: `${input.context_id}:${input.target_id}`,
+      context_id: input.context_id,
+      target_id: input.target_id,
+      status: input.status ?? "active",
+      console_count: 0,
+      network_count: 0,
+      artifact_count: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+  }
 }
 
 describeLive("SparseKernel CDP browser broker live smoke", () => {
@@ -89,9 +115,8 @@ describeLive("SparseKernel CDP browser broker live smoke", () => {
           readyTimeoutMs: 20_000,
           idleTimeoutMs: 0,
         });
-        broker = new SparseKernelCdpBrowserBroker({
-          kernel: new LiveSmokeKernel(),
-        });
+        const kernel = new LiveSmokeKernel();
+        broker = new SparseKernelCdpBrowserBroker({ kernel });
         const context = await broker.acquireContext({
           trust_zone_id: "public_web",
           cdp_endpoint: browser.cdpEndpoint,
@@ -139,6 +164,15 @@ describeLive("SparseKernel CDP browser broker live smoke", () => {
             timeoutMs: 5_000,
           }),
         ).resolves.toMatchObject({ ok: true });
+        await expect(broker.captureScreenshotArtifact(contextId)).resolves.toMatchObject({
+          artifact_type: "screenshot",
+        });
+        expect(kernel.targets.some((target) => target.target_id === context.target_id)).toBe(true);
+        expect(
+          kernel.observations.some(
+            (observation) => observation.observation_type === "browser_artifact.created",
+          ),
+        ).toBe(true);
       } finally {
         if (broker && contextId) {
           await broker.releaseContext(contextId).catch(() => false);

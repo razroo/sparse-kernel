@@ -46,17 +46,17 @@ describe("local runtime kernel database", () => {
   it("migrates an empty database idempotently", () => {
     const root = tempRoot();
     const db = openTempDb(root);
-    expect(db.schemaVersion()).toBe(2);
+    expect(db.schemaVersion()).toBe(3);
     db.migrate();
-    expect(db.schemaVersion()).toBe(2);
+    expect(db.schemaVersion()).toBe(3);
     const migrations = db.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as {
       count: number;
     };
-    expect(migrations.count).toBe(2);
+    expect(migrations.count).toBe(3);
     db.close();
 
     const reopened = openTempDb(root);
-    expect(reopened.schemaVersion()).toBe(2);
+    expect(reopened.schemaVersion()).toBe(3);
     expect(reopened.inspect().counts.audit_log).toBe(0);
   });
 
@@ -261,6 +261,8 @@ describe("local runtime kernel database", () => {
   it("brokers browser context leases with max context accounting", () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });
+    db.upsertSession({ id: "session-a", agentId: "main" });
+    db.enqueueTask({ id: "task-a", kind: "browser", sessionId: "session-a" });
     db.grantCapability({
       subjectType: "agent",
       subjectId: "main",
@@ -279,6 +281,62 @@ describe("local runtime kernel database", () => {
       broker.acquireContext({ agentId: "main", trustZoneId: "public_web", maxContexts: 1 }),
     ).toThrow(/no available contexts/);
     expect(broker.releaseContext(context.id)).toBe(true);
+  });
+
+  it("records browser target lifecycle and queryable observations", () => {
+    const db = openTempDb();
+    db.ensureAgent({ id: "main" });
+    db.upsertSession({ id: "session-a", agentId: "main" });
+    db.enqueueTask({ id: "task-a", kind: "browser", sessionId: "session-a" });
+    db.grantCapability({
+      subjectType: "agent",
+      subjectId: "main",
+      resourceType: "browser_context",
+      resourceId: "public_web",
+      action: "allocate",
+    });
+    const broker = new LocalBrowserBroker(db);
+    const context = broker.acquireContext({
+      agentId: "main",
+      sessionId: "session-a",
+      taskId: "task-a",
+      trustZoneId: "public_web",
+    });
+    db.recordBrowserTarget({
+      contextId: context.id,
+      targetId: "target-1",
+      url: "https://example.com",
+      status: "active",
+    });
+    db.recordBrowserObservation({
+      contextId: context.id,
+      targetId: "target-1",
+      observationType: "browser_console",
+      payload: { text: "hello" },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    db.recordBrowserObservation({
+      contextId: context.id,
+      targetId: "target-1",
+      observationType: "browser_network.request",
+      payload: { requestId: "req-1" },
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    expect(db.listBrowserTargets({ contextId: context.id })).toEqual([
+      expect.objectContaining({
+        targetId: "target-1",
+        consoleCount: 1,
+        networkCount: 1,
+      }),
+    ]);
+    expect(db.listBrowserObservations({ contextId: context.id, targetId: "target-1" })).toEqual([
+      expect.objectContaining({ observationType: "browser_network.request" }),
+      expect.objectContaining({ observationType: "browser_console" }),
+    ]);
+    expect(db.pruneBrowserObservations({ olderThan: "2026-01-01T00:00:00.500Z" })).toBe(1);
+    expect(db.closeBrowserTarget({ contextId: context.id, targetId: "target-1" })).toMatchObject({
+      status: "closed",
+    });
   });
 
   it("applies trust-zone network policy checks to brokered browser origins", () => {
@@ -347,6 +405,40 @@ describe("local runtime kernel database", () => {
     });
     expect(allocation).toMatchObject({ backend: "local/no_isolation", status: "active" });
     expect(broker.releaseSandbox(allocation.id)).toBe(true);
+  });
+
+  it("runs trusted local commands behind an active sandbox lease", async () => {
+    const db = openTempDb();
+    db.ensureAgent({ id: "main" });
+    db.enqueueTask({ id: "task-a", kind: "demo" });
+    db.grantCapability({
+      subjectType: "agent",
+      subjectId: "main",
+      resourceType: "sandbox",
+      resourceId: "code_execution",
+      action: "allocate",
+    });
+    const broker = new LocalSandboxBroker(db);
+    const allocation = broker.allocateSandbox({
+      taskId: "task-a",
+      agentId: "main",
+      trustZoneId: "code_execution",
+      requirements: { maxRuntimeMs: 5_000, maxBytesOut: 1024 },
+    });
+    await expect(
+      broker.runCommand({
+        allocationId: allocation.id,
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('ok')"],
+      }),
+    ).resolves.toMatchObject({ exitCode: 0, stdout: "ok", timedOut: false });
+    expect(db.summarizeUsage().map((row) => row.resourceType)).toEqual(
+      expect.arrayContaining(["sandbox_runtime", "sandbox_output"]),
+    );
+    expect(broker.releaseSandbox(allocation.id)).toBe(true);
+    await expect(
+      broker.runCommand({ allocationId: allocation.id, command: process.execPath }),
+    ).rejects.toThrow(/not active/);
   });
 
   it("accounts sandboxed runs without requiring a queued task row", () => {

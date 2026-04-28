@@ -110,18 +110,23 @@ export async function runtimePruneCommand(
   try {
     const store = new ContentAddressedArtifactStore(db);
     const result = store.prune({ olderThan, retentionPolicies });
+    const prunedBrowserObservations = db.pruneBrowserObservations({ olderThan });
     if (opts.json) {
       writeRuntimeJson(runtime, {
         olderThan,
         retentionPolicies,
         prunedArtifacts: result.artifacts.length,
         deletedFiles: result.deletedFiles,
+        prunedBrowserObservations,
       });
       return;
     }
     runtime.log(
       `Pruned ${result.artifacts.length} runtime artifact record(s), deleted ${result.deletedFiles} file(s).`,
     );
+    if (prunedBrowserObservations > 0) {
+      runtime.log(`Pruned ${prunedBrowserObservations} browser observation record(s).`);
+    }
   } finally {
     db.close();
   }
@@ -263,6 +268,102 @@ export async function runtimeTranscriptCommand(
       if (event.content !== undefined) {
         runtime.log(JSON.stringify(event.content));
       }
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeBrowserTargetsCommand(
+  opts: {
+    context?: string;
+    session?: string;
+    task?: string;
+    status?: string;
+    limit?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let limit: number;
+  try {
+    limit = parseLimit(opts.limit, 100);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const targets = db.listBrowserTargets({
+      contextId: opts.context,
+      sessionId: opts.session,
+      taskId: opts.task,
+      status: opts.status,
+      limit,
+    });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { targets });
+      return;
+    }
+    if (targets.length === 0) {
+      runtime.log("No SparseKernel browser targets found.");
+      return;
+    }
+    for (const target of targets) {
+      runtime.log(
+        `${target.targetId} context=${target.contextId} status=${target.status} url=${target.url ?? "-"} console=${target.consoleCount} network=${target.networkCount} artifacts=${target.artifactCount}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeBrowserObservationsCommand(
+  opts: {
+    context?: string;
+    target?: string;
+    type?: string;
+    since?: string;
+    limit?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let limit: number;
+  let since: string | undefined;
+  try {
+    limit = parseLimit(opts.limit, 100);
+    since = opts.since
+      ? new Date(Date.now() - parseDurationMs(opts.since, { defaultUnit: "d" })).toISOString()
+      : undefined;
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const observations = db.listBrowserObservations({
+      contextId: opts.context,
+      targetId: opts.target,
+      observationType: opts.type,
+      since,
+      limit,
+    });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { observations });
+      return;
+    }
+    if (observations.length === 0) {
+      runtime.log("No SparseKernel browser observations found.");
+      return;
+    }
+    for (const observation of observations) {
+      runtime.log(
+        `#${observation.id} ${observation.observationType} context=${observation.contextId} target=${observation.targetId ?? "-"} ${observation.createdAt}`,
+      );
     }
   } finally {
     db.close();

@@ -16,6 +16,7 @@ SparseKernel security claims must be precise.
 - Playwright route blocking is not a hard security boundary.
 - Docker is one sandbox backend, not the default mental model.
 - `local/no_isolation` is only for trusted operations and accounting.
+- The local/no-isolation sandbox command runner schedules and audits trusted commands behind a lease, but it does not confine process, filesystem, or network access.
 - Untrusted plugins must not get ambient host authority.
 - Secrets should be referenced, not stored as plaintext in SQLite.
 

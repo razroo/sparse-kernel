@@ -124,12 +124,17 @@ export class LocalBrowserBroker implements BrowserBroker {
   }
 
   recordObservation(contextId: string, observation: unknown): void {
-    this.db.recordAudit({
-      actor: { type: "runtime" },
-      action: "browser_context.observation",
-      objectType: "browser_context",
-      objectId: contextId,
-      payload: observation,
+    const record =
+      observation && typeof observation === "object"
+        ? (observation as Record<string, unknown>)
+        : {};
+    this.db.recordBrowserObservation({
+      contextId,
+      targetId: typeof record.targetId === "string" ? record.targetId : undefined,
+      observationType:
+        typeof record.observationType === "string" ? record.observationType : "browser_observation",
+      payload: record.payload ?? observation,
+      createdAt: typeof record.createdAt === "string" ? record.createdAt : undefined,
     });
   }
 

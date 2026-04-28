@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 use sparsekernel_core::{
     probe_browser_endpoint, AppendTranscriptEventInput, ArtifactStore, AuditInput, BrowserBroker,
     CapabilityCheck, CompleteToolCallInput, CreateToolCallInput, EnqueueTaskInput,
-    GrantCapabilityInput, LedgerToolBroker, LocalSandboxBroker, MockBrowserBroker, SandboxBroker,
-    SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
+    GrantCapabilityInput, LedgerToolBroker, ListBrowserObservationsInput, ListBrowserTargetsInput,
+    LocalSandboxBroker, MockBrowserBroker, RecordBrowserObservationInput, RecordBrowserTargetInput,
+    SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
@@ -286,6 +287,14 @@ struct BrowserObservationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CloseBrowserTargetRequest {
+    context_id: String,
+    target_id: String,
+    reason: Option<String>,
+    closed_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AllocateSandboxRequest {
     agent_id: Option<String>,
     task_id: Option<String>,
@@ -552,22 +561,57 @@ pub fn handle_api_request_with_artifact_root(
         }
         ("POST", "/browser/contexts/observe") => {
             let input: BrowserObservationRequest = parse_body(body)?;
-            db.record_audit(AuditInput {
-                actor_type: Some("runtime".to_string()),
-                actor_id: None,
-                action: "browser_context.observation".to_string(),
-                object_type: Some("browser_context".to_string()),
-                object_id: Some(input.context_id),
-                payload: Some(json!({
-                    "targetId": input.target_id,
-                    "observationType": input.observation_type,
-                    "payload": input.payload,
-                    "observedAt": input.created_at,
-                })),
+            db.record_browser_observation(RecordBrowserObservationInput {
+                context_id: input.context_id,
+                target_id: input.target_id,
+                observation_type: input.observation_type,
+                payload: input.payload,
+                created_at: input.created_at,
             })?;
             ApiReply {
                 status_code: 200,
                 body: json!({ "ok": true }),
+            }
+        }
+        ("POST", "/browser/targets/record") => {
+            let input: RecordBrowserTargetInput = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.record_browser_target(input)?)?,
+            }
+        }
+        ("POST", "/browser/targets/close") => {
+            let input: CloseBrowserTargetRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.close_browser_target(
+                    &input.context_id,
+                    &input.target_id,
+                    input.reason.as_deref(),
+                    input.closed_at.as_deref(),
+                )?)?,
+            }
+        }
+        ("POST", "/browser/targets/list") => {
+            let input: ListBrowserTargetsInput = if body.is_empty() {
+                ListBrowserTargetsInput::default()
+            } else {
+                parse_body(body)?
+            };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.list_browser_targets(input)?)?,
+            }
+        }
+        ("POST", "/browser/observations/list") => {
+            let input: ListBrowserObservationsInput = if body.is_empty() {
+                ListBrowserObservationsInput::default()
+            } else {
+                parse_body(body)?
+            };
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.list_browser_observations(input)?)?,
             }
         }
         ("POST", "/tasks/enqueue") => {
@@ -1103,7 +1147,7 @@ mod tests {
             "POST",
             "/browser/contexts/observe",
             json!({
-                "context_id": context_id,
+                "context_id": context_id.clone(),
                 "target_id": "target-1",
                 "observation_type": "browser_console",
                 "payload": { "text": "hello" },
@@ -1119,6 +1163,28 @@ mod tests {
             "browser_console"
         );
         assert_eq!(audit[0].payload.as_ref().unwrap()["targetId"], "target-1");
+        let targets = json_call(
+            &mut db,
+            "POST",
+            "/browser/targets/list",
+            json!({ "context_id": context_id.clone() }),
+        );
+        assert_eq!(targets[0]["target_id"], "target-1");
+        assert_eq!(targets[0]["console_count"], 1);
+        let observations = json_call(
+            &mut db,
+            "POST",
+            "/browser/observations/list",
+            json!({ "context_id": context_id.clone(), "target_id": "target-1" }),
+        );
+        assert_eq!(observations[0]["observation_type"], "browser_console");
+        let closed = json_call(
+            &mut db,
+            "POST",
+            "/browser/targets/close",
+            json!({ "context_id": context_id.clone(), "target_id": "target-1", "reason": "test" }),
+        );
+        assert_eq!(closed["status"], "closed");
 
         let denied = handle_api_request(
             &mut db,

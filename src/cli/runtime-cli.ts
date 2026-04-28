@@ -1,5 +1,7 @@
 import type { Command } from "commander";
 import {
+  runtimeBrowserObservationsCommand,
+  runtimeBrowserTargetsCommand,
   runtimeBudgetCommand,
   runtimeBudgetSetCommand,
   runtimeInspectCommand,
@@ -43,6 +45,11 @@ export function registerRuntimeCli(program: Command) {
           ["openclaw sparsekernel sessions --json", "List SparseKernel sessions."],
           ["openclaw sparsekernel tasks --kind openclaw.embedded_run", "List runtime tasks."],
           ["openclaw sparsekernel transcript --session <id>", "Show transcript events."],
+          ["openclaw sparsekernel browser-targets --json", "List brokered browser targets."],
+          [
+            "openclaw sparsekernel browser-observations --context <id>",
+            "List browser observations.",
+          ],
           ["openclaw sparsekernel recover", "Recover expired or dead embedded-run leases."],
           ["openclaw runtime budget", "List trust-zone budgets and usage."],
           [
@@ -143,6 +150,56 @@ export function registerRuntimeCli(program: Command) {
             session: opts.session as string | undefined,
             limit: opts.limit as string | undefined,
             format: opts.format as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("browser-targets")
+    .description("List SparseKernel brokered browser targets")
+    .option("--context <id>", "Filter by browser context id")
+    .option("--session <id>", "Filter by session id")
+    .option("--task <id>", "Filter by task id")
+    .option("--status <status>", "Filter by target status")
+    .option("--limit <n>", "Maximum targets to return", "100")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeBrowserTargetsCommand(
+          {
+            context: opts.context as string | undefined,
+            session: opts.session as string | undefined,
+            task: opts.task as string | undefined,
+            status: opts.status as string | undefined,
+            limit: opts.limit as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("browser-observations")
+    .description("List SparseKernel browser observations")
+    .option("--context <id>", "Filter by browser context id")
+    .option("--target <id>", "Filter by target id")
+    .option("--type <type>", "Filter by observation type")
+    .option("--since <duration>", "Only include observations newer than this duration")
+    .option("--limit <n>", "Maximum observations to return", "100")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeBrowserObservationsCommand(
+          {
+            context: opts.context as string | undefined,
+            target: opts.target as string | undefined,
+            type: opts.type as string | undefined,
+            since: opts.since as string | undefined,
+            limit: opts.limit as string | undefined,
             json: Boolean(opts.json),
           },
           defaultRuntime,

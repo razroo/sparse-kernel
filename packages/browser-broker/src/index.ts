@@ -11,7 +11,10 @@ import {
   type SparseKernelBrowserContext,
   type SparseKernelBrowserEndpointProbe,
   type SparseKernelBrowserObservationInput,
+  type SparseKernelBrowserTarget,
+  type SparseKernelCloseBrowserTargetInput,
   type SparseKernelCreateArtifactInput,
+  type SparseKernelRecordBrowserTargetInput,
 } from "../../sparsekernel-client/src/index.js";
 
 export type {
@@ -21,7 +24,10 @@ export type {
   SparseKernelBrowserContext,
   SparseKernelBrowserEndpointProbe,
   SparseKernelBrowserObservationInput,
+  SparseKernelBrowserTarget,
+  SparseKernelCloseBrowserTargetInput,
   SparseKernelCreateArtifactInput,
+  SparseKernelRecordBrowserTargetInput,
 } from "../../sparsekernel-client/src/index.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -34,6 +40,12 @@ export type SparseKernelBrowserKernelClient = {
   releaseBrowserContext(contextId: string): Promise<boolean>;
   createArtifact(input: SparseKernelCreateArtifactInput): Promise<SparseKernelArtifact>;
   recordBrowserObservation?(input: SparseKernelBrowserObservationInput): Promise<void>;
+  recordBrowserTarget?(
+    input: SparseKernelRecordBrowserTargetInput,
+  ): Promise<SparseKernelBrowserTarget>;
+  closeBrowserTarget?(
+    input: SparseKernelCloseBrowserTargetInput,
+  ): Promise<SparseKernelBrowserTarget>;
 };
 
 export type CdpTransport = {
@@ -375,6 +387,15 @@ export class SparseKernelCdpBrowserBroker {
       await connection.command("Page.enable", {}, sessionId);
       await connection.command("Runtime.enable", {}, sessionId);
       await connection.command("Network.enable", {}, sessionId).catch(() => {});
+      if (allowedOrigins.length > 0) {
+        await connection
+          .command(
+            "Fetch.enable",
+            { patterns: [{ urlPattern: "*", requestStage: "Request" }] },
+            sessionId,
+          )
+          .catch(() => {});
+      }
       await connection.command("Log.enable", {}, sessionId).catch(() => {});
       await connection.command("Target.setDiscoverTargets", { discover: true }).catch(() => {});
       if (input.download_dir) {
@@ -404,6 +425,11 @@ export class SparseKernelCdpBrowserBroker {
         pages: new Map([[targetId, createLiveBrowserPage(targetId, sessionId)]]),
       };
       connection.onEvent((event) => {
+        void this.handleFetchRequestPaused(materialized, event).catch((error) => {
+          this.recordObservation(materialized, undefined, "browser_network.policy_error", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
         const consoleObservation = recordConsoleEvent(materialized, event);
         if (consoleObservation) {
           this.recordObservation(
@@ -424,6 +450,10 @@ export class SparseKernelCdpBrowserBroker {
         }
       });
       this.contexts.set(ledgerContext.id, materialized);
+      this.recordTarget(materialized, targetId, {
+        url: input.initial_url ?? "about:blank",
+        status: "active",
+      });
       return publicContext(materialized);
     } catch (error) {
       connection?.close();
@@ -683,6 +713,7 @@ export class SparseKernelCdpBrowserBroker {
     this.requirePage(context, targetId);
     await context.connection.command("Target.closeTarget", { targetId });
     context.pages.delete(targetId);
+    this.closeLedgerTarget(context, targetId, "closed");
     this.recordObservation(context, targetId, "browser_target.closed", {
       remainingTargets: context.pages.size,
     });
@@ -1002,6 +1033,7 @@ export class SparseKernelCdpBrowserBroker {
     try {
       for (const targetId of context.pages.keys()) {
         await context.connection.command("Target.closeTarget", { targetId }).catch(() => {});
+        this.closeLedgerTarget(context, targetId, "context_released");
       }
       await context.connection.command("Target.disposeBrowserContext", {
         browserContextId: context.cdp_browser_context_id,
@@ -1041,6 +1073,42 @@ export class SparseKernelCdpBrowserBroker {
     context.page_session_id = page.page_session_id;
   }
 
+  private recordTarget(
+    context: LiveBrowserContext,
+    targetId: string,
+    input: {
+      openerTargetId?: string;
+      url?: string;
+      title?: string;
+      status?: string;
+      closeReason?: string;
+      closedAt?: string;
+    } = {},
+  ): void {
+    const recorded = this.kernel.recordBrowserTarget?.({
+      context_id: context.ledger_context.id,
+      target_id: targetId,
+      opener_target_id: input.openerTargetId,
+      url: input.url,
+      title: input.title,
+      status: input.status,
+      close_reason: input.closeReason,
+      closed_at: input.closedAt,
+      updated_at: new Date().toISOString(),
+    });
+    void recorded?.catch(() => {});
+  }
+
+  private closeLedgerTarget(context: LiveBrowserContext, targetId: string, reason: string): void {
+    const closed = this.kernel.closeBrowserTarget?.({
+      context_id: context.ledger_context.id,
+      target_id: targetId,
+      reason,
+      closed_at: new Date().toISOString(),
+    });
+    void closed?.catch(() => {});
+  }
+
   private recordObservation(
     context: LiveBrowserContext,
     targetId: string | undefined,
@@ -1055,6 +1123,36 @@ export class SparseKernelCdpBrowserBroker {
       created_at: new Date().toISOString(),
     });
     void observed?.catch(() => {});
+  }
+
+  private async handleFetchRequestPaused(
+    context: LiveBrowserContext,
+    event: CdpEventMessage,
+  ): Promise<void> {
+    if (event.method !== "Fetch.requestPaused" || context.allowed_origins.length === 0) {
+      return;
+    }
+    const requestId = readString(event.params.requestId);
+    const request = isRecord(event.params.request) ? event.params.request : {};
+    const url = readString(request.url);
+    if (!requestId || !url) {
+      return;
+    }
+    const page = pageForEvent(context, event);
+    if (isUrlAllowedByOrigins(url, context.allowed_origins)) {
+      await context.connection.command("Fetch.continueRequest", { requestId }, event.sessionId);
+      return;
+    }
+    await context.connection.command(
+      "Fetch.failRequest",
+      { requestId, errorReason: "BlockedByClient" },
+      event.sessionId,
+    );
+    this.recordObservation(context, page?.target_id, "browser_network.blocked", {
+      requestId,
+      url,
+      reason: "allowed_origins",
+    });
   }
 
   private async navigate(
@@ -1085,6 +1183,12 @@ export class SparseKernelCdpBrowserBroker {
     if (load) {
       await load;
     }
+    const tab = await this.describeContextTab(context);
+    this.recordTarget(context, context.target_id, {
+      url: tab.url ?? url,
+      title: tab.title,
+      status: "active",
+    });
   }
 
   private async withPostActionNavigationGuard<T extends SparseKernelBrowserActResult>(
@@ -1253,11 +1357,26 @@ export class SparseKernelCdpBrowserBroker {
     await context.connection.command("Page.enable", {}, sessionId);
     await context.connection.command("Runtime.enable", {}, sessionId);
     await context.connection.command("Network.enable", {}, sessionId).catch(() => {});
+    if (context.allowed_origins.length > 0) {
+      await context.connection
+        .command(
+          "Fetch.enable",
+          { patterns: [{ urlPattern: "*", requestStage: "Request" }] },
+          sessionId,
+        )
+        .catch(() => {});
+    }
     await context.connection.command("Log.enable", {}, sessionId).catch(() => {});
     context.pages.set(targetId, createLiveBrowserPage(targetId, sessionId));
     context.target_id = targetId;
     context.page_session_id = sessionId;
     context.snapshot_refs = new Map();
+    const tab = await this.describeContextTab(context).catch(() => undefined);
+    this.recordTarget(context, targetId, {
+      url: tab?.url,
+      title: tab?.title,
+      status: "active",
+    });
     this.recordObservation(context, targetId, "browser_target.attached", {
       totalTargets: context.pages.size,
     });
@@ -1793,20 +1912,38 @@ function normalizeAllowedOrigin(raw: string): string | undefined {
 }
 
 function assertUrlAllowedByOrigins(url: string, allowedOrigins: string[], label: string): void {
+  const allowed = isUrlAllowedByOrigins(url, allowedOrigins);
+  if (allowed) {
+    return;
+  }
   if (allowedOrigins.length === 0) {
     return;
+  }
+  try {
+    new URL(url);
+  } catch {
+    throw new Error(`SparseKernel browser ${label} URL is not valid: ${url}`);
+  }
+  throw new Error(
+    `SparseKernel browser ${label} blocked by allowed origins: ${url} is not in ${allowedOrigins.join(", ")}`,
+  );
+}
+
+function isUrlAllowedByOrigins(url: string, allowedOrigins: string[]): boolean {
+  if (allowedOrigins.length === 0) {
+    return true;
   }
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    throw new Error(`SparseKernel browser ${label} URL is not valid: ${url}`);
+    return false;
   }
   if (parsed.protocol === "about:" && parsed.href === "about:blank") {
-    return;
+    return true;
   }
   if (parsed.protocol === "data:") {
-    return;
+    return true;
   }
   const origin =
     parsed.protocol === "blob:"
@@ -1814,12 +1951,7 @@ function assertUrlAllowedByOrigins(url: string, allowedOrigins: string[], label:
       : parsed.protocol === "http:" || parsed.protocol === "https:"
         ? parsed.origin
         : undefined;
-  if (origin && allowedOrigins.includes(origin)) {
-    return;
-  }
-  throw new Error(
-    `SparseKernel browser ${label} blocked by allowed origins: ${url} is not in ${allowedOrigins.join(", ")}`,
-  );
+  return Boolean(origin && allowedOrigins.includes(origin));
 }
 
 function normalizeBlobOrigin(url: string): string | undefined {

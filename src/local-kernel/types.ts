@@ -181,6 +181,53 @@ export type BrowserContextRecord = {
   expiresAt?: string;
 };
 
+export type BrowserTargetInput = {
+  contextId: string;
+  targetId: string;
+  openerTargetId?: string;
+  url?: string;
+  title?: string;
+  status?: "active" | "closed" | "blocked" | "crashed";
+  closeReason?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  closedAt?: string;
+};
+
+export type BrowserTargetRecord = {
+  id: string;
+  contextId: string;
+  targetId: string;
+  openerTargetId?: string;
+  url?: string;
+  title?: string;
+  status: string;
+  closeReason?: string;
+  consoleCount: number;
+  networkCount: number;
+  artifactCount: number;
+  createdAt: string;
+  updatedAt: string;
+  closedAt?: string;
+};
+
+export type BrowserObservationInput = {
+  contextId: string;
+  targetId?: string;
+  observationType: string;
+  payload?: unknown;
+  createdAt?: string;
+};
+
+export type BrowserObservationRecord = {
+  id: number;
+  contextId: string;
+  targetId?: string;
+  observationType: string;
+  payload?: unknown;
+  createdAt: string;
+};
+
 export type SandboxAllocationRecord = {
   id: string;
   taskId: string;

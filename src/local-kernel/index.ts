@@ -42,6 +42,8 @@ export type {
 export type {
   SandboxAllocationRequest,
   SandboxBackendKind,
+  SandboxCommandRequest,
+  SandboxCommandResult,
   SandboxBroker,
 } from "./sandbox-broker.js";
 export { isSandboxBackendAvailable } from "./sandbox-broker.js";

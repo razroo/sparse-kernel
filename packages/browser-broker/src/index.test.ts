@@ -4,7 +4,9 @@ import { describe, expect, it } from "vitest";
 import type {
   SparseKernelArtifact,
   SparseKernelBrowserContext,
+  SparseKernelBrowserTarget,
   SparseKernelCreateArtifactInput,
+  SparseKernelRecordBrowserTargetInput,
 } from "../../sparsekernel-client/src/index.js";
 import type {
   CdpTransport,
@@ -20,6 +22,9 @@ import {
 class FakeKernel implements SparseKernelBrowserKernelClient {
   readonly artifactInputs: SparseKernelCreateArtifactInput[] = [];
   readonly observations: SparseKernelBrowserObservationInput[] = [];
+  readonly targets: SparseKernelRecordBrowserTargetInput[] = [];
+  readonly closedTargets: Array<{ context_id: string; target_id: string; reason?: string | null }> =
+    [];
   readonly releasedContextIds: string[] = [];
 
   async probeBrowserPool() {
@@ -65,6 +70,41 @@ class FakeKernel implements SparseKernelBrowserKernelClient {
   async recordBrowserObservation(input: SparseKernelBrowserObservationInput): Promise<void> {
     this.observations.push(input);
   }
+
+  async recordBrowserTarget(
+    input: SparseKernelRecordBrowserTargetInput,
+  ): Promise<SparseKernelBrowserTarget> {
+    this.targets.push(input);
+    return fakeBrowserTarget(input);
+  }
+
+  async closeBrowserTarget(input: {
+    context_id: string;
+    target_id: string;
+    reason?: string | null;
+  }): Promise<SparseKernelBrowserTarget> {
+    this.closedTargets.push(input);
+    return fakeBrowserTarget({ ...input, status: "closed", close_reason: input.reason });
+  }
+}
+
+function fakeBrowserTarget(input: SparseKernelRecordBrowserTargetInput): SparseKernelBrowserTarget {
+  return {
+    id: `${input.context_id}:${input.target_id}`,
+    context_id: input.context_id,
+    target_id: input.target_id,
+    opener_target_id: input.opener_target_id,
+    url: input.url,
+    title: input.title,
+    status: input.status ?? "active",
+    close_reason: input.close_reason,
+    console_count: 0,
+    network_count: 0,
+    artifact_count: 0,
+    created_at: input.created_at ?? "2026-04-27T00:00:00Z",
+    updated_at: input.updated_at ?? "2026-04-27T00:00:00Z",
+    closed_at: input.closed_at,
+  };
 }
 
 class FakeCdpTransport implements CdpTransport {
@@ -102,6 +142,9 @@ class FakeCdpTransport implements CdpTransport {
       case "Page.enable":
       case "Runtime.enable":
       case "Network.enable":
+      case "Fetch.enable":
+      case "Fetch.continueRequest":
+      case "Fetch.failRequest":
       case "Log.enable":
       case "Target.setDiscoverTargets":
         this.respond(message.id, {});
@@ -204,6 +247,14 @@ class FakeCdpTransport implements CdpTransport {
       method: "Network.loadingFinished",
       sessionId,
       params: { requestId },
+    });
+  }
+
+  emitFetchRequest(requestId: string, url: string, sessionId = "session-1"): void {
+    this.emit({
+      method: "Fetch.requestPaused",
+      sessionId,
+      params: { requestId, request: { method: "GET", url } },
     });
   }
 
@@ -443,6 +494,20 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     });
     expect(result.artifact_type).toBe("screenshot");
     expect(result.artifact.mime_type).toBe("image/png");
+    expect(kernel.targets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ context_id: "browser_ctx_1", target_id: "target-1" }),
+        expect.objectContaining({ target_id: "target-1", url: "https://example.com/" }),
+      ]),
+    );
+    expect(kernel.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target_id: "target-1",
+          observation_type: "browser_artifact.created",
+        }),
+      ]),
+    );
     expect(kernel.artifactInputs[0]).toMatchObject({
       content_base64: Buffer.from("pixels").toString("base64"),
       mime_type: "image/png",
@@ -910,6 +975,53 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     );
   });
 
+  it("blocks target-scoped CDP requests outside the allowed origin policy", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.emitFetchRequest("fetch-allowed", "https://example.com/style.css");
+    transport.emitFetchRequest("fetch-denied", "https://tracker.example.net/pixel");
+    await delay(0);
+
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "Fetch.enable" }),
+        expect.objectContaining({
+          method: "Fetch.continueRequest",
+          params: expect.objectContaining({ requestId: "fetch-allowed" }),
+        }),
+        expect.objectContaining({
+          method: "Fetch.failRequest",
+          params: expect.objectContaining({ requestId: "fetch-denied" }),
+        }),
+      ]),
+    );
+    expect(kernel.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          context_id: context.ledger_context.id,
+          target_id: "target-1",
+          observation_type: "browser_network.blocked",
+          payload: expect.objectContaining({ requestId: "fetch-denied" }),
+        }),
+      ]),
+    );
+  });
+
   it("closes one broker-owned tab without releasing the whole context", async () => {
     const kernel = new FakeKernel();
     const transport = new FakeCdpTransport();
@@ -943,6 +1055,9 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       activeTargetId: "target-1",
     });
     expect(kernel.releasedContextIds).toEqual([]);
+    expect(kernel.closedTargets).toEqual([
+      expect.objectContaining({ context_id: "browser_ctx_1", target_id: "target-popup" }),
+    ]);
     await expect(broker.listTabs(context.ledger_context.id)).resolves.toEqual([
       expect.objectContaining({ targetId: "target-1" }),
     ]);
@@ -1202,6 +1317,19 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
         if (url.endsWith("/browser/contexts/observe")) {
           return Response.json({ ok: true });
         }
+        if (url.endsWith("/browser/targets/record") || url.endsWith("/browser/targets/close")) {
+          return Response.json({
+            id: `${body.context_id}:${body.target_id}`,
+            context_id: body.context_id,
+            target_id: body.target_id,
+            status: body.status ?? "active",
+            console_count: 0,
+            network_count: 0,
+            artifact_count: 0,
+            created_at: "2026-04-27T00:00:00Z",
+            updated_at: "2026-04-27T00:00:00Z",
+          });
+        }
         if (url.endsWith("/browser/contexts/release")) {
           return Response.json({ released: true });
         }
@@ -1225,6 +1353,8 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
         "/json/version",
         "/artifacts/create",
         "/browser/contexts/observe",
+        "/browser/targets/record",
+        "/browser/targets/close",
         "/browser/contexts/release",
       ]),
     );

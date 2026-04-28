@@ -170,6 +170,32 @@ export type SparseKernelBrowserEndpointProbe = {
   error?: string | null;
 };
 
+export type SparseKernelBrowserTarget = {
+  id: string;
+  context_id: string;
+  target_id: string;
+  opener_target_id?: string | null;
+  url?: string | null;
+  title?: string | null;
+  status: string;
+  close_reason?: string | null;
+  console_count: number;
+  network_count: number;
+  artifact_count: number;
+  created_at: string;
+  updated_at: string;
+  closed_at?: string | null;
+};
+
+export type SparseKernelBrowserObservation = {
+  id: number;
+  context_id: string;
+  target_id?: string | null;
+  observation_type: string;
+  payload?: unknown;
+  created_at: string;
+};
+
 export type SparseKernelAcquireBrowserContextInput = {
   agent_id?: string | null;
   session_id?: string | null;
@@ -186,6 +212,42 @@ export type SparseKernelBrowserObservationInput = {
   observation_type: string;
   payload?: unknown;
   created_at?: string | null;
+};
+
+export type SparseKernelRecordBrowserTargetInput = {
+  context_id: string;
+  target_id: string;
+  opener_target_id?: string | null;
+  url?: string | null;
+  title?: string | null;
+  status?: string | null;
+  close_reason?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  closed_at?: string | null;
+};
+
+export type SparseKernelCloseBrowserTargetInput = {
+  context_id: string;
+  target_id: string;
+  reason?: string | null;
+  closed_at?: string | null;
+};
+
+export type SparseKernelListBrowserTargetsInput = {
+  context_id?: string | null;
+  session_id?: string | null;
+  task_id?: string | null;
+  status?: string | null;
+  limit?: number;
+};
+
+export type SparseKernelListBrowserObservationsInput = {
+  context_id?: string | null;
+  target_id?: string | null;
+  observation_type?: string | null;
+  since?: string | null;
+  limit?: number;
 };
 
 export type SparseKernelEnqueueTaskInput = {
@@ -393,6 +455,33 @@ export class SparseKernelClient {
 
   async recordBrowserObservation(input: SparseKernelBrowserObservationInput): Promise<void> {
     await this.postJson<{ ok: boolean }>("/browser/contexts/observe", input);
+  }
+
+  async recordBrowserTarget(
+    input: SparseKernelRecordBrowserTargetInput,
+  ): Promise<SparseKernelBrowserTarget> {
+    return await this.postJson<SparseKernelBrowserTarget>("/browser/targets/record", input);
+  }
+
+  async closeBrowserTarget(
+    input: SparseKernelCloseBrowserTargetInput,
+  ): Promise<SparseKernelBrowserTarget> {
+    return await this.postJson<SparseKernelBrowserTarget>("/browser/targets/close", input);
+  }
+
+  async browserTargets(
+    input: SparseKernelListBrowserTargetsInput = {},
+  ): Promise<SparseKernelBrowserTarget[]> {
+    return await this.postJson<SparseKernelBrowserTarget[]>("/browser/targets/list", input);
+  }
+
+  async browserObservations(
+    input: SparseKernelListBrowserObservationsInput = {},
+  ): Promise<SparseKernelBrowserObservation[]> {
+    return await this.postJson<SparseKernelBrowserObservation[]>(
+      "/browser/observations/list",
+      input,
+    );
   }
 
   async enqueueTask(input: SparseKernelEnqueueTaskInput): Promise<SparseKernelTask> {

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   createSparseKernelCdpBrowserBroker,
   type MaterializedBrowserContext,
+  type SparseKernelBrowserActRequest,
   type SparseKernelBrowserTab,
 } from "../../packages/browser-broker/src/index.js";
 import {
@@ -320,7 +321,7 @@ function readNumber(value: unknown): number | undefined {
   return undefined;
 }
 
-function readActRequest(value: Record<string, unknown>) {
+function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActRequest {
   const kind = readString(value.kind);
   switch (kind) {
     case "click":
@@ -330,6 +331,20 @@ function readActRequest(value: Record<string, unknown>) {
         selector: readString(value.selector),
         targetId: readString(value.targetId),
         doubleClick: value.doubleClick === true,
+        button: readString(value.button),
+        modifiers: readStringArray(value.modifiers),
+        delayMs: readNumber(value.delayMs),
+        timeoutMs: readNumber(value.timeoutMs),
+      } as const;
+    case "clickCoords":
+      return {
+        kind,
+        x: readNumber(value.x) ?? 0,
+        y: readNumber(value.y) ?? 0,
+        targetId: readString(value.targetId),
+        doubleClick: value.doubleClick === true,
+        button: readString(value.button),
+        delayMs: readNumber(value.delayMs),
         timeoutMs: readNumber(value.timeoutMs),
       } as const;
     case "type":
@@ -340,6 +355,7 @@ function readActRequest(value: Record<string, unknown>) {
         text: typeof value.text === "string" ? value.text : "",
         targetId: readString(value.targetId),
         submit: value.submit === true,
+        slowly: value.slowly === true,
         timeoutMs: readNumber(value.timeoutMs),
       } as const;
     case "press":
@@ -350,10 +366,37 @@ function readActRequest(value: Record<string, unknown>) {
         delayMs: readNumber(value.delayMs),
       } as const;
     case "hover":
+    case "scrollIntoView":
       return {
         kind,
         ref: readString(value.ref),
         selector: readString(value.selector),
+        targetId: readString(value.targetId),
+        timeoutMs: readNumber(value.timeoutMs),
+      } as const;
+    case "drag":
+      return {
+        kind,
+        startRef: readString(value.startRef),
+        startSelector: readString(value.startSelector),
+        endRef: readString(value.endRef),
+        endSelector: readString(value.endSelector),
+        targetId: readString(value.targetId),
+        timeoutMs: readNumber(value.timeoutMs),
+      } as const;
+    case "select":
+      return {
+        kind,
+        ref: readString(value.ref),
+        selector: readString(value.selector),
+        values: readStringArray(value.values),
+        targetId: readString(value.targetId),
+        timeoutMs: readNumber(value.timeoutMs),
+      } as const;
+    case "fill":
+      return {
+        kind,
+        fields: readFormFields(value.fields),
         targetId: readString(value.targetId),
         timeoutMs: readNumber(value.timeoutMs),
       } as const;
@@ -363,6 +406,19 @@ function readActRequest(value: Record<string, unknown>) {
         timeMs: readNumber(value.timeMs),
         text: readString(value.text),
         textGone: readString(value.textGone),
+        selector: readString(value.selector),
+        url: readString(value.url),
+        loadState: readLoadState(value.loadState),
+        fn: readString(value.fn),
+        targetId: readString(value.targetId),
+        timeoutMs: readNumber(value.timeoutMs),
+      } as const;
+    case "evaluate":
+      return {
+        kind,
+        fn: readString(value.fn) ?? "",
+        ref: readString(value.ref),
+        targetId: readString(value.targetId),
         timeoutMs: readNumber(value.timeoutMs),
       } as const;
     case "resize":
@@ -372,9 +428,55 @@ function readActRequest(value: Record<string, unknown>) {
         height: readNumber(value.height) ?? 720,
         targetId: readString(value.targetId),
       } as const;
+    case "batch":
+      return {
+        kind,
+        actions: Array.isArray(value.actions)
+          ? value.actions.map((action) => readActRequest(readRecord(action)))
+          : [],
+        targetId: readString(value.targetId),
+        stopOnError: value.stopOnError === false ? false : undefined,
+      } as const;
     default:
       throw new Error(`SparseKernel CDP browser proxy does not support act kind: ${kind ?? ""}`);
   }
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry).trim()).filter((entry) => entry.length > 0)
+    : [];
+}
+
+function readLoadState(value: unknown): "load" | "domcontentloaded" | "networkidle" | undefined {
+  const state = readString(value);
+  return state === "load" || state === "domcontentloaded" || state === "networkidle"
+    ? state
+    : undefined;
+}
+
+function readFormFields(value: unknown): Array<{
+  ref: string;
+  type?: string;
+  value?: string | number | boolean;
+}> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry) => {
+    const record = readRecord(entry);
+    const rawValue = record.value;
+    const type = readString(record.type);
+    const parsedValue =
+      typeof rawValue === "string" || typeof rawValue === "number" || typeof rawValue === "boolean"
+        ? rawValue
+        : undefined;
+    return {
+      ref: readString(record.ref) ?? "",
+      ...(type ? { type } : {}),
+      ...(parsedValue !== undefined ? { value: parsedValue } : {}),
+    };
+  });
 }
 
 function requiredString(value: unknown, field: string): string {

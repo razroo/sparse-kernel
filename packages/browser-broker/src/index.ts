@@ -148,6 +148,19 @@ export type SparseKernelBrowserActRequest =
       selector?: string;
       targetId?: string;
       doubleClick?: boolean;
+      button?: string;
+      modifiers?: string[];
+      delayMs?: number;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "clickCoords";
+      x: number;
+      y: number;
+      targetId?: string;
+      doubleClick?: boolean;
+      button?: string;
+      delayMs?: number;
       timeoutMs?: number;
     }
   | {
@@ -157,13 +170,68 @@ export type SparseKernelBrowserActRequest =
       text: string;
       targetId?: string;
       submit?: boolean;
+      slowly?: boolean;
       timeoutMs?: number;
     }
   | { kind: "press"; key: string; targetId?: string; delayMs?: number }
   | { kind: "hover"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
-  | { kind: "wait"; timeMs?: number; text?: string; textGone?: string; timeoutMs?: number }
+  | {
+      kind: "scrollIntoView";
+      ref?: string;
+      selector?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "drag";
+      startRef?: string;
+      startSelector?: string;
+      endRef?: string;
+      endSelector?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "select";
+      ref?: string;
+      selector?: string;
+      values: string[];
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "fill";
+      fields: SparseKernelBrowserFormField[];
+      targetId?: string;
+      timeoutMs?: number;
+    }
   | { kind: "resize"; width: number; height: number; targetId?: string }
+  | {
+      kind: "wait";
+      timeMs?: number;
+      text?: string;
+      textGone?: string;
+      selector?: string;
+      url?: string;
+      loadState?: "load" | "domcontentloaded" | "networkidle";
+      fn?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | { kind: "evaluate"; fn: string; ref?: string; targetId?: string; timeoutMs?: number }
+  | {
+      kind: "batch";
+      actions: SparseKernelBrowserActRequest[];
+      targetId?: string;
+      stopOnError?: boolean;
+    }
   | { kind: "close"; targetId?: string };
+
+export type SparseKernelBrowserFormField = {
+  ref: string;
+  type?: string;
+  value?: string | number | boolean;
+};
 
 export type SparseKernelBrowserActResult = {
   ok: true;
@@ -578,7 +646,9 @@ export class SparseKernelCdpBrowserBroker {
     switch (request.kind) {
       case "click":
       case "type":
-      case "hover": {
+      case "hover":
+      case "scrollIntoView":
+      case "select": {
         const selector = this.resolveActionSelector(context, request);
         const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
           "Runtime.evaluate",
@@ -597,12 +667,55 @@ export class SparseKernelCdpBrowserBroker {
           value: evaluated.result?.value,
         };
       }
+      case "clickCoords": {
+        const button = normalizeMouseButton(request.button);
+        const clickCount = request.doubleClick ? 2 : 1;
+        await context.connection.command(
+          "Input.dispatchMouseEvent",
+          {
+            type: "mouseMoved",
+            x: request.x,
+            y: request.y,
+            button: "none",
+          },
+          context.page_session_id,
+        );
+        await context.connection.command(
+          "Input.dispatchMouseEvent",
+          {
+            type: "mousePressed",
+            x: request.x,
+            y: request.y,
+            button,
+            clickCount,
+          },
+          context.page_session_id,
+        );
+        if (request.delayMs && request.delayMs > 0) {
+          await delay(Math.min(5_000, Math.floor(request.delayMs)));
+        }
+        await context.connection.command(
+          "Input.dispatchMouseEvent",
+          {
+            type: "mouseReleased",
+            x: request.x,
+            y: request.y,
+            button,
+            clickCount,
+          },
+          context.page_session_id,
+        );
+        return { ok: true, targetId: context.target_id, kind: request.kind };
+      }
       case "press": {
         await context.connection.command(
           "Input.dispatchKeyEvent",
           { type: "keyDown", key: request.key },
           context.page_session_id,
         );
+        if (request.delayMs && request.delayMs > 0) {
+          await delay(Math.min(5_000, Math.floor(request.delayMs)));
+        }
         await context.connection.command(
           "Input.dispatchKeyEvent",
           { type: "keyUp", key: request.key },
@@ -610,11 +723,80 @@ export class SparseKernelCdpBrowserBroker {
         );
         return { ok: true, targetId: context.target_id, kind: request.kind };
       }
+      case "drag": {
+        const startSelector = this.resolveActionSelector(context, {
+          ref: request.startRef,
+          selector: request.startSelector,
+        });
+        const endSelector = this.resolveActionSelector(context, {
+          ref: request.endRef,
+          selector: request.endSelector,
+        });
+        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+          "Runtime.evaluate",
+          {
+            expression: buildDragExpression(startSelector, endSelector),
+            returnByValue: true,
+            awaitPromise: true,
+          },
+          context.page_session_id,
+          request.timeoutMs,
+        );
+        return {
+          ok: true,
+          targetId: context.target_id,
+          kind: request.kind,
+          value: evaluated.result?.value,
+        };
+      }
+      case "fill": {
+        const fields = request.fields.map((field) => ({
+          ...field,
+          selector: this.resolveActionSelector(context, { ref: field.ref }),
+        }));
+        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+          "Runtime.evaluate",
+          {
+            expression: buildFillExpression(fields),
+            returnByValue: true,
+            awaitPromise: true,
+          },
+          context.page_session_id,
+          request.timeoutMs,
+        );
+        return {
+          ok: true,
+          targetId: context.target_id,
+          kind: request.kind,
+          value: evaluated.result?.value,
+        };
+      }
       case "wait": {
         const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
           "Runtime.evaluate",
           {
             expression: buildWaitExpression(request),
+            returnByValue: true,
+            awaitPromise: true,
+          },
+          context.page_session_id,
+          request.timeoutMs,
+        );
+        return {
+          ok: true,
+          targetId: context.target_id,
+          kind: request.kind,
+          value: evaluated.result?.value,
+        };
+      }
+      case "evaluate": {
+        const selector = request.ref
+          ? this.resolveActionSelector(context, { ref: request.ref })
+          : undefined;
+        const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+          "Runtime.evaluate",
+          {
+            expression: buildEvaluateExpression(request, selector),
             returnByValue: true,
             awaitPromise: true,
           },
@@ -640,6 +822,29 @@ export class SparseKernelCdpBrowserBroker {
           context.page_session_id,
         );
         return { ok: true, targetId: context.target_id, kind: request.kind };
+      case "batch": {
+        const results: Array<{ ok: boolean; kind: string; error?: string }> = [];
+        for (const action of request.actions.slice(0, 100)) {
+          try {
+            const result = await this.actContext(contextId, {
+              ...action,
+              targetId:
+                "targetId" in action && action.targetId ? action.targetId : request.targetId,
+            } as SparseKernelBrowserActRequest);
+            results.push({ ok: true, kind: result.kind });
+          } catch (error) {
+            results.push({
+              ok: false,
+              kind: "kind" in action ? action.kind : "unknown",
+              error: error instanceof Error ? error.message : String(error),
+            });
+            if (request.stopOnError !== false) {
+              break;
+            }
+          }
+        }
+        return { ok: true, targetId: context.target_id, kind: request.kind, value: { results } };
+      }
       case "close":
         await this.releaseContext(context.ledger_context.id);
         return { ok: true, targetId: context.target_id, kind: request.kind };
@@ -985,6 +1190,15 @@ export function normalizeLoopbackCdpEndpoint(endpoint: string): string {
 function isLoopbackHost(host: string): boolean {
   const normalized = host.toLowerCase();
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeMouseButton(button: string | undefined): "left" | "right" | "middle" {
+  const normalized = button?.trim().toLowerCase();
+  return normalized === "right" || normalized === "middle" ? normalized : "left";
 }
 
 function publicContext(context: LiveBrowserContext): MaterializedBrowserContext {
@@ -1340,15 +1554,26 @@ function buildAiSnapshotText(
 
 function buildActionExpression(request: SparseKernelBrowserActRequest, selector: string): string {
   const selectorJson = JSON.stringify(selector);
-  if (request.kind === "click" || request.kind === "hover") {
+  if (request.kind === "click" || request.kind === "hover" || request.kind === "scrollIntoView") {
     const eventName = request.kind === "hover" ? "mouseover" : "click";
     const repeat = request.kind === "click" && request.doubleClick ? 2 : 1;
+    const button = JSON.stringify(
+      normalizeMouseButton(request.kind === "click" ? request.button : undefined),
+    );
     return `(() => {
   const node = document.querySelector(${selectorJson});
   if (!node) throw new Error("SparseKernel browser action target not found");
   node.scrollIntoView({ block: "center", inline: "center" });
+  if (${JSON.stringify(request.kind)} === "scrollIntoView") return { ok: true };
   for (let i = 0; i < ${repeat}; i += 1) {
-    node.dispatchEvent(new MouseEvent(${JSON.stringify(eventName)}, { bubbles: true, cancelable: true, view: window }));
+    if (${JSON.stringify(request.kind)} === "click" && typeof node.click === "function" && ${button} === "left") {
+      node.click();
+    } else {
+      node.dispatchEvent(new MouseEvent(${JSON.stringify(eventName)}, { bubbles: true, cancelable: true, view: window, button: ${button} === "right" ? 2 : ${button} === "middle" ? 1 : 0 }));
+    }
+  }
+  if (${repeat} > 1) {
+    node.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window }));
   }
   return { ok: true };
 })()`;
@@ -1378,6 +1603,28 @@ function buildActionExpression(request: SparseKernelBrowserActRequest, selector:
   return { ok: true };
 })()`;
   }
+  if (request.kind === "select") {
+    const values = JSON.stringify(request.values);
+    return `(() => {
+  const node = document.querySelector(${selectorJson});
+  if (!node) throw new Error("SparseKernel browser action target not found");
+  node.scrollIntoView({ block: "center", inline: "center" });
+  const values = ${values};
+  if (node instanceof HTMLSelectElement) {
+    const wanted = new Set(values.map(String));
+    for (const option of Array.from(node.options)) {
+      option.selected = wanted.has(option.value) || wanted.has(option.text);
+    }
+  } else if ("value" in node) {
+    node.value = String(values[0] ?? "");
+  } else {
+    throw new Error("SparseKernel browser select target is not selectable");
+  }
+  node.dispatchEvent(new Event("input", { bubbles: true }));
+  node.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: true, values };
+})()`;
+  }
   throw new Error(`SparseKernel CDP browser action does not support ${request.kind} yet.`);
 }
 
@@ -1385,20 +1632,111 @@ function buildWaitExpression(request: Extract<SparseKernelBrowserActRequest, { k
   const timeMs = Math.max(0, Math.min(60_000, Math.floor(request.timeMs ?? 0)));
   const text = JSON.stringify(request.text ?? "");
   const textGone = JSON.stringify(request.textGone ?? "");
+  const selector = JSON.stringify(request.selector ?? "");
+  const url = JSON.stringify(request.url ?? "");
+  const loadState = JSON.stringify(request.loadState ?? "");
+  const fn = JSON.stringify(request.fn ?? "");
   return `(async () => {
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const wanted = ${text};
   const gone = ${textGone};
+  const selector = ${selector};
+  const wantedUrl = ${url};
+  const loadState = ${loadState};
+  const fnBody = ${fn};
+  const selectorMatches = () => {
+    if (!selector) return true;
+    try { return Boolean(document.querySelector(selector)); } catch { return false; }
+  };
+  const urlMatches = () => !wantedUrl || location.href.includes(String(wantedUrl).replace(/\\*/g, ""));
+  const loadStateMatches = () => {
+    if (!loadState) return true;
+    if (loadState === "domcontentloaded") return document.readyState === "interactive" || document.readyState === "complete";
+    return document.readyState === "complete";
+  };
+  const fnMatches = async () => {
+    if (!fnBody) return true;
+    try {
+      const candidate = eval("(" + fnBody + ")");
+      const result = typeof candidate === "function" ? candidate() : candidate;
+      return Boolean(await result);
+    } catch {
+      return false;
+    }
+  };
   if (${timeMs} > 0) await delay(${timeMs});
   const deadline = Date.now() + ${Math.max(1, Math.floor(request.timeoutMs ?? 10_000))};
   while (Date.now() < deadline) {
     const body = document.body?.innerText || document.documentElement?.textContent || "";
     const hasWanted = !wanted || body.includes(wanted);
     const hasGone = gone ? body.includes(gone) : false;
-    if (hasWanted && !hasGone) return { ok: true };
+    if (hasWanted && !hasGone && selectorMatches() && urlMatches() && loadStateMatches() && await fnMatches()) return { ok: true };
     await delay(100);
   }
   throw new Error("SparseKernel browser wait timed out");
+})()`;
+}
+
+function buildDragExpression(startSelector: string, endSelector: string): string {
+  return `(() => {
+  const start = document.querySelector(${JSON.stringify(startSelector)});
+  const end = document.querySelector(${JSON.stringify(endSelector)});
+  if (!start || !end) throw new Error("SparseKernel browser drag target not found");
+  start.scrollIntoView({ block: "center", inline: "center" });
+  end.scrollIntoView({ block: "center", inline: "center" });
+  const data = typeof DataTransfer === "function" ? new DataTransfer() : undefined;
+  const make = (type) => new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: data });
+  start.dispatchEvent(make("dragstart"));
+  end.dispatchEvent(make("dragenter"));
+  end.dispatchEvent(make("dragover"));
+  end.dispatchEvent(make("drop"));
+  start.dispatchEvent(make("dragend"));
+  return { ok: true };
+})()`;
+}
+
+function buildFillExpression(
+  fields: Array<SparseKernelBrowserFormField & { selector: string }>,
+): string {
+  return `(() => {
+  const fields = ${JSON.stringify(fields)};
+  let changed = 0;
+  for (const field of fields) {
+    const node = document.querySelector(field.selector);
+    if (!node) throw new Error("SparseKernel browser fill target not found: " + field.ref);
+    const type = String(field.type || "").toLowerCase();
+    const value = field.value;
+    if (type === "checkbox" || type === "radio") {
+      node.checked = value === true || value === 1 || value === "1" || value === "true";
+    } else if (node instanceof HTMLSelectElement) {
+      const wanted = new Set([String(value ?? "")]);
+      for (const option of Array.from(node.options)) {
+        option.selected = wanted.has(option.value) || wanted.has(option.text);
+      }
+    } else if ("value" in node) {
+      node.value = value == null ? "" : String(value);
+    } else {
+      node.textContent = value == null ? "" : String(value);
+    }
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+    changed += 1;
+  }
+  return { ok: true, changed };
+})()`;
+}
+
+function buildEvaluateExpression(
+  request: Extract<SparseKernelBrowserActRequest, { kind: "evaluate" }>,
+  selector?: string,
+): string {
+  return `(() => {
+  const fnBody = ${JSON.stringify(request.fn)};
+  const selector = ${JSON.stringify(selector ?? "")};
+  const node = selector ? document.querySelector(selector) : undefined;
+  if (selector && !node) throw new Error("SparseKernel browser evaluate target not found");
+  const candidate = eval("(" + fnBody + ")");
+  return typeof candidate === "function" ? (selector ? candidate(node) : candidate()) : candidate;
 })()`;
 }
 

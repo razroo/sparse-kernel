@@ -108,33 +108,9 @@ class FakeCdpTransport implements CdpTransport {
         this.handleNavigate(String(message.params?.url ?? ""));
         break;
       case "Runtime.evaluate":
-        this.respond(message.id, {
-          result: {
-            value: JSON.stringify({
-              title: this.currentUrl.includes("example.com") ? "Example" : "",
-              url: this.currentUrl,
-              text: "Example page body",
-              links: [
-                {
-                  text: "Example link",
-                  href: "https://example.com/link",
-                  selector: "body > a:nth-of-type(1)",
-                },
-              ],
-              buttons: [{ text: "Submit", selector: "body > button:nth-of-type(1)" }],
-              inputs: [
-                {
-                  label: "Search",
-                  name: "q",
-                  type: "text",
-                  selector: "body > input:nth-of-type(1)",
-                },
-              ],
-              truncated: false,
-            }),
-          },
-        });
+        this.respondRuntimeEvaluate(message);
         break;
+      case "Input.dispatchMouseEvent":
       case "Input.dispatchKeyEvent":
       case "Emulation.setDeviceMetricsOverride":
       case "Page.handleJavaScriptDialog":
@@ -193,6 +169,59 @@ class FakeCdpTransport implements CdpTransport {
       params: {
         message: "Continue?",
       },
+    });
+  }
+
+  private respondRuntimeEvaluate(message: { id: number; params?: Record<string, unknown> }): void {
+    const expression = String(message.params?.expression ?? "");
+    if (expression.includes("const links =")) {
+      this.respond(message.id, {
+        result: {
+          value: JSON.stringify({
+            title: this.currentUrl.includes("example.com") ? "Example" : "",
+            url: this.currentUrl,
+            text: "Example page body",
+            links: [
+              {
+                text: "Example link",
+                href: "https://example.com/link",
+                selector: "body > a:nth-of-type(1)",
+              },
+            ],
+            buttons: [{ text: "Submit", selector: "body > button:nth-of-type(1)" }],
+            inputs: [
+              {
+                label: "Search",
+                name: "q",
+                type: "text",
+                selector: "body > input:nth-of-type(1)",
+              },
+            ],
+            truncated: false,
+          }),
+        },
+      });
+      return;
+    }
+    if (expression.includes("title: document.title")) {
+      this.respond(message.id, {
+        result: {
+          value: JSON.stringify({
+            title: this.currentUrl.includes("example.com") ? "Example" : "",
+            url: this.currentUrl,
+          }),
+        },
+      });
+      return;
+    }
+    if (expression.includes("() => 42")) {
+      this.respond(message.id, {
+        result: { value: 42 },
+      });
+      return;
+    }
+    this.respond(message.id, {
+      result: { value: { ok: true } },
     });
   }
 
@@ -573,6 +602,93 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
           }),
         }),
         expect.objectContaining({ method: "Input.dispatchKeyEvent" }),
+      ]),
+    );
+  });
+
+  it("performs the broader brokered action contract against the leased context", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    await broker.snapshotContext(context.ledger_context.id);
+
+    await broker.actContext(context.ledger_context.id, {
+      kind: "clickCoords",
+      x: 10,
+      y: 20,
+      doubleClick: true,
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "scrollIntoView",
+      ref: "e1",
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "drag",
+      startRef: "e1",
+      endRef: "e2",
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "select",
+      ref: "e3",
+      values: ["choice"],
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "fill",
+      fields: [{ ref: "e3", type: "text", value: "filled" }],
+    });
+    const evaluated = await broker.actContext(context.ledger_context.id, {
+      kind: "evaluate",
+      fn: "() => 42",
+    });
+    const batch = await broker.actContext(context.ledger_context.id, {
+      kind: "batch",
+      actions: [
+        { kind: "press", key: "Enter" },
+        { kind: "wait", selector: "body", url: "example.com", loadState: "load" },
+      ],
+    });
+
+    expect(evaluated.value).toBe(42);
+    expect(batch.value).toMatchObject({
+      results: [
+        { ok: true, kind: "press" },
+        { ok: true, kind: "wait" },
+      ],
+    });
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "Input.dispatchMouseEvent" }),
+        expect.objectContaining({
+          method: "Runtime.evaluate",
+          params: expect.objectContaining({
+            expression: expect.stringContaining("scrollIntoView"),
+          }),
+        }),
+        expect.objectContaining({
+          method: "Runtime.evaluate",
+          params: expect.objectContaining({
+            expression: expect.stringContaining("DataTransfer"),
+          }),
+        }),
+        expect.objectContaining({
+          method: "Runtime.evaluate",
+          params: expect.objectContaining({
+            expression: expect.stringContaining("filled"),
+          }),
+        }),
       ]),
     );
   });

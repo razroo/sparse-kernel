@@ -10,6 +10,7 @@ import {
   type SparseKernelArtifactSubject,
   type SparseKernelBrowserContext,
   type SparseKernelBrowserEndpointProbe,
+  type SparseKernelBrowserObservationInput,
   type SparseKernelCreateArtifactInput,
 } from "../../sparsekernel-client/src/index.js";
 
@@ -19,6 +20,7 @@ export type {
   SparseKernelArtifactSubject,
   SparseKernelBrowserContext,
   SparseKernelBrowserEndpointProbe,
+  SparseKernelBrowserObservationInput,
   SparseKernelCreateArtifactInput,
 } from "../../sparsekernel-client/src/index.js";
 
@@ -31,6 +33,7 @@ export type SparseKernelBrowserKernelClient = {
   ): Promise<SparseKernelBrowserContext>;
   releaseBrowserContext(contextId: string): Promise<boolean>;
   createArtifact(input: SparseKernelCreateArtifactInput): Promise<SparseKernelArtifact>;
+  recordBrowserObservation?(input: SparseKernelBrowserObservationInput): Promise<void>;
 };
 
 export type CdpTransport = {
@@ -91,6 +94,7 @@ export type CaptureDownloadArtifactInput = {
 
 export type BrowserArtifactResult = {
   context_id: string;
+  target_id?: string;
   artifact: SparseKernelArtifact;
   artifact_type: "screenshot" | "download" | "pdf";
   filename?: string;
@@ -101,6 +105,7 @@ export type SparseKernelBrowserConsoleMessage = {
   type: string;
   text: string;
   timestamp: string;
+  targetId?: string;
   level?: string;
 };
 
@@ -289,6 +294,9 @@ type CdpEventMessage = {
 type LiveBrowserPage = {
   target_id: string;
   page_session_id: string;
+  console_messages: SparseKernelBrowserConsoleMessage[];
+  network_request_ids: Set<string>;
+  last_network_activity_at: number;
 };
 
 type LiveBrowserContext = MaterializedBrowserContext & {
@@ -297,9 +305,6 @@ type LiveBrowserContext = MaterializedBrowserContext & {
   download_dir: string;
   owns_download_dir: boolean;
   snapshot_refs: Map<string, SnapshotRef>;
-  console_messages: SparseKernelBrowserConsoleMessage[];
-  network_request_ids: Set<string>;
-  last_network_activity_at: number;
   allowed_origins: string[];
   pages: Map<string, LiveBrowserPage>;
 };
@@ -395,15 +400,28 @@ export class SparseKernelCdpBrowserBroker {
         download_dir: downloadDir,
         owns_download_dir: ownsDownloadDir,
         snapshot_refs: new Map(),
-        console_messages: [],
-        network_request_ids: new Set(),
-        last_network_activity_at: Date.now(),
         allowed_origins: allowedOrigins,
-        pages: new Map([[targetId, { target_id: targetId, page_session_id: sessionId }]]),
+        pages: new Map([[targetId, createLiveBrowserPage(targetId, sessionId)]]),
       };
       connection.onEvent((event) => {
-        recordConsoleEvent(materialized, event);
-        recordNetworkEvent(materialized, event);
+        const consoleObservation = recordConsoleEvent(materialized, event);
+        if (consoleObservation) {
+          this.recordObservation(
+            materialized,
+            consoleObservation.targetId,
+            "browser_console",
+            consoleObservation.message,
+          );
+        }
+        const networkObservation = recordNetworkEvent(materialized, event);
+        if (networkObservation) {
+          this.recordObservation(
+            materialized,
+            networkObservation.targetId,
+            networkObservation.observationType,
+            networkObservation.payload,
+          );
+        }
       });
       this.contexts.set(ledgerContext.id, materialized);
       return publicContext(materialized);
@@ -440,8 +458,15 @@ export class SparseKernelCdpBrowserBroker {
       retention_policy: input.retention_policy ?? "debug",
       subject: input.subject,
     });
+    this.recordObservation(context, context.target_id, "browser_artifact.created", {
+      artifactId: artifact.id,
+      artifactType: "screenshot",
+      sha256: artifact.sha256,
+      sourceUrl: input.url,
+    });
     return {
       context_id: contextId,
+      target_id: context.target_id,
       artifact,
       artifact_type: "screenshot",
       source_url: input.url,
@@ -476,12 +501,21 @@ export class SparseKernelCdpBrowserBroker {
       retention_policy: input.retention_policy ?? "session",
       subject: input.subject,
     });
+    const sourceUrl = readString(complete.params.url) ?? input.url;
+    this.recordObservation(context, context.target_id, "browser_artifact.created", {
+      artifactId: artifact.id,
+      artifactType: "download",
+      sha256: artifact.sha256,
+      sourceUrl,
+      filename: readString(beginEvent.params.suggestedFilename),
+    });
     return {
       context_id: contextId,
+      target_id: context.target_id,
       artifact,
       artifact_type: "download",
       filename: readString(beginEvent.params.suggestedFilename),
-      source_url: readString(complete.params.url) ?? input.url,
+      source_url: sourceUrl,
     };
   }
 
@@ -504,8 +538,14 @@ export class SparseKernelCdpBrowserBroker {
       retention_policy: input.retention_policy ?? "debug",
       subject: input.subject,
     });
+    this.recordObservation(context, context.target_id, "browser_artifact.created", {
+      artifactId: artifact.id,
+      artifactType: "pdf",
+      sha256: artifact.sha256,
+    });
     return {
       context_id: contextId,
+      target_id: context.target_id,
       artifact,
       artifact_type: "pdf",
     };
@@ -513,17 +553,20 @@ export class SparseKernelCdpBrowserBroker {
 
   listConsoleMessages(
     contextId: string,
-    input: { level?: string; limit?: number } = {},
+    input: { level?: string; limit?: number; target_id?: string } = {},
   ): { ok: true; targetId: string; messages: SparseKernelBrowserConsoleMessage[] } {
     const context = this.requireContext(contextId);
+    const page = input.target_id
+      ? this.requirePage(context, input.target_id)
+      : this.activePage(context);
     const level = input.level?.trim().toLowerCase();
     const limit = Math.max(1, Math.min(500, Math.floor(input.limit ?? 100)));
-    const messages = context.console_messages
+    const messages = page.console_messages
       .filter((message) => !level || message.type.toLowerCase() === level)
       .slice(-limit);
     return {
       ok: true,
-      targetId: context.target_id,
+      targetId: page.target_id,
       messages,
     };
   }
@@ -629,6 +672,38 @@ export class SparseKernelCdpBrowserBroker {
     const context = this.requireContext(contextId);
     this.activateTarget(context, input.target_id);
     return await this.describeContextTab(context);
+  }
+
+  async closeTarget(
+    contextId: string,
+    input: { target_id: string },
+  ): Promise<{ ok: true; targetId: string; releasedContext: boolean; activeTargetId?: string }> {
+    const context = this.requireContext(contextId);
+    const targetId = input.target_id.trim();
+    this.requirePage(context, targetId);
+    await context.connection.command("Target.closeTarget", { targetId });
+    context.pages.delete(targetId);
+    this.recordObservation(context, targetId, "browser_target.closed", {
+      remainingTargets: context.pages.size,
+    });
+    if (context.pages.size === 0) {
+      await this.releaseContext(contextId);
+      return { ok: true, targetId, releasedContext: true };
+    }
+    if (context.target_id === targetId) {
+      const next = context.pages.values().next().value as LiveBrowserPage | undefined;
+      if (next) {
+        context.target_id = next.target_id;
+        context.page_session_id = next.page_session_id;
+        context.snapshot_refs = new Map();
+      }
+    }
+    return {
+      ok: true,
+      targetId,
+      releasedContext: false,
+      activeTargetId: context.target_id,
+    };
   }
 
   async snapshotContext(
@@ -907,8 +982,14 @@ export class SparseKernelCdpBrowserBroker {
         return { ok: true, targetId: context.target_id, kind: request.kind, value: { results } };
       }
       case "close":
-        await this.releaseContext(context.ledger_context.id);
-        return { ok: true, targetId: context.target_id, kind: request.kind };
+        return {
+          ok: true,
+          targetId: targetId ?? context.target_id,
+          kind: request.kind,
+          value: await this.closeTarget(context.ledger_context.id, {
+            target_id: targetId ?? context.target_id,
+          }),
+        };
     }
   }
 
@@ -942,13 +1023,38 @@ export class SparseKernelCdpBrowserBroker {
     return context;
   }
 
-  private activateTarget(context: LiveBrowserContext, targetId: string): void {
+  private requirePage(context: LiveBrowserContext, targetId: string): LiveBrowserPage {
     const page = context.pages.get(targetId);
     if (!page) {
       throw new Error(`SparseKernel CDP browser context does not own target: ${targetId}`);
     }
+    return page;
+  }
+
+  private activePage(context: LiveBrowserContext): LiveBrowserPage {
+    return this.requirePage(context, context.target_id);
+  }
+
+  private activateTarget(context: LiveBrowserContext, targetId: string): void {
+    const page = this.requirePage(context, targetId);
     context.target_id = page.target_id;
     context.page_session_id = page.page_session_id;
+  }
+
+  private recordObservation(
+    context: LiveBrowserContext,
+    targetId: string | undefined,
+    observationType: string,
+    payload: unknown,
+  ): void {
+    const observed = this.kernel.recordBrowserObservation?.({
+      context_id: context.ledger_context.id,
+      target_id: targetId,
+      observation_type: observationType,
+      payload,
+      created_at: new Date().toISOString(),
+    });
+    void observed?.catch(() => {});
   }
 
   private async navigate(
@@ -1148,17 +1254,17 @@ export class SparseKernelCdpBrowserBroker {
     await context.connection.command("Runtime.enable", {}, sessionId);
     await context.connection.command("Network.enable", {}, sessionId).catch(() => {});
     await context.connection.command("Log.enable", {}, sessionId).catch(() => {});
-    context.pages.set(targetId, { target_id: targetId, page_session_id: sessionId });
+    context.pages.set(targetId, createLiveBrowserPage(targetId, sessionId));
     context.target_id = targetId;
     context.page_session_id = sessionId;
     context.snapshot_refs = new Map();
+    this.recordObservation(context, targetId, "browser_target.attached", {
+      totalTargets: context.pages.size,
+    });
   }
 
   private async describeContextTab(context: LiveBrowserContext): Promise<SparseKernelBrowserTab> {
-    return await this.describePageTab(context, {
-      target_id: context.target_id,
-      page_session_id: context.page_session_id,
-    });
+    return await this.describePageTab(context, this.activePage(context));
   }
 
   private async describePageTab(
@@ -1325,10 +1431,11 @@ export class SparseKernelCdpBrowserBroker {
   }
 
   private async waitForNetworkIdle(context: LiveBrowserContext, timeoutMs: number): Promise<void> {
+    const page = this.activePage(context);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() <= deadline) {
-      const quietForMs = Date.now() - context.last_network_activity_at;
-      if (context.network_request_ids.size === 0 && quietForMs >= NETWORK_IDLE_QUIET_MS) {
+      const quietForMs = Date.now() - page.last_network_activity_at;
+      if (page.network_request_ids.size === 0 && quietForMs >= NETWORK_IDLE_QUIET_MS) {
         return;
       }
       const remaining = deadline - Date.now();
@@ -1338,7 +1445,7 @@ export class SparseKernelCdpBrowserBroker {
       await delay(Math.min(100, remaining));
     }
     throw new Error(
-      `SparseKernel browser wait timed out waiting for networkidle (${context.network_request_ids.size} request(s) still active)`,
+      `SparseKernel browser wait timed out waiting for networkidle (${page.network_request_ids.size} request(s) still active)`,
     );
   }
 }
@@ -1633,6 +1740,16 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function createLiveBrowserPage(targetId: string, sessionId: string): LiveBrowserPage {
+  return {
+    target_id: targetId,
+    page_session_id: sessionId,
+    console_messages: [],
+    network_request_ids: new Set(),
+    last_network_activity_at: Date.now(),
+  };
+}
+
 function normalizeMouseButton(button: string | undefined): "left" | "right" | "middle" {
   const normalized = button?.trim().toLowerCase();
   return normalized === "right" || normalized === "middle" ? normalized : "left";
@@ -1724,9 +1841,28 @@ function publicContext(context: LiveBrowserContext): MaterializedBrowserContext 
   };
 }
 
-function recordConsoleEvent(context: LiveBrowserContext, event: CdpEventMessage): void {
-  if (event.sessionId && event.sessionId !== context.page_session_id) {
-    return;
+function pageForEvent(
+  context: LiveBrowserContext,
+  event: CdpEventMessage,
+): LiveBrowserPage | undefined {
+  if (!event.sessionId) {
+    return context.pages.get(context.target_id) ?? context.pages.values().next().value;
+  }
+  for (const page of context.pages.values()) {
+    if (page.page_session_id === event.sessionId) {
+      return page;
+    }
+  }
+  return undefined;
+}
+
+function recordConsoleEvent(
+  context: LiveBrowserContext,
+  event: CdpEventMessage,
+): { targetId: string; message: SparseKernelBrowserConsoleMessage } | undefined {
+  const page = pageForEvent(context, event);
+  if (!page) {
+    return undefined;
   }
   if (event.method === "Runtime.consoleAPICalled") {
     const type = readString(event.params.type) ?? "log";
@@ -1736,46 +1872,81 @@ function recordConsoleEvent(context: LiveBrowserContext, event: CdpEventMessage)
       .map((arg) => readString(arg.value) ?? readString(arg.description) ?? "")
       .filter(Boolean)
       .join(" ");
-    context.console_messages.push({
+    const message = {
       type,
       text,
       timestamp: new Date().toISOString(),
-    });
+      targetId: page.target_id,
+    };
+    page.console_messages.push(message);
+    if (page.console_messages.length > 500) {
+      page.console_messages.splice(0, page.console_messages.length - 500);
+    }
+    return { targetId: page.target_id, message };
   } else if (event.method === "Log.entryAdded" && isRecord(event.params.entry)) {
     const entry = event.params.entry;
     const level = readString(entry.level) ?? "log";
-    context.console_messages.push({
+    const message = {
       type: level,
       level,
       text: readString(entry.text) ?? "",
       timestamp: new Date().toISOString(),
-    });
+      targetId: page.target_id,
+    };
+    page.console_messages.push(message);
+    if (page.console_messages.length > 500) {
+      page.console_messages.splice(0, page.console_messages.length - 500);
+    }
+    return { targetId: page.target_id, message };
   } else {
-    return;
-  }
-  if (context.console_messages.length > 500) {
-    context.console_messages.splice(0, context.console_messages.length - 500);
+    return undefined;
   }
 }
 
-function recordNetworkEvent(context: LiveBrowserContext, event: CdpEventMessage): void {
-  if (event.sessionId && event.sessionId !== context.page_session_id) {
-    return;
+function recordNetworkEvent(
+  context: LiveBrowserContext,
+  event: CdpEventMessage,
+): { targetId: string; observationType: string; payload: Record<string, unknown> } | undefined {
+  const page = pageForEvent(context, event);
+  if (!page) {
+    return undefined;
   }
   const requestId = readString(event.params.requestId);
   if (!requestId) {
-    return;
+    return undefined;
   }
   switch (event.method) {
-    case "Network.requestWillBeSent":
-      context.network_request_ids.add(requestId);
-      context.last_network_activity_at = Date.now();
-      break;
+    case "Network.requestWillBeSent": {
+      page.network_request_ids.add(requestId);
+      page.last_network_activity_at = Date.now();
+      const request = isRecord(event.params.request) ? event.params.request : {};
+      return {
+        targetId: page.target_id,
+        observationType: "browser_network.request",
+        payload: {
+          requestId,
+          url: readString(request.url),
+          method: readString(request.method),
+        },
+      };
+    }
     case "Network.loadingFinished":
     case "Network.loadingFailed":
-      context.network_request_ids.delete(requestId);
-      context.last_network_activity_at = Date.now();
-      break;
+      page.network_request_ids.delete(requestId);
+      page.last_network_activity_at = Date.now();
+      return {
+        targetId: page.target_id,
+        observationType:
+          event.method === "Network.loadingFinished"
+            ? "browser_network.finished"
+            : "browser_network.failed",
+        payload: {
+          requestId,
+          errorText: readString(event.params.errorText),
+        },
+      };
+    default:
+      return undefined;
   }
 }
 

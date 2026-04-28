@@ -6,7 +6,11 @@ import type {
   SparseKernelBrowserContext,
   SparseKernelCreateArtifactInput,
 } from "../../sparsekernel-client/src/index.js";
-import type { CdpTransport, SparseKernelBrowserKernelClient } from "./index.js";
+import type {
+  CdpTransport,
+  SparseKernelBrowserKernelClient,
+  SparseKernelBrowserObservationInput,
+} from "./index.js";
 import {
   createSparseKernelCdpBrowserBroker,
   normalizeLoopbackCdpEndpoint,
@@ -15,6 +19,7 @@ import {
 
 class FakeKernel implements SparseKernelBrowserKernelClient {
   readonly artifactInputs: SparseKernelCreateArtifactInput[] = [];
+  readonly observations: SparseKernelBrowserObservationInput[] = [];
   readonly releasedContextIds: string[] = [];
 
   async probeBrowserPool() {
@@ -56,6 +61,10 @@ class FakeKernel implements SparseKernelBrowserKernelClient {
       created_at: "2026-04-27T00:00:00Z",
     };
   }
+
+  async recordBrowserObservation(input: SparseKernelBrowserObservationInput): Promise<void> {
+    this.observations.push(input);
+  }
 }
 
 class FakeCdpTransport implements CdpTransport {
@@ -65,6 +74,8 @@ class FakeCdpTransport implements CdpTransport {
   private readonly errorListeners: Array<(error: Error) => void> = [];
   private downloadPath: string | undefined;
   private currentUrl = "about:blank";
+  private readonly targetUrls = new Map<string, string>();
+  private readonly sessionTargets = new Map<string, string>();
   private nextActionNavigationUrl: string | undefined;
   private nextActionNewTarget: { targetId: string; url: string } | undefined;
 
@@ -82,10 +93,11 @@ class FakeCdpTransport implements CdpTransport {
         break;
       case "Target.createTarget":
         this.currentUrl = String(message.params?.url ?? this.currentUrl);
+        this.targetUrls.set("target-1", this.currentUrl);
         this.respond(message.id, { targetId: "target-1" });
         break;
       case "Target.attachToTarget":
-        this.respond(message.id, { sessionId: "session-1" });
+        this.respondAttachToTarget(message);
         break;
       case "Page.enable":
       case "Runtime.enable":
@@ -109,7 +121,7 @@ class FakeCdpTransport implements CdpTransport {
         break;
       case "Page.navigate":
         this.respond(message.id, { frameId: "frame-1" });
-        this.handleNavigate(String(message.params?.url ?? ""));
+        this.handleNavigate(String(message.params?.url ?? ""), message.sessionId);
         break;
       case "Runtime.evaluate":
         this.respondRuntimeEvaluate(message);
@@ -128,6 +140,9 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { nodeId: 2 });
         break;
       case "Target.closeTarget":
+        this.closeTarget(String(message.params?.targetId ?? ""));
+        this.respond(message.id, { success: true });
+        break;
       case "Target.disposeBrowserContext":
         this.respond(message.id, { success: true });
         break;
@@ -155,10 +170,10 @@ class FakeCdpTransport implements CdpTransport {
     this.errorListeners.push(listener);
   }
 
-  emitConsole(text: string): void {
+  emitConsole(text: string, sessionId = "session-1"): void {
     this.emit({
       method: "Runtime.consoleAPICalled",
-      sessionId: "session-1",
+      sessionId,
       params: {
         type: "log",
         args: [{ value: text }],
@@ -176,18 +191,18 @@ class FakeCdpTransport implements CdpTransport {
     });
   }
 
-  emitNetworkRequest(requestId: string): void {
+  emitNetworkRequest(requestId: string, sessionId = "session-1", url = "https://example.com/api") {
     this.emit({
       method: "Network.requestWillBeSent",
-      sessionId: "session-1",
-      params: { requestId },
+      sessionId,
+      params: { requestId, request: { method: "GET", url } },
     });
   }
 
-  emitNetworkFinished(requestId: string): void {
+  emitNetworkFinished(requestId: string, sessionId = "session-1"): void {
     this.emit({
       method: "Network.loadingFinished",
-      sessionId: "session-1",
+      sessionId,
       params: { requestId },
     });
   }
@@ -200,14 +215,21 @@ class FakeCdpTransport implements CdpTransport {
     this.nextActionNewTarget = { targetId, url };
   }
 
-  private respondRuntimeEvaluate(message: { id: number; params?: Record<string, unknown> }): void {
+  private respondRuntimeEvaluate(message: {
+    id: number;
+    params?: Record<string, unknown>;
+    sessionId?: string;
+  }): void {
     const expression = String(message.params?.expression ?? "");
+    const url = this.urlForSession(
+      typeof message.sessionId === "string" ? message.sessionId : "session-1",
+    );
     if (expression.includes("const links =")) {
       this.respond(message.id, {
         result: {
           value: JSON.stringify({
-            title: this.currentUrl.includes("example.com") ? "Example" : "",
-            url: this.currentUrl,
+            title: url.includes("example.com") ? "Example" : "",
+            url,
             text: "Example page body",
             links: [
               {
@@ -235,8 +257,8 @@ class FakeCdpTransport implements CdpTransport {
       this.respond(message.id, {
         result: {
           value: JSON.stringify({
-            title: this.currentUrl.includes("example.com") ? "Example" : "",
-            url: this.currentUrl,
+            title: url.includes("example.com") ? "Example" : "",
+            url,
           }),
         },
       });
@@ -257,7 +279,7 @@ class FakeCdpTransport implements CdpTransport {
         result: { value: { ok: true } },
       });
       if (navigationUrl) {
-        setTimeout(() => this.emitFrameNavigation(navigationUrl), 0);
+        setTimeout(() => this.emitFrameNavigation(navigationUrl, message.sessionId), 0);
       }
       if (newTarget) {
         setTimeout(() => this.emitNewTarget(newTarget.targetId, newTarget.url), 0);
@@ -277,14 +299,23 @@ class FakeCdpTransport implements CdpTransport {
     this.emit({ id, error: { message } });
   }
 
+  private respondAttachToTarget(message: { id: number; params?: Record<string, unknown> }): void {
+    const targetId = String(message.params?.targetId ?? "target-1");
+    const sessionId = targetId === "target-1" ? "session-1" : `session-${targetId}`;
+    this.sessionTargets.set(sessionId, targetId);
+    this.respond(message.id, { sessionId });
+  }
+
   private emit(message: Record<string, unknown>): void {
     for (const listener of this.messageListeners) {
       listener(JSON.stringify(message));
     }
   }
 
-  private handleNavigate(url: string): void {
+  private handleNavigate(url: string, sessionId = "session-1"): void {
     this.currentUrl = url;
+    const targetId = this.sessionTargets.get(sessionId) ?? "target-1";
+    this.targetUrls.set(targetId, url);
     if (url.endsWith("/download")) {
       const downloadPath = this.downloadPath;
       if (!downloadPath) {
@@ -318,13 +349,15 @@ class FakeCdpTransport implements CdpTransport {
       this.emit({
         method: "Page.loadEventFired",
         params: {},
-        sessionId: "session-1",
+        sessionId,
       });
     }, 0);
   }
 
-  private emitFrameNavigation(url: string): void {
+  private emitFrameNavigation(url: string, sessionId = "session-1"): void {
     this.currentUrl = url;
+    const targetId = this.sessionTargets.get(sessionId) ?? "target-1";
+    this.targetUrls.set(targetId, url);
     this.emit({
       method: "Page.frameNavigated",
       params: {
@@ -333,18 +366,19 @@ class FakeCdpTransport implements CdpTransport {
           url,
         },
       },
-      sessionId: "session-1",
+      sessionId,
     });
     setTimeout(() => {
       this.emit({
         method: "Page.loadEventFired",
         params: {},
-        sessionId: "session-1",
+        sessionId,
       });
     }, 0);
   }
 
   private emitNewTarget(targetId: string, url: string): void {
+    this.targetUrls.set(targetId, url);
     this.emit({
       method: "Target.targetCreated",
       params: {
@@ -356,6 +390,20 @@ class FakeCdpTransport implements CdpTransport {
         },
       },
     });
+  }
+
+  private closeTarget(targetId: string): void {
+    this.targetUrls.delete(targetId);
+    for (const [sessionId, mappedTargetId] of [...this.sessionTargets.entries()]) {
+      if (mappedTargetId === targetId) {
+        this.sessionTargets.delete(sessionId);
+      }
+    }
+  }
+
+  private urlForSession(sessionId: string): string {
+    const targetId = this.sessionTargets.get(sessionId) ?? "target-1";
+    return this.targetUrls.get(targetId) ?? this.currentUrl;
   }
 }
 
@@ -501,11 +549,20 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       targetId: "target-1",
       messages: [
         {
+          targetId: "target-1",
           type: "log",
           text: "hello from page",
         },
       ],
     });
+    expect(kernel.observations).toEqual([
+      expect.objectContaining({
+        context_id: "browser_ctx_1",
+        target_id: "target-1",
+        observation_type: "browser_console",
+        payload: expect.objectContaining({ text: "hello from page", targetId: "target-1" }),
+      }),
+    ]);
   });
 
   it("uploads files and handles dialogs through the leased CDP context", async () => {
@@ -776,6 +833,127 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       expect.objectContaining({ targetId: "target-1" }),
       expect.objectContaining({ targetId: "target-popup" }),
     ]);
+    expect(kernel.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target_id: "target-popup",
+          observation_type: "browser_target.attached",
+        }),
+      ]),
+    );
+  });
+
+  it("keeps console and network observations scoped to their CDP targets", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.emitConsole("primary console");
+    transport.emitNetworkRequest("req-primary", "session-1", "https://example.com/api");
+    transport.emitNetworkFinished("req-primary");
+    transport.queueActionNewTarget("https://example.com/popup", "target-popup");
+    await broker.actContext(context.ledger_context.id, {
+      kind: "click",
+      selector: "#popup",
+    });
+    transport.emitConsole("popup console", "session-target-popup");
+    transport.emitConsole("orphan console", "session-detached");
+    transport.emitNetworkRequest("req-orphan", "session-detached", "https://example.com/orphan");
+
+    expect(broker.listConsoleMessages(context.ledger_context.id)).toMatchObject({
+      targetId: "target-popup",
+      messages: [expect.objectContaining({ targetId: "target-popup", text: "popup console" })],
+    });
+    await broker.focusContext(context.ledger_context.id, { target_id: "target-1" });
+    expect(broker.listConsoleMessages(context.ledger_context.id)).toMatchObject({
+      targetId: "target-1",
+      messages: [expect.objectContaining({ targetId: "target-1", text: "primary console" })],
+    });
+    expect(kernel.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target_id: "target-1",
+          observation_type: "browser_network.request",
+          payload: expect.objectContaining({ requestId: "req-primary" }),
+        }),
+        expect.objectContaining({
+          target_id: "target-1",
+          observation_type: "browser_network.finished",
+          payload: expect.objectContaining({ requestId: "req-primary" }),
+        }),
+        expect.objectContaining({
+          target_id: "target-popup",
+          observation_type: "browser_console",
+          payload: expect.objectContaining({ text: "popup console" }),
+        }),
+      ]),
+    );
+    expect(kernel.observations).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          payload: expect.objectContaining({ requestId: "req-orphan" }),
+        }),
+      ]),
+    );
+  });
+
+  it("closes one broker-owned tab without releasing the whole context", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.queueActionNewTarget("https://example.com/popup", "target-popup");
+    await broker.actContext(context.ledger_context.id, {
+      kind: "click",
+      selector: "#popup",
+    });
+
+    await expect(
+      broker.closeTarget(context.ledger_context.id, { target_id: "target-popup" }),
+    ).resolves.toMatchObject({
+      ok: true,
+      targetId: "target-popup",
+      releasedContext: false,
+      activeTargetId: "target-1",
+    });
+    expect(kernel.releasedContextIds).toEqual([]);
+    await expect(broker.listTabs(context.ledger_context.id)).resolves.toEqual([
+      expect.objectContaining({ targetId: "target-1" }),
+    ]);
+    await expect(
+      broker.closeTarget(context.ledger_context.id, { target_id: "target-1" }),
+    ).resolves.toMatchObject({
+      ok: true,
+      targetId: "target-1",
+      releasedContext: true,
+    });
+    expect(kernel.releasedContextIds).toEqual(["browser_ctx_1"]);
   });
 
   it("closes new tabs that violate the context policy", async () => {
@@ -1021,6 +1199,9 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
             created_at: "2026-04-27T00:00:00Z",
           });
         }
+        if (url.endsWith("/browser/contexts/observe")) {
+          return Response.json({ ok: true });
+        }
         if (url.endsWith("/browser/contexts/release")) {
           return Response.json({ released: true });
         }
@@ -1043,9 +1224,17 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
         "/browser/contexts/acquire",
         "/json/version",
         "/artifacts/create",
+        "/browser/contexts/observe",
         "/browser/contexts/release",
       ]),
     );
+    expect(
+      calls.find((call) => call.url.endsWith("/browser/contexts/observe"))?.body,
+    ).toMatchObject({
+      context_id: "browser_ctx_client",
+      target_id: "target-1",
+      observation_type: "browser_artifact.created",
+    });
     expect(calls.find((call) => call.url.endsWith("/artifacts/create"))?.body).toMatchObject({
       content_base64: Buffer.from("pixels").toString("base64"),
       mime_type: "image/png",

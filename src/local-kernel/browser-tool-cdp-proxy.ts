@@ -54,12 +54,24 @@ export async function createSparseKernelBrowserToolCdpProxy(
   });
   const tempDir = await mkdtemp(join(tmpdir(), "openclaw-sparsekernel-browser-"));
   let releasePromise: Promise<void> | undefined;
+  let brokerContextReleased = false;
+  const cleanupTempDir = async () => {
+    await rm(tempDir, { force: true, recursive: true });
+  };
+  const markBrokerContextReleased = async () => {
+    brokerContextReleased = true;
+    releasePromise ??= cleanupTempDir();
+    await releasePromise;
+  };
   const release = async () => {
     releasePromise ??= (async () => {
       try {
-        await broker.releaseContext(materialized.ledger_context.id);
+        if (!brokerContextReleased) {
+          await broker.releaseContext(materialized.ledger_context.id);
+          brokerContextReleased = true;
+        }
       } finally {
-        await rm(tempDir, { force: true, recursive: true });
+        await cleanupTempDir();
       }
     })();
     await releasePromise;
@@ -209,7 +221,7 @@ export async function createSparseKernelBrowserToolCdpProxy(
         path,
         artifact: result.artifact,
         artifactId: result.artifact.id,
-        targetId: materialized.target_id,
+        targetId: result.target_id ?? materialized.target_id,
         sparsekernelContextId: materialized.ledger_context.id,
       };
     }
@@ -235,7 +247,7 @@ export async function createSparseKernelBrowserToolCdpProxy(
         path,
         artifact: result.artifact,
         artifactId: result.artifact.id,
-        targetId: materialized.target_id,
+        targetId: result.target_id ?? materialized.target_id,
         sparsekernelContextId: materialized.ledger_context.id,
       };
     }
@@ -264,20 +276,33 @@ export async function createSparseKernelBrowserToolCdpProxy(
       });
     }
     if (method === "DELETE" && path.startsWith("/tabs/")) {
+      const result = await broker.closeTarget(materialized.ledger_context.id, {
+        target_id: decodeURIComponent(path.slice("/tabs/".length)),
+      });
+      if (result.releasedContext) {
+        await markBrokerContextReleased();
+      }
+      return result;
+    }
+    if (method === "DELETE" && path === "/tabs") {
       await release();
       return {
         ok: true,
-        targetId: decodeURIComponent(path.slice("/tabs/".length)),
+        releasedContext: true,
       };
     }
     if (method === "POST" && path === "/act") {
       const body = readRecord(request.body);
       if (body.kind === "close") {
-        await release();
-        return {
-          ok: true,
-          targetId: materialized.target_id,
-        };
+        const result = await broker.actContext(
+          materialized.ledger_context.id,
+          readActRequest(body),
+        );
+        const value = isRecord(result.value) ? result.value : {};
+        if (value.releasedContext === true) {
+          await markBrokerContextReleased();
+        }
+        return result;
       }
       return await broker.actContext(materialized.ledger_context.id, readActRequest(body));
     }
@@ -336,6 +361,10 @@ function readRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readString(value: unknown): string | undefined {

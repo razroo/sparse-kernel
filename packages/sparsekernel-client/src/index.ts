@@ -180,6 +180,14 @@ export type SparseKernelAcquireBrowserContextInput = {
   allowed_origins?: unknown;
 };
 
+export type SparseKernelBrowserObservationInput = {
+  context_id: string;
+  target_id?: string | null;
+  observation_type: string;
+  payload?: unknown;
+  created_at?: string | null;
+};
+
 export type SparseKernelEnqueueTaskInput = {
   id?: string;
   agent_id?: string | null;
@@ -381,6 +389,10 @@ export class SparseKernelClient {
       context_id: contextId,
     });
     return response.released;
+  }
+
+  async recordBrowserObservation(input: SparseKernelBrowserObservationInput): Promise<void> {
+    await this.postJson<{ ok: boolean }>("/browser/contexts/observe", input);
   }
 
   async enqueueTask(input: SparseKernelEnqueueTaskInput): Promise<SparseKernelTask> {

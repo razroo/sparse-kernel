@@ -277,6 +277,15 @@ struct ReleaseBrowserContextRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct BrowserObservationRequest {
+    context_id: String,
+    target_id: Option<String>,
+    observation_type: String,
+    payload: Option<Value>,
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AllocateSandboxRequest {
     agent_id: Option<String>,
     task_id: Option<String>,
@@ -539,6 +548,26 @@ pub fn handle_api_request_with_artifact_root(
             ApiReply {
                 status_code: 200,
                 body: json!({ "released": broker.release_context(&input.context_id)? }),
+            }
+        }
+        ("POST", "/browser/contexts/observe") => {
+            let input: BrowserObservationRequest = parse_body(body)?;
+            db.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "browser_context.observation".to_string(),
+                object_type: Some("browser_context".to_string()),
+                object_id: Some(input.context_id),
+                payload: Some(json!({
+                    "targetId": input.target_id,
+                    "observationType": input.observation_type,
+                    "payload": input.payload,
+                    "observedAt": input.created_at,
+                })),
+            })?;
+            ApiReply {
+                status_code: 200,
+                body: json!({ "ok": true }),
             }
         }
         ("POST", "/tasks/enqueue") => {
@@ -1068,6 +1097,28 @@ mod tests {
         );
         let context_id = context["id"].as_str().unwrap().to_string();
         assert_eq!(context["status"], "active");
+
+        let observed = json_call(
+            &mut db,
+            "POST",
+            "/browser/contexts/observe",
+            json!({
+                "context_id": context_id,
+                "target_id": "target-1",
+                "observation_type": "browser_console",
+                "payload": { "text": "hello" },
+                "created_at": "2026-04-28T00:00:00Z",
+            }),
+        );
+        assert_eq!(observed["ok"], true);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "browser_context.observation");
+        assert_eq!(audit[0].object_id.as_deref(), Some(context_id.as_str()));
+        assert_eq!(
+            audit[0].payload.as_ref().unwrap()["observationType"],
+            "browser_console"
+        );
+        assert_eq!(audit[0].payload.as_ref().unwrap()["targetId"], "target-1");
 
         let denied = handle_api_request(
             &mut db,

@@ -3,6 +3,7 @@ import type { AnyAgentTool } from "../agents/tools/common.js";
 import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
 import { ContentAddressedArtifactStore } from "./artifact-store.js";
 import { LocalBrowserBroker } from "./browser-broker.js";
+import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
 import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
 import { attachSparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 import type { LocalKernelDatabase } from "./database.js";
@@ -26,6 +27,7 @@ export type CapabilityToolBrokerOptions = {
   artifactRootDir?: string;
   outputArtifactThresholdBytes?: number;
   env?: NodeJS.ProcessEnv;
+  browserControlFetch?: typeof fetch;
   browserCdpProxyFactory?: (
     input: SparseKernelBrowserToolCdpProxyInput,
   ) => Promise<BrowserToolLease>;
@@ -58,6 +60,11 @@ function resolveOutputArtifactThresholdBytes(options: CapabilityToolBrokerOption
   return Number.isFinite(parsed) && parsed >= 0
     ? parsed
     : DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES;
+}
+
+function isBrowserBrokerDisabled(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "off" || normalized === "0" || normalized === "false";
 }
 
 export class CapabilityToolBroker {
@@ -233,15 +240,29 @@ export class CapabilityToolBroker {
       shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")
         ? [urlCandidate]
         : undefined;
-    const cdpEndpoint = env.OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT?.trim();
     const browserBrokerMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
     const cdpEligibleTarget = !target || target === "host";
+    const cdpBrokerDisabled = isBrowserBrokerDisabled(browserBrokerMode);
+    const managedCdp =
+      cdpEligibleTarget && !cdpBrokerDisabled
+        ? await resolveSparseKernelBrowserCdpEndpoint({
+            env,
+            fetchImpl: this.options.browserControlFetch,
+            profile: profile || undefined,
+          })
+        : null;
     const shouldUseCdpBroker =
       cdpEligibleTarget &&
-      Boolean(cdpEndpoint) &&
+      !cdpBrokerDisabled &&
+      Boolean(managedCdp?.cdpEndpoint) &&
       (browserBrokerMode === "cdp" ||
         browserBrokerMode === "sparsekernel" ||
-        browserBrokerMode === "sparse-kernel");
+        browserBrokerMode === "sparse-kernel" ||
+        browserBrokerMode === "managed" ||
+        browserBrokerMode === "managed-cdp" ||
+        browserBrokerMode === "sparsekernel-managed" ||
+        Boolean(env.OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL?.trim()) ||
+        Boolean(env.OPENCLAW_BROWSER_CONTROL_URL?.trim()));
     const leaseKey = [
       shouldUseCdpBroker ? "cdp" : "local",
       trustZoneId,
@@ -255,7 +276,7 @@ export class CapabilityToolBroker {
       return activeLease;
     }
     try {
-      if (shouldUseCdpBroker && cdpEndpoint) {
+      if (shouldUseCdpBroker && managedCdp?.cdpEndpoint) {
         const createBrowserProxy =
           this.options.browserCdpProxyFactory ??
           (async (input: SparseKernelBrowserToolCdpProxyInput) => {
@@ -268,7 +289,7 @@ export class CapabilityToolBroker {
           sessionId: context.sessionId,
           taskId: context.taskId,
           trustZoneId,
-          cdpEndpoint,
+          cdpEndpoint: managedCdp.cdpEndpoint,
           baseUrl: env.OPENCLAW_SPARSEKERNEL_BASE_URL ?? env.SPARSEKERNEL_BASE_URL,
           initialUrl:
             urlCandidate && (action === "open" || action === "navigate") ? urlCandidate : undefined,
@@ -285,6 +306,7 @@ export class CapabilityToolBroker {
           objectId: lease.id,
           payload: {
             trustZoneId,
+            endpointSource: managedCdp.source,
             taskId: context.taskId,
             sessionId: context.sessionId,
           },

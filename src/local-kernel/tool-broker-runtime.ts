@@ -5,6 +5,7 @@ import {
   type OpenClawSparseKernelToolBrokerClient,
 } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
 import { openLocalKernelDatabase, type LocalKernelDatabase } from "./database.js";
 import { CapabilityToolBroker } from "./tool-broker.js";
 
@@ -299,14 +300,18 @@ function createDaemonBrowserProxyFactory(
   input: BrokerToolsForRunInput,
 ): OpenClawSparseKernelBrowserProxyFactory | undefined {
   const env = input.env ?? process.env;
-  const cdpEndpoint = env.OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT?.trim();
   const browserBrokerMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
   const shouldUseCdpBroker =
-    Boolean(cdpEndpoint) &&
+    !isFalsyBrokerFlag(browserBrokerMode) &&
     (browserBrokerMode === "cdp" ||
       browserBrokerMode === "sparsekernel" ||
-      browserBrokerMode === "sparse-kernel");
-  if (!shouldUseCdpBroker || !cdpEndpoint) {
+      browserBrokerMode === "sparse-kernel" ||
+      browserBrokerMode === "managed" ||
+      browserBrokerMode === "managed-cdp" ||
+      browserBrokerMode === "sparsekernel-managed" ||
+      Boolean(env.OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL?.trim()) ||
+      Boolean(env.OPENCLAW_BROWSER_CONTROL_URL?.trim()));
+  if (!shouldUseCdpBroker) {
     return undefined;
   }
   return async ({ toolName, toolParams, agentId, sessionId, taskId }) => {
@@ -333,13 +338,20 @@ function createDaemonBrowserProxyFactory(
         : profile || target === "host"
           ? "authenticated_web"
           : "public_web";
+    const managedCdp = await resolveSparseKernelBrowserCdpEndpoint({
+      env,
+      profile: profile || undefined,
+    });
+    if (!managedCdp?.cdpEndpoint) {
+      return null;
+    }
     const { createSparseKernelBrowserToolCdpProxy } = await import("./browser-tool-cdp-proxy.js");
     return await createSparseKernelBrowserToolCdpProxy({
       agentId,
       sessionId,
       taskId,
       trustZoneId,
-      cdpEndpoint,
+      cdpEndpoint: managedCdp.cdpEndpoint,
       baseUrl:
         input.sparseKernelBaseUrl ??
         env.OPENCLAW_SPARSEKERNEL_BASE_URL ??

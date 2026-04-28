@@ -86,6 +86,8 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { sessionId: "session-1" });
         break;
       case "Page.enable":
+      case "Runtime.enable":
+      case "Log.enable":
         this.respond(message.id, {});
         break;
       case "Browser.setDownloadBehavior":
@@ -97,6 +99,9 @@ class FakeCdpTransport implements CdpTransport {
         break;
       case "Page.captureScreenshot":
         this.respond(message.id, { data: Buffer.from("pixels").toString("base64") });
+        break;
+      case "Page.printToPDF":
+        this.respond(message.id, { data: Buffer.from("pdf body").toString("base64") });
         break;
       case "Page.navigate":
         this.respond(message.id, { frameId: "frame-1" });
@@ -132,7 +137,15 @@ class FakeCdpTransport implements CdpTransport {
         break;
       case "Input.dispatchKeyEvent":
       case "Emulation.setDeviceMetricsOverride":
+      case "Page.handleJavaScriptDialog":
+      case "DOM.setFileInputFiles":
         this.respond(message.id, {});
+        break;
+      case "DOM.getDocument":
+        this.respond(message.id, { root: { nodeId: 1 } });
+        break;
+      case "DOM.querySelector":
+        this.respond(message.id, { nodeId: 2 });
         break;
       case "Target.closeTarget":
       case "Target.disposeBrowserContext":
@@ -160,6 +173,27 @@ class FakeCdpTransport implements CdpTransport {
 
   onError(listener: (error: Error) => void): void {
     this.errorListeners.push(listener);
+  }
+
+  emitConsole(text: string): void {
+    this.emit({
+      method: "Runtime.consoleAPICalled",
+      sessionId: "session-1",
+      params: {
+        type: "log",
+        args: [{ value: text }],
+      },
+    });
+  }
+
+  emitDialog(): void {
+    this.emit({
+      method: "Page.javascriptDialogOpening",
+      sessionId: "session-1",
+      params: {
+        message: "Continue?",
+      },
+    });
   }
 
   private respond(id: number, result: Record<string, unknown>): void {
@@ -302,6 +336,123 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       mime_type: "text/plain",
       retention_policy: "durable",
     });
+  });
+
+  it("stores printed PDFs as SparseKernel artifacts", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+    });
+    const result = await broker.capturePdfArtifact(context.ledger_context.id, {
+      retention_policy: "debug",
+    });
+
+    expect(result.artifact_type).toBe("pdf");
+    expect(result.artifact.mime_type).toBe("application/pdf");
+    expect(kernel.artifactInputs[0]).toMatchObject({
+      content_base64: Buffer.from("pdf body").toString("base64"),
+      mime_type: "application/pdf",
+      retention_policy: "debug",
+    });
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([expect.objectContaining({ method: "Page.printToPDF" })]),
+    );
+  });
+
+  it("records console events from the leased CDP context", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+    });
+    transport.emitConsole("hello from page");
+
+    expect(broker.listConsoleMessages(context.ledger_context.id)).toMatchObject({
+      ok: true,
+      targetId: "target-1",
+      messages: [
+        {
+          type: "log",
+          text: "hello from page",
+        },
+      ],
+    });
+  });
+
+  it("uploads files and handles dialogs through the leased CDP context", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    await broker.snapshotContext(context.ledger_context.id);
+
+    await expect(
+      broker.uploadFiles(context.ledger_context.id, {
+        input_ref: "e3",
+        paths: ["/tmp/openclaw-browser-uploads/report.txt"],
+      }),
+    ).resolves.toEqual({ ok: true, targetId: "target-1" });
+
+    const armed = broker.armDialog(context.ledger_context.id, {
+      accept: true,
+      prompt_text: "ok",
+      timeout_ms: 1_000,
+    });
+    transport.emitDialog();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(armed).toEqual({ ok: true, targetId: "target-1", armed: true });
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "DOM.querySelector",
+          params: expect.objectContaining({ selector: "body > input:nth-of-type(1)" }),
+        }),
+        expect.objectContaining({
+          method: "DOM.setFileInputFiles",
+          params: expect.objectContaining({
+            files: ["/tmp/openclaw-browser-uploads/report.txt"],
+          }),
+        }),
+        expect.objectContaining({
+          method: "Page.handleJavaScriptDialog",
+          params: expect.objectContaining({ accept: true, promptText: "ok" }),
+        }),
+      ]),
+    );
   });
 
   it("navigates and lists the leased CDP context tab", async () => {

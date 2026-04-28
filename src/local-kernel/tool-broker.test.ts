@@ -547,4 +547,180 @@ describe("CapabilityToolBroker", () => {
       db.close();
     }
   });
+
+  it("does not inject the CDP proxy when browser broker mode is off", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    const proxyFactory = vi.fn(async () => ({
+      id: "browser_ctx_cdp",
+      proxyRequest: async () => ({ ok: true }),
+      release: () => {},
+    }));
+    const broker = new CapabilityToolBroker(db, {
+      env: {
+        OPENCLAW_RUNTIME_BROWSER_BROKER: "off",
+        OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT: "http://127.0.0.1:9222",
+      } as NodeJS.ProcessEnv,
+      browserCdpProxyFactory: proxyFactory,
+    });
+    try {
+      db.upsertSession({
+        id: "session-a",
+        agentId: "main",
+        status: "active",
+      });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "browser",
+        action: "invoke",
+      });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "browser_context",
+        resourceId: "authenticated_web",
+        action: "allocate",
+      });
+      const tool = broker.wrapTool(
+        {
+          name: "browser",
+          label: "Browser",
+          description: "test",
+          parameters: Type.Object({}),
+          execute: async (_toolCallId, params) => ({
+            content: [{ type: "text", text: "ok" }],
+            details: {
+              hasSparseKernelProxy: Boolean(
+                params && typeof params === "object"
+                  ? (params as Record<PropertyKey, unknown>)[
+                      SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL
+                    ]
+                  : undefined,
+              ),
+            },
+          }),
+        } as AnyAgentTool,
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
+
+      await expect(
+        tool.execute("call-browser", {
+          action: "status",
+          target: "host",
+        }),
+      ).resolves.toMatchObject({
+        details: { hasSparseKernelProxy: false },
+      });
+      expect(proxyFactory).not.toHaveBeenCalled();
+    } finally {
+      await broker.close();
+      db.close();
+    }
+  });
+
+  it("can resolve a managed browser CDP endpoint through browser control", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    const fetchCalls: Array<{ url: string; method?: string }> = [];
+    const proxyInputs: SparseKernelBrowserToolCdpProxyInput[] = [];
+    const broker = new CapabilityToolBroker(db, {
+      env: {
+        OPENCLAW_RUNTIME_BROWSER_BROKER: "managed",
+        OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL: "http://127.0.0.1:18791",
+      } as NodeJS.ProcessEnv,
+      browserControlFetch: (async (input, init) => {
+        fetchCalls.push({ url: input.toString(), method: init?.method });
+        return Response.json({
+          running: true,
+          cdpReady: true,
+          transport: "cdp",
+          cdpUrl: "http://127.0.0.1:18800",
+        });
+      }) as typeof fetch,
+      browserCdpProxyFactory: async (input) => {
+        proxyInputs.push(input);
+        return {
+          id: "browser_ctx_managed",
+          proxyRequest: async () => ({ ok: true, transport: "sparsekernel-cdp" }),
+          release: () => {},
+        };
+      },
+    });
+    try {
+      db.upsertSession({
+        id: "session-a",
+        agentId: "main",
+        status: "active",
+      });
+      db.enqueueTask({
+        id: "task-a",
+        agentId: "main",
+        sessionId: "session-a",
+        kind: "test",
+      });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "browser",
+        action: "invoke",
+      });
+      const tool = broker.wrapTool(
+        {
+          name: "browser",
+          label: "Browser",
+          description: "test",
+          parameters: Type.Object({}),
+          execute: async (_toolCallId, params) => {
+            const injected =
+              params && typeof params === "object"
+                ? (params as Record<PropertyKey, unknown>)[
+                    SPARSEKERNEL_BROWSER_PROXY_REQUEST_SYMBOL
+                  ]
+                : undefined;
+            if (typeof injected !== "function") {
+              throw new Error("missing SparseKernel browser proxy");
+            }
+            return {
+              content: [{ type: "text", text: "ok" }],
+              details: await injected({ method: "GET", path: "/" }),
+            };
+          },
+        } as AnyAgentTool,
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          taskId: "task-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
+
+      await expect(
+        tool.execute("call-browser", {
+          action: "status",
+          profile: "openclaw",
+        }),
+      ).resolves.toMatchObject({
+        details: { ok: true, transport: "sparsekernel-cdp" },
+      });
+
+      expect(fetchCalls).toEqual([
+        { url: "http://127.0.0.1:18791/start?profile=openclaw", method: "POST" },
+        { url: "http://127.0.0.1:18791/?profile=openclaw", method: "GET" },
+      ]);
+      expect(proxyInputs[0]).toMatchObject({
+        cdpEndpoint: "http://127.0.0.1:18800",
+        trustZoneId: "authenticated_web",
+      });
+    } finally {
+      await broker.close();
+      db.close();
+    }
+  });
 });

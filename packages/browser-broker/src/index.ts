@@ -91,9 +91,31 @@ export type CaptureDownloadArtifactInput = {
 export type BrowserArtifactResult = {
   context_id: string;
   artifact: SparseKernelArtifact;
-  artifact_type: "screenshot" | "download";
+  artifact_type: "screenshot" | "download" | "pdf";
   filename?: string;
   source_url?: string;
+};
+
+export type SparseKernelBrowserConsoleMessage = {
+  type: string;
+  text: string;
+  timestamp: string;
+  level?: string;
+};
+
+export type SparseKernelBrowserDialogInput = {
+  accept: boolean;
+  prompt_text?: string;
+  timeout_ms?: number;
+};
+
+export type SparseKernelBrowserUploadInput = {
+  paths: string[];
+  ref?: string;
+  input_ref?: string;
+  selector?: string;
+  target_id?: string;
+  timeout_ms?: number;
 };
 
 export type SparseKernelBrowserSnapshotInput = {
@@ -196,6 +218,7 @@ type LiveBrowserContext = MaterializedBrowserContext & {
   download_dir: string;
   owns_download_dir: boolean;
   snapshot_refs: Map<string, SnapshotRef>;
+  console_messages: SparseKernelBrowserConsoleMessage[];
 };
 
 export class SparseKernelCdpBrowserBroker {
@@ -249,6 +272,8 @@ export class SparseKernelCdpBrowserBroker {
         },
       );
       await connection.command("Page.enable", {}, sessionId);
+      await connection.command("Runtime.enable", {}, sessionId);
+      await connection.command("Log.enable", {}, sessionId).catch(() => {});
       if (input.download_dir) {
         downloadDir = input.download_dir;
       } else {
@@ -272,7 +297,9 @@ export class SparseKernelCdpBrowserBroker {
         download_dir: downloadDir,
         owns_download_dir: ownsDownloadDir,
         snapshot_refs: new Map(),
+        console_messages: [],
       };
+      connection.onEvent((event) => recordConsoleEvent(materialized, event));
       this.contexts.set(ledgerContext.id, materialized);
       return publicContext(materialized);
     } catch (error) {
@@ -350,6 +377,125 @@ export class SparseKernelCdpBrowserBroker {
       artifact_type: "download",
       filename: readString(beginEvent.params.suggestedFilename),
       source_url: readString(complete.params.url) ?? input.url,
+    };
+  }
+
+  async capturePdfArtifact(
+    contextId: string,
+    input: {
+      retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
+      subject?: SparseKernelArtifactSubject;
+    } = {},
+  ): Promise<BrowserArtifactResult> {
+    const context = this.requireContext(contextId);
+    const pdf = await context.connection.command<{ data: string }>(
+      "Page.printToPDF",
+      { printBackground: true },
+      context.page_session_id,
+    );
+    const artifact = await this.kernel.createArtifact({
+      content_base64: pdf.data,
+      mime_type: "application/pdf",
+      retention_policy: input.retention_policy ?? "debug",
+      subject: input.subject,
+    });
+    return {
+      context_id: contextId,
+      artifact,
+      artifact_type: "pdf",
+    };
+  }
+
+  listConsoleMessages(
+    contextId: string,
+    input: { level?: string; limit?: number } = {},
+  ): { ok: true; targetId: string; messages: SparseKernelBrowserConsoleMessage[] } {
+    const context = this.requireContext(contextId);
+    const level = input.level?.trim().toLowerCase();
+    const limit = Math.max(1, Math.min(500, Math.floor(input.limit ?? 100)));
+    const messages = context.console_messages
+      .filter((message) => !level || message.type.toLowerCase() === level)
+      .slice(-limit);
+    return {
+      ok: true,
+      targetId: context.target_id,
+      messages,
+    };
+  }
+
+  armDialog(
+    contextId: string,
+    input: SparseKernelBrowserDialogInput,
+  ): { ok: true; targetId: string; armed: true } {
+    const context = this.requireContext(contextId);
+    void context.connection
+      .waitForEvent(
+        "Page.javascriptDialogOpening",
+        (event) => event.sessionId === context.page_session_id,
+        input.timeout_ms ?? 30_000,
+      )
+      .then(async () => {
+        await context.connection.command(
+          "Page.handleJavaScriptDialog",
+          {
+            accept: input.accept,
+            promptText: input.prompt_text,
+          },
+          context.page_session_id,
+        );
+      })
+      .catch(() => {});
+    return {
+      ok: true,
+      targetId: context.target_id,
+      armed: true,
+    };
+  }
+
+  async uploadFiles(
+    contextId: string,
+    input: SparseKernelBrowserUploadInput,
+  ): Promise<{ ok: true; targetId: string }> {
+    const context = this.requireContext(contextId);
+    const targetId = input.target_id?.trim();
+    if (targetId && targetId !== context.target_id) {
+      throw new Error(`SparseKernel CDP browser context does not own target: ${targetId}`);
+    }
+    if (input.paths.length === 0) {
+      throw new Error("SparseKernel browser upload requires at least one file path.");
+    }
+    const selector = this.resolveActionSelector(context, {
+      ref: input.ref ?? input.input_ref,
+      selector: input.selector,
+    });
+    const { root } = await context.connection.command<{ root: { nodeId: number } }>(
+      "DOM.getDocument",
+      { depth: 1 },
+      context.page_session_id,
+      input.timeout_ms,
+    );
+    const rootNodeId = root?.nodeId;
+    if (typeof rootNodeId !== "number") {
+      throw new Error("SparseKernel browser upload could not read DOM root.");
+    }
+    const { nodeId } = await context.connection.command<{ nodeId: number }>(
+      "DOM.querySelector",
+      { nodeId: rootNodeId, selector },
+      context.page_session_id,
+      input.timeout_ms,
+    );
+    if (typeof nodeId !== "number" || nodeId <= 0) {
+      throw new Error("SparseKernel browser upload target not found.");
+    }
+    await context.connection.command(
+      "DOM.setFileInputFiles",
+      { nodeId, files: input.paths },
+      context.page_session_id,
+      input.timeout_ms,
+    );
+    return {
+      ok: true,
+      targetId: context.target_id,
     };
   }
 
@@ -615,6 +761,7 @@ class CdpConnection {
   private readonly pending = new Map<number, CdpResponseWaiter>();
   private readonly eventWaiters: CdpEventWaiter[] = [];
   private readonly eventBacklog: CdpEventMessage[] = [];
+  private readonly eventObservers: Array<(message: CdpEventMessage) => void> = [];
 
   private constructor(private readonly transport: CdpTransport) {
     transport.onMessage((data) => this.handleMessage(data));
@@ -677,6 +824,10 @@ class CdpConnection {
     });
   }
 
+  onEvent(listener: (message: CdpEventMessage) => void): void {
+    this.eventObservers.push(listener);
+  }
+
   close(): void {
     this.transport.close();
     this.failAll(new Error("CDP connection closed"));
@@ -715,6 +866,13 @@ class CdpConnection {
     this.eventBacklog.push(event);
     if (this.eventBacklog.length > 100) {
       this.eventBacklog.shift();
+    }
+    for (const observer of this.eventObservers) {
+      try {
+        observer(event);
+      } catch {
+        // CDP event observers are best-effort side channels such as console capture.
+      }
     }
     for (const waiter of [...this.eventWaiters]) {
       if (waiter.method === method && waiter.predicate(event)) {
@@ -836,6 +994,40 @@ function publicContext(context: LiveBrowserContext): MaterializedBrowserContext 
     cdp_browser_context_id: context.cdp_browser_context_id,
     target_id: context.target_id,
   };
+}
+
+function recordConsoleEvent(context: LiveBrowserContext, event: CdpEventMessage): void {
+  if (event.sessionId && event.sessionId !== context.page_session_id) {
+    return;
+  }
+  if (event.method === "Runtime.consoleAPICalled") {
+    const type = readString(event.params.type) ?? "log";
+    const args = Array.isArray(event.params.args) ? event.params.args : [];
+    const text = args
+      .filter(isRecord)
+      .map((arg) => readString(arg.value) ?? readString(arg.description) ?? "")
+      .filter(Boolean)
+      .join(" ");
+    context.console_messages.push({
+      type,
+      text,
+      timestamp: new Date().toISOString(),
+    });
+  } else if (event.method === "Log.entryAdded" && isRecord(event.params.entry)) {
+    const entry = event.params.entry;
+    const level = readString(entry.level) ?? "log";
+    context.console_messages.push({
+      type: level,
+      level,
+      text: readString(entry.text) ?? "",
+      timestamp: new Date().toISOString(),
+    });
+  } else {
+    return;
+  }
+  if (context.console_messages.length > 500) {
+    context.console_messages.splice(0, context.console_messages.length - 500);
+  }
 }
 
 function parseJsonRecord(raw: string): JsonRecord | undefined {

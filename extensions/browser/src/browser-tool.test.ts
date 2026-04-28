@@ -835,6 +835,154 @@ describe("browser tool snapshot maxChars", () => {
     expect(browserActionsMocks.browserAct).not.toHaveBeenCalled();
   });
 
+  it("routes console reads through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      targetId: "target-1",
+      messages: [{ type: "log", text: "hello" }],
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "console",
+          targetId: "target-1",
+          level: "log",
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({
+      ok: true,
+      targetId: "target-1",
+      messageCount: 1,
+    });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "GET",
+        path: "/console",
+        query: expect.objectContaining({
+          targetId: "target-1",
+          level: "log",
+        }),
+      }),
+    );
+    expect(browserActionsMocks.browserConsoleMessages).not.toHaveBeenCalled();
+  });
+
+  it("routes PDFs through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      path: "/tmp/sparsekernel-page.pdf",
+      targetId: "target-1",
+      artifactId: "artifact_pdf",
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "pdf",
+          targetId: "target-1",
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({
+      ok: true,
+      path: "/tmp/sparsekernel-page.pdf",
+      artifactId: "artifact_pdf",
+    });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/pdf",
+        body: expect.objectContaining({ targetId: "target-1" }),
+      }),
+    );
+    expect(browserActionsMocks.browserPdfSave).not.toHaveBeenCalled();
+  });
+
+  it("routes uploads through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      targetId: "target-1",
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "upload",
+          targetId: "target-1",
+          inputRef: "e3",
+          paths: ["/tmp/openclaw-browser-uploads/report.txt"],
+          timeoutMs: 12_345,
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({ ok: true, targetId: "target-1" });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/hooks/file-chooser",
+        body: expect.objectContaining({
+          targetId: "target-1",
+          inputRef: "e3",
+          paths: ["/tmp/openclaw-browser-uploads/report.txt"],
+          timeoutMs: 12_345,
+        }),
+      }),
+    );
+    expect(browserActionsMocks.browserArmFileChooser).not.toHaveBeenCalled();
+  });
+
+  it("routes dialogs through the hidden SparseKernel browser proxy", async () => {
+    const proxyRequest = vi.fn(async () => ({
+      ok: true,
+      targetId: "target-1",
+      armed: true,
+    }));
+    const tool = createBrowserTool();
+
+    const result = await tool.execute?.(
+      "call-1",
+      withSparseKernelBrowserProxy(
+        {
+          action: "dialog",
+          accept: true,
+          promptText: "ok",
+          targetId: "target-1",
+          timeoutMs: 12_345,
+        },
+        proxyRequest,
+      ),
+    );
+
+    expect(result?.details).toMatchObject({ ok: true, targetId: "target-1", armed: true });
+    expect(proxyRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/hooks/dialog",
+        body: expect.objectContaining({
+          accept: true,
+          promptText: "ok",
+          targetId: "target-1",
+          timeoutMs: 12_345,
+        }),
+      }),
+    );
+    expect(browserActionsMocks.browserArmDialog).not.toHaveBeenCalled();
+  });
+
   it("passes screenshot timeoutMs to the host browser client", async () => {
     const tool = createBrowserTool();
     await tool.execute?.("call-1", {

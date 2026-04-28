@@ -125,6 +125,13 @@ export async function createSparseKernelBrowserToolCdpProxy(
         timeout_ms: request.timeoutMs,
       });
     }
+    if (method === "GET" && path === "/console") {
+      assertTargetId(materialized, readString(request.query?.targetId));
+      return broker.listConsoleMessages(materialized.ledger_context.id, {
+        level: readString(request.query?.level),
+        limit: readNumber(request.query?.limit),
+      });
+    }
     if (method === "POST" && path === "/tabs/focus") {
       const body = readRecord(request.body);
       assertTargetId(materialized, readString(body.targetId));
@@ -183,6 +190,48 @@ export async function createSparseKernelBrowserToolCdpProxy(
         targetId: materialized.target_id,
         sparsekernelContextId: materialized.ledger_context.id,
       };
+    }
+    if (method === "POST" && path === "/pdf") {
+      const body = readRecord(request.body);
+      assertTargetId(materialized, readString(body.targetId));
+      const result = await broker.capturePdfArtifact(materialized.ledger_context.id, {
+        retention_policy: "debug",
+        subject: input.subject,
+      });
+      const artifactBytes = await client.readArtifact({
+        id: result.artifact.id,
+        subject: input.subject,
+      });
+      const path = join(tempDir, `${result.artifact.sha256}.pdf`);
+      await writeFile(path, Buffer.from(artifactBytes.content_base64, "base64"));
+      return {
+        ok: true,
+        path,
+        artifact: result.artifact,
+        artifactId: result.artifact.id,
+        targetId: materialized.target_id,
+        sparsekernelContextId: materialized.ledger_context.id,
+      };
+    }
+    if (method === "POST" && path === "/hooks/dialog") {
+      const body = readRecord(request.body);
+      assertTargetId(materialized, readString(body.targetId));
+      return broker.armDialog(materialized.ledger_context.id, {
+        accept: body.accept !== false,
+        prompt_text: readString(body.promptText),
+        timeout_ms: readNumber(body.timeoutMs) ?? request.timeoutMs,
+      });
+    }
+    if (method === "POST" && path === "/hooks/file-chooser") {
+      const body = readRecord(request.body);
+      return await broker.uploadFiles(materialized.ledger_context.id, {
+        paths: Array.isArray(body.paths) ? body.paths.map((path) => String(path)) : [],
+        ref: readString(body.ref),
+        input_ref: readString(body.inputRef),
+        selector: readString(body.selector) ?? readString(body.element),
+        target_id: readString(body.targetId),
+        timeout_ms: readNumber(body.timeoutMs) ?? request.timeoutMs,
+      });
     }
     if (method === "DELETE" && path.startsWith("/tabs/")) {
       assertTargetId(materialized, decodeURIComponent(path.slice("/tabs/".length)));

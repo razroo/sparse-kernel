@@ -286,6 +286,11 @@ type CdpEventMessage = {
   sessionId?: string;
 };
 
+type LiveBrowserPage = {
+  target_id: string;
+  page_session_id: string;
+};
+
 type LiveBrowserContext = MaterializedBrowserContext & {
   connection: CdpConnection;
   page_session_id: string;
@@ -296,6 +301,7 @@ type LiveBrowserContext = MaterializedBrowserContext & {
   network_request_ids: Set<string>;
   last_network_activity_at: number;
   allowed_origins: string[];
+  pages: Map<string, LiveBrowserPage>;
 };
 
 const NETWORK_IDLE_QUIET_MS = 500;
@@ -393,6 +399,7 @@ export class SparseKernelCdpBrowserBroker {
         network_request_ids: new Set(),
         last_network_activity_at: Date.now(),
         allowed_origins: allowedOrigins,
+        pages: new Map([[targetId, { target_id: targetId, page_session_id: sessionId }]]),
       };
       connection.onEvent((event) => {
         recordConsoleEvent(materialized, event);
@@ -556,8 +563,8 @@ export class SparseKernelCdpBrowserBroker {
   ): Promise<{ ok: true; targetId: string }> {
     const context = this.requireContext(contextId);
     const targetId = input.target_id?.trim();
-    if (targetId && targetId !== context.target_id) {
-      throw new Error(`SparseKernel CDP browser context does not own target: ${targetId}`);
+    if (targetId) {
+      this.activateTarget(context, targetId);
     }
     if (input.paths.length === 0) {
       throw new Error("SparseKernel browser upload requires at least one file path.");
@@ -607,7 +614,21 @@ export class SparseKernelCdpBrowserBroker {
   }
 
   async listTabs(contextId: string): Promise<SparseKernelBrowserTab[]> {
-    return [await this.describeContextTab(this.requireContext(contextId))];
+    const context = this.requireContext(contextId);
+    const tabs: SparseKernelBrowserTab[] = [];
+    for (const page of context.pages.values()) {
+      tabs.push(await this.describePageTab(context, page));
+    }
+    return tabs;
+  }
+
+  async focusContext(
+    contextId: string,
+    input: { target_id: string },
+  ): Promise<SparseKernelBrowserTab> {
+    const context = this.requireContext(contextId);
+    this.activateTarget(context, input.target_id);
+    return await this.describeContextTab(context);
   }
 
   async snapshotContext(
@@ -670,8 +691,8 @@ export class SparseKernelCdpBrowserBroker {
     const context = this.requireContext(contextId);
     const targetId =
       "targetId" in request && typeof request.targetId === "string" ? request.targetId : undefined;
-    if (targetId && targetId !== context.target_id) {
-      throw new Error(`SparseKernel CDP browser context does not own target: ${targetId}`);
+    if (targetId) {
+      this.activateTarget(context, targetId);
     }
     switch (request.kind) {
       case "click":
@@ -898,7 +919,9 @@ export class SparseKernelCdpBrowserBroker {
     }
     this.contexts.delete(contextId);
     try {
-      await context.connection.command("Target.closeTarget", { targetId: context.target_id });
+      for (const targetId of context.pages.keys()) {
+        await context.connection.command("Target.closeTarget", { targetId }).catch(() => {});
+      }
       await context.connection.command("Target.disposeBrowserContext", {
         browserContextId: context.cdp_browser_context_id,
       });
@@ -917,6 +940,15 @@ export class SparseKernelCdpBrowserBroker {
       throw new Error(`SparseKernel browser context is not materialized: ${contextId}`);
     }
     return context;
+  }
+
+  private activateTarget(context: LiveBrowserContext, targetId: string): void {
+    const page = context.pages.get(targetId);
+    if (!page) {
+      throw new Error(`SparseKernel CDP browser context does not own target: ${targetId}`);
+    }
+    context.target_id = page.target_id;
+    context.page_session_id = page.page_session_id;
   }
 
   private async navigate(
@@ -1057,12 +1089,22 @@ export class SparseKernelCdpBrowserBroker {
     observation: PostActionNavigationObservation | undefined,
   ): Promise<void> {
     if (observation?.kind === "new-target") {
-      await context.connection
-        .command("Target.closeTarget", { targetId: observation.targetId })
-        .catch(() => {});
-      throw new Error(
-        `SparseKernel browser action opened a new tab/window (${observation.targetId}); new targets are not accepted by the v0 broker.`,
-      );
+      try {
+        if (observation.url) {
+          assertUrlAllowedByOrigins(observation.url, context.allowed_origins, "popup navigation");
+        } else if (context.allowed_origins.length > 0) {
+          throw new Error(
+            `SparseKernel browser popup navigation blocked by allowed origins: target ${observation.targetId} did not report a URL`,
+          );
+        }
+      } catch (error) {
+        await context.connection
+          .command("Target.closeTarget", { targetId: observation.targetId })
+          .catch(() => {});
+        throw error;
+      }
+      await this.attachNewTarget(context, observation.targetId);
+      return;
     }
     if (observation?.kind === "same-target") {
       await context.connection
@@ -1089,7 +1131,40 @@ export class SparseKernelCdpBrowserBroker {
     return (await this.describeContextTab(context)).url;
   }
 
+  private async attachNewTarget(context: LiveBrowserContext, targetId: string): Promise<void> {
+    const existing = context.pages.get(targetId);
+    if (existing) {
+      this.activateTarget(context, targetId);
+      return;
+    }
+    const { sessionId } = await context.connection.command<{ sessionId: string }>(
+      "Target.attachToTarget",
+      {
+        flatten: true,
+        targetId,
+      },
+    );
+    await context.connection.command("Page.enable", {}, sessionId);
+    await context.connection.command("Runtime.enable", {}, sessionId);
+    await context.connection.command("Network.enable", {}, sessionId).catch(() => {});
+    await context.connection.command("Log.enable", {}, sessionId).catch(() => {});
+    context.pages.set(targetId, { target_id: targetId, page_session_id: sessionId });
+    context.target_id = targetId;
+    context.page_session_id = sessionId;
+    context.snapshot_refs = new Map();
+  }
+
   private async describeContextTab(context: LiveBrowserContext): Promise<SparseKernelBrowserTab> {
+    return await this.describePageTab(context, {
+      target_id: context.target_id,
+      page_session_id: context.page_session_id,
+    });
+  }
+
+  private async describePageTab(
+    context: LiveBrowserContext,
+    page: LiveBrowserPage,
+  ): Promise<SparseKernelBrowserTab> {
     let title: string | undefined;
     let url: string | undefined;
     try {
@@ -1101,7 +1176,7 @@ export class SparseKernelCdpBrowserBroker {
           expression: "JSON.stringify({ title: document.title, url: location.href })",
           returnByValue: true,
         },
-        context.page_session_id,
+        page.page_session_id,
       );
       const raw = evaluated.result?.value;
       if (typeof raw === "string") {
@@ -1113,8 +1188,8 @@ export class SparseKernelCdpBrowserBroker {
       // Best-effort tab metadata; target id is the durable handle for the lease.
     }
     return {
-      targetId: context.target_id,
-      suggestedTargetId: context.target_id,
+      targetId: page.target_id,
+      suggestedTargetId: page.target_id,
       ...(title ? { title } : {}),
       ...(url ? { url } : {}),
       type: "page",

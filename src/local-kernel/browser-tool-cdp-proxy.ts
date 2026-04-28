@@ -5,6 +5,7 @@ import {
   createSparseKernelCdpBrowserBroker,
   type MaterializedBrowserContext,
   type SparseKernelBrowserActRequest,
+  type SparseKernelCdpBrowserBroker,
   type SparseKernelBrowserTab,
 } from "../../packages/browser-broker/src/index.js";
 import {
@@ -117,7 +118,11 @@ export async function createSparseKernelBrowserToolCdpProxy(
     }
     if (method === "GET" && path === "/snapshot") {
       const query = request.query ?? {};
-      assertTargetId(materialized, readString(query.targetId));
+      await focusTargetIfRequested(
+        broker,
+        materialized.ledger_context.id,
+        readString(query.targetId),
+      );
       return await broker.snapshotContext(materialized.ledger_context.id, {
         format: query.format === "aria" ? "aria" : "ai",
         max_chars: readNumber(query.maxChars),
@@ -129,7 +134,11 @@ export async function createSparseKernelBrowserToolCdpProxy(
       });
     }
     if (method === "GET" && path === "/console") {
-      assertTargetId(materialized, readString(request.query?.targetId));
+      await focusTargetIfRequested(
+        broker,
+        materialized.ledger_context.id,
+        readString(request.query?.targetId),
+      );
       return broker.listConsoleMessages(materialized.ledger_context.id, {
         level: readString(request.query?.level),
         limit: readNumber(request.query?.limit),
@@ -137,10 +146,12 @@ export async function createSparseKernelBrowserToolCdpProxy(
     }
     if (method === "POST" && path === "/tabs/focus") {
       const body = readRecord(request.body);
-      assertTargetId(materialized, readString(body.targetId));
+      const tab = await broker.focusContext(materialized.ledger_context.id, {
+        target_id: requiredString(body.targetId, "targetId"),
+      });
       return {
         ok: true,
-        targetId: materialized.target_id,
+        ...toBrowserTabResult(tab),
       };
     }
     if (method === "POST" && path === "/tabs/open") {
@@ -157,7 +168,11 @@ export async function createSparseKernelBrowserToolCdpProxy(
     }
     if (method === "POST" && path === "/navigate") {
       const body = readRecord(request.body);
-      assertTargetId(materialized, readString(body.targetId));
+      await focusTargetIfRequested(
+        broker,
+        materialized.ledger_context.id,
+        readString(body.targetId),
+      );
       const tab = await broker.navigateContext(materialized.ledger_context.id, {
         url: requiredString(body.url, "url"),
         timeout_ms: request.timeoutMs,
@@ -169,7 +184,11 @@ export async function createSparseKernelBrowserToolCdpProxy(
     }
     if (method === "POST" && path === "/screenshot") {
       const body = readRecord(request.body);
-      assertTargetId(materialized, readString(body.targetId));
+      await focusTargetIfRequested(
+        broker,
+        materialized.ledger_context.id,
+        readString(body.targetId),
+      );
       const format = body.type === "jpeg" ? "jpeg" : "png";
       const result = await broker.captureScreenshotArtifact(materialized.ledger_context.id, {
         format,
@@ -196,7 +215,11 @@ export async function createSparseKernelBrowserToolCdpProxy(
     }
     if (method === "POST" && path === "/pdf") {
       const body = readRecord(request.body);
-      assertTargetId(materialized, readString(body.targetId));
+      await focusTargetIfRequested(
+        broker,
+        materialized.ledger_context.id,
+        readString(body.targetId),
+      );
       const result = await broker.capturePdfArtifact(materialized.ledger_context.id, {
         retention_policy: "debug",
         subject: input.subject,
@@ -218,7 +241,11 @@ export async function createSparseKernelBrowserToolCdpProxy(
     }
     if (method === "POST" && path === "/hooks/dialog") {
       const body = readRecord(request.body);
-      assertTargetId(materialized, readString(body.targetId));
+      await focusTargetIfRequested(
+        broker,
+        materialized.ledger_context.id,
+        readString(body.targetId),
+      );
       return broker.armDialog(materialized.ledger_context.id, {
         accept: body.accept !== false,
         prompt_text: readString(body.promptText),
@@ -237,11 +264,10 @@ export async function createSparseKernelBrowserToolCdpProxy(
       });
     }
     if (method === "DELETE" && path.startsWith("/tabs/")) {
-      assertTargetId(materialized, decodeURIComponent(path.slice("/tabs/".length)));
       await release();
       return {
         ok: true,
-        targetId: materialized.target_id,
+        targetId: decodeURIComponent(path.slice("/tabs/".length)),
       };
     }
     if (method === "POST" && path === "/act") {
@@ -288,9 +314,13 @@ function toBrowserTabResult(tab: SparseKernelBrowserTab): Record<string, unknown
   };
 }
 
-function assertTargetId(context: MaterializedBrowserContext, targetId: string | undefined): void {
-  if (targetId && targetId !== context.target_id) {
-    throw new Error(`SparseKernel CDP browser context does not own target: ${targetId}`);
+async function focusTargetIfRequested(
+  broker: SparseKernelCdpBrowserBroker,
+  contextId: string,
+  targetId: string | undefined,
+): Promise<void> {
+  if (targetId) {
+    await broker.focusContext(contextId, { target_id: targetId });
   }
 }
 

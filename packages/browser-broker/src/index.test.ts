@@ -746,7 +746,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     expect(kernel.releasedContextIds).toEqual(["browser_ctx_1"]);
   });
 
-  it("closes new tabs opened by brokered actions instead of accepting unleased targets", async () => {
+  it("attaches same-policy tabs opened by brokered actions", async () => {
     const kernel = new FakeKernel();
     const transport = new FakeCdpTransport();
     const broker = new SparseKernelCdpBrowserBroker({
@@ -771,7 +771,39 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
         kind: "click",
         selector: "#popup",
       }),
-    ).rejects.toThrow(/opened a new tab\/window/);
+    ).resolves.toMatchObject({ ok: true, kind: "click" });
+    await expect(broker.listTabs(context.ledger_context.id)).resolves.toEqual([
+      expect.objectContaining({ targetId: "target-1" }),
+      expect.objectContaining({ targetId: "target-popup" }),
+    ]);
+  });
+
+  it("closes new tabs that violate the context policy", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/start",
+      allowed_origins: ["https://example.com"],
+    });
+    transport.queueActionNewTarget("https://blocked.example/popup", "target-popup");
+
+    await expect(
+      broker.actContext(context.ledger_context.id, {
+        kind: "click",
+        selector: "#popup",
+      }),
+    ).rejects.toThrow(/popup navigation blocked by allowed origins/);
     expect(transport.sent).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

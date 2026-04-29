@@ -1759,6 +1759,12 @@ pub struct ArtifactStore<'a> {
     root: PathBuf,
 }
 
+struct TempArtifactBlob {
+    path: PathBuf,
+    sha256: String,
+    size_bytes: i64,
+}
+
 impl<'a> ArtifactStore<'a> {
     pub fn new(db: &'a SparseKernelDb, root: impl AsRef<Path>) -> Self {
         Self {
@@ -1783,22 +1789,62 @@ impl<'a> ArtifactStore<'a> {
         if !storage_path.exists() {
             fs::write(&storage_path, bytes)?;
         }
-        let artifact = self.db.record_artifact(
+        self.record_stored_artifact(
             &sha256,
             bytes.len() as i64,
             &storage_ref,
             mime_type,
-            None,
             retention_policy,
-        )?;
-        if let Some((subject_type, subject_id, permission)) = subject {
-            self.db
-                .grant_artifact_access(&artifact.id, subject_type, subject_id, permission)?;
-        }
-        Ok(artifact)
+            subject,
+        )
+    }
+
+    pub fn import_file(
+        &self,
+        file_path: impl AsRef<Path>,
+        mime_type: Option<&str>,
+        retention_policy: Option<&str>,
+        subject: Option<(&str, &str, &str)>,
+    ) -> Result<ArtifactRecord> {
+        let file = fs::File::open(file_path.as_ref())?;
+        let temp = self.write_reader_to_temp(file)?;
+        let storage_ref = artifact_storage_ref(&temp.sha256)?;
+        self.move_temp_to_storage(&temp.path, &storage_ref)?;
+        self.record_stored_artifact(
+            &temp.sha256,
+            temp.size_bytes,
+            &storage_ref,
+            mime_type,
+            retention_policy,
+            subject,
+        )
     }
 
     pub fn read(&self, artifact_id: &str, subject: Option<(&str, &str, &str)>) -> Result<Vec<u8>> {
+        let artifact = self.checked_artifact(artifact_id, subject)?;
+        Ok(fs::read(self.root.join(artifact.storage_ref))?)
+    }
+
+    pub fn export_file(
+        &self,
+        artifact_id: &str,
+        destination_path: impl AsRef<Path>,
+        subject: Option<(&str, &str, &str)>,
+    ) -> Result<ArtifactRecord> {
+        let artifact = self.checked_artifact(artifact_id, subject)?;
+        let destination_path = destination_path.as_ref();
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(self.root.join(&artifact.storage_ref), destination_path)?;
+        Ok(artifact)
+    }
+
+    fn checked_artifact(
+        &self,
+        artifact_id: &str,
+        subject: Option<(&str, &str, &str)>,
+    ) -> Result<ArtifactRecord> {
         if let Some((subject_type, subject_id, permission)) = subject {
             if !self
                 .db
@@ -1818,7 +1864,96 @@ impl<'a> ArtifactStore<'a> {
             }
         }
         let artifact = self.db.get_artifact(artifact_id)?;
-        Ok(fs::read(self.root.join(artifact.storage_ref))?)
+        Ok(artifact)
+    }
+
+    fn record_stored_artifact(
+        &self,
+        sha256: &str,
+        size_bytes: i64,
+        storage_ref: &str,
+        mime_type: Option<&str>,
+        retention_policy: Option<&str>,
+        subject: Option<(&str, &str, &str)>,
+    ) -> Result<ArtifactRecord> {
+        let artifact = self.db.record_artifact(
+            sha256,
+            size_bytes,
+            storage_ref,
+            mime_type,
+            None,
+            retention_policy,
+        )?;
+        if let Some((subject_type, subject_id, permission)) = subject {
+            self.db
+                .grant_artifact_access(&artifact.id, subject_type, subject_id, permission)?;
+        }
+        Ok(artifact)
+    }
+
+    fn write_reader_to_temp<R: Read>(&self, mut reader: R) -> Result<TempArtifactBlob> {
+        let tmp_dir = self.root.join(".tmp");
+        fs::create_dir_all(&tmp_dir)?;
+        let tmp_path = tmp_dir.join(format!(
+            "artifact-{}-{}.tmp",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut writer = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0_i64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err.into());
+                }
+            };
+            let chunk = &buffer[..count];
+            hasher.update(chunk);
+            size_bytes += count as i64;
+            if let Err(err) = writer.write_all(chunk) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
+        }
+        if let Err(err) = writer.flush() {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        Ok(TempArtifactBlob {
+            path: tmp_path,
+            sha256: format!("{:x}", hasher.finalize()),
+            size_bytes,
+        })
+    }
+
+    fn move_temp_to_storage(&self, tmp_path: &Path, storage_ref: &str) -> Result<()> {
+        let storage_path = self.root.join(storage_ref);
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if storage_path.exists() {
+            fs::remove_file(tmp_path)?;
+            return Ok(());
+        }
+        match fs::rename(tmp_path, &storage_path) {
+            Ok(()) => Ok(()),
+            Err(_) if storage_path.exists() => {
+                let _ = fs::remove_file(tmp_path);
+                Ok(())
+            }
+            Err(err) => {
+                let _ = fs::remove_file(tmp_path);
+                Err(err.into())
+            }
+        }
     }
 }
 
@@ -2476,7 +2611,13 @@ mod tests {
         let second = store
             .write(b"hello", Some("text/plain"), Some("session"), None)
             .unwrap();
+        let import_path = dir.path().join("import.txt");
+        fs::write(&import_path, b"hello").unwrap();
+        let imported = store
+            .import_file(&import_path, Some("text/plain"), Some("session"), None)
+            .unwrap();
         assert_eq!(first.id, second.id);
+        assert_eq!(first.id, imported.id);
         assert_eq!(
             store
                 .read(&first.id, Some(("agent", "main", "read")))
@@ -2486,6 +2627,11 @@ mod tests {
         assert!(store
             .read(&first.id, Some(("agent", "other", "read")))
             .is_err());
+        let export_path = dir.path().join("export.txt");
+        store
+            .export_file(&first.id, &export_path, Some(("agent", "main", "read")))
+            .unwrap();
+        assert_eq!(fs::read(export_path).unwrap(), b"hello");
     }
 
     #[test]

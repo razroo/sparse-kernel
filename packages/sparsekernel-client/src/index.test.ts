@@ -41,4 +41,56 @@ describe("SparseKernelClient protocol compatibility", () => {
       /protocol mismatch/,
     );
   });
+
+  it("posts staged artifact import and export requests", async () => {
+    const artifact = {
+      id: "artifact-a",
+      sha256: "0".repeat(64),
+      size_bytes: 4,
+      storage_ref: "sha256/00/00/hash",
+      created_at: "2026-04-29T00:00:00Z",
+    };
+    const requests: Array<{ path: string; body: unknown }> = [];
+    const fetchImpl = vi.fn(async (input, init) => {
+      const url = new URL(String(input));
+      requests.push({
+        path: url.pathname,
+        body: JSON.parse(String(init?.body)),
+      });
+      if (url.pathname === "/artifacts/export-file") {
+        return Response.json({ artifact, staged_path: "/tmp/exported.bin" });
+      }
+      return Response.json(artifact);
+    }) as unknown as typeof fetch;
+    const client = new SparseKernelClient({ fetchImpl });
+
+    await expect(
+      client.importArtifactFile({
+        staged_path: "upload.bin",
+        mime_type: "application/octet-stream",
+      }),
+    ).resolves.toMatchObject({ id: "artifact-a" });
+    await expect(
+      client.exportArtifactFile({
+        id: "artifact-a",
+        file_name: "download.bin",
+      }),
+    ).resolves.toMatchObject({ staged_path: "/tmp/exported.bin" });
+    expect(requests).toEqual([
+      {
+        path: "/artifacts/import-file",
+        body: {
+          staged_path: "upload.bin",
+          mime_type: "application/octet-stream",
+        },
+      },
+      {
+        path: "/artifacts/export-file",
+        body: {
+          id: "artifact-a",
+          file_name: "download.bin",
+        },
+      },
+    ]);
+  });
 });

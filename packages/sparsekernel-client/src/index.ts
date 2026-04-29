@@ -132,6 +132,13 @@ export type SparseKernelCreateArtifactInput = {
   subject?: SparseKernelArtifactSubject;
 };
 
+export type SparseKernelImportArtifactFileInput = {
+  staged_path: string;
+  mime_type?: string | null;
+  retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string | null;
+  subject?: SparseKernelArtifactSubject;
+};
+
 export type SparseKernelArtifactAccessInput = {
   id: string;
   subject?: SparseKernelArtifactSubject;
@@ -140,6 +147,15 @@ export type SparseKernelArtifactAccessInput = {
 export type SparseKernelReadArtifactResult = {
   artifact: SparseKernelArtifact;
   content_base64: string;
+};
+
+export type SparseKernelExportArtifactFileInput = SparseKernelArtifactAccessInput & {
+  file_name?: string | null;
+};
+
+export type SparseKernelExportArtifactFileResult = {
+  artifact: SparseKernelArtifact;
+  staged_path: string;
 };
 
 export type SparseKernelBrowserContext = {
@@ -475,10 +491,25 @@ export class SparseKernelClient {
     return await this.postJson<SparseKernelArtifact>("/artifacts/create", input);
   }
 
+  async importArtifactFile(
+    input: SparseKernelImportArtifactFileInput,
+  ): Promise<SparseKernelArtifact> {
+    return await this.postJson<SparseKernelArtifact>("/artifacts/import-file", input);
+  }
+
   async readArtifact(
     input: SparseKernelArtifactAccessInput,
   ): Promise<SparseKernelReadArtifactResult> {
     return await this.postJson<SparseKernelReadArtifactResult>("/artifacts/read", input);
+  }
+
+  async exportArtifactFile(
+    input: SparseKernelExportArtifactFileInput,
+  ): Promise<SparseKernelExportArtifactFileResult> {
+    return await this.postJson<SparseKernelExportArtifactFileResult>(
+      "/artifacts/export-file",
+      input,
+    );
   }
 
   async artifactMetadata(input: SparseKernelArtifactAccessInput): Promise<SparseKernelArtifact> {

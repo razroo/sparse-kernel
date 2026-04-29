@@ -12,8 +12,10 @@ use sparsekernel_core::{
     SPARSEKERNEL_PROTOCOL_VERSION,
 };
 use std::error::Error;
+use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
+use std::{env, io};
 use tiny_http::{Header, Response, Server};
 
 #[derive(Debug, Parser)]
@@ -371,8 +373,23 @@ struct CreateArtifactRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ImportArtifactFileRequest {
+    staged_path: String,
+    mime_type: Option<String>,
+    retention_policy: Option<String>,
+    subject: Option<ArtifactSubject>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ArtifactAccessRequest {
     id: String,
+    subject: Option<ArtifactSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportArtifactFileRequest {
+    id: String,
+    file_name: Option<String>,
     subject: Option<ArtifactSubject>,
 }
 
@@ -380,6 +397,63 @@ fn artifact_root_path(override_root: Option<&Path>) -> PathBuf {
     override_root
         .map(Path::to_path_buf)
         .unwrap_or_else(|| SparseKernelPaths::from_env().artifact_root)
+}
+
+fn artifact_staging_root(artifact_root: &Path) -> PathBuf {
+    env::var_os("SPARSEKERNEL_ARTIFACT_STAGING_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| artifact_root.join(".staging"))
+}
+
+fn artifact_export_root(artifact_root: &Path) -> PathBuf {
+    env::var_os("SPARSEKERNEL_ARTIFACT_EXPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| artifact_root.join(".exports"))
+}
+
+fn canonical_child_path(root: &Path, raw_path: &str) -> Result<PathBuf, Box<dyn Error>> {
+    fs::create_dir_all(root)?;
+    let canonical_root = root.canonicalize()?;
+    let candidate = Path::new(raw_path);
+    let path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let canonical_path = path.canonicalize()?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!(
+            "artifact file path must be inside {}",
+            canonical_root.display()
+        )
+        .into());
+    }
+    Ok(canonical_path)
+}
+
+fn sanitize_export_file_name(raw: Option<&str>, fallback: &str) -> String {
+    let candidate = raw.unwrap_or(fallback).trim();
+    let sanitized: String = candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('.');
+    if trimmed.is_empty() || trimmed == ".." {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn artifact_export_path(root: &Path, artifact_id: &str, file_name: Option<&str>) -> PathBuf {
+    let safe_name = sanitize_export_file_name(file_name, artifact_id);
+    root.join(safe_name)
 }
 
 fn decode_artifact_content(input: &CreateArtifactRequest) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -436,6 +510,7 @@ pub fn handle_api_request_with_artifact_root(
                     "ledger.v1",
                     "tasks.v1",
                     "artifacts.v1",
+                    "artifacts.file-transfer.v1",
                     "capabilities.v1",
                     "browser-broker.v1",
                     "sandbox-broker.v1"
@@ -777,6 +852,41 @@ pub fn handle_api_request_with_artifact_root(
                 )?)?,
             }
         }
+        ("POST", "/artifacts/import-file") => {
+            let input: ImportArtifactFileRequest = parse_body(body)?;
+            if let Some(subject) = &input.subject {
+                require_artifact_capability(db, subject, None, "write")?;
+            }
+            let artifact_root = artifact_root_path(artifact_root);
+            let staged_path =
+                canonical_child_path(&artifact_staging_root(&artifact_root), &input.staged_path)?;
+            let store = ArtifactStore::new(db, &artifact_root);
+            let subject = input.subject.as_ref().map(|subject| {
+                (
+                    subject.subject_type.as_str(),
+                    subject.subject_id.as_str(),
+                    subject.permission.as_deref().unwrap_or("read"),
+                )
+            });
+            let artifact = store.import_file(
+                &staged_path,
+                input.mime_type.as_deref(),
+                input.retention_policy.as_deref(),
+                subject,
+            )?;
+            db.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "artifact.import_file".to_string(),
+                object_type: Some("artifact".to_string()),
+                object_id: Some(artifact.id.clone()),
+                payload: Some(json!({ "sizeBytes": artifact.size_bytes })),
+            })?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(artifact)?,
+            }
+        }
         ("POST", "/artifacts/read") => {
             let input: ArtifactAccessRequest = parse_body(body)?;
             if let Some(subject) = &input.subject {
@@ -796,6 +906,50 @@ pub fn handle_api_request_with_artifact_root(
                 body: json!({
                     "artifact": db.get_artifact(&input.id)?,
                     "content_base64": BASE64_STANDARD.encode(bytes),
+                }),
+            }
+        }
+        ("POST", "/artifacts/export-file") => {
+            let input: ExportArtifactFileRequest = parse_body(body)?;
+            if let Some(subject) = &input.subject {
+                require_artifact_capability(db, subject, Some(&input.id), "read")?;
+            }
+            let artifact_root = artifact_root_path(artifact_root);
+            let export_root = artifact_export_root(&artifact_root);
+            fs::create_dir_all(&export_root)?;
+            let export_path =
+                artifact_export_path(&export_root, &input.id, input.file_name.as_deref());
+            let canonical_root = export_root.canonicalize()?;
+            let parent = export_path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid artifact export path")
+            })?;
+            fs::create_dir_all(parent)?;
+            let canonical_parent = parent.canonicalize()?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                return Err("artifact export path escaped export root".into());
+            }
+            let store = ArtifactStore::new(db, &artifact_root);
+            let subject = input.subject.as_ref().map(|subject| {
+                (
+                    subject.subject_type.as_str(),
+                    subject.subject_id.as_str(),
+                    subject.permission.as_deref().unwrap_or("read"),
+                )
+            });
+            let artifact = store.export_file(&input.id, &export_path, subject)?;
+            db.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "artifact.export_file".to_string(),
+                object_type: Some("artifact".to_string()),
+                object_id: Some(artifact.id.clone()),
+                payload: Some(json!({ "sizeBytes": artifact.size_bytes })),
+            })?;
+            ApiReply {
+                status_code: 200,
+                body: json!({
+                    "artifact": artifact,
+                    "staged_path": export_path.to_string_lossy().to_string(),
                 }),
             }
         }
@@ -1423,5 +1577,76 @@ mod tests {
             .decode(read["content_base64"].as_str().unwrap())
             .unwrap();
         assert_eq!(decoded, b"hello");
+
+        let staging_dir = root.path().join(".staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let staged_path = staging_dir.join("large.bin");
+        fs::write(&staged_path, b"streamed artifact bytes").unwrap();
+        let imported = json_call_with_artifact_root(
+            &mut db,
+            root.path(),
+            "POST",
+            "/artifacts/import-file",
+            json!({
+                "staged_path": staged_path,
+                "mime_type": "application/octet-stream",
+                "retention_policy": "debug",
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }),
+        );
+        let imported_id = imported["id"].as_str().unwrap().to_string();
+        assert_eq!(imported["size_bytes"], 23);
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "main".to_string(),
+            resource_type: "artifact".to_string(),
+            resource_id: Some(imported_id.clone()),
+            action: "read".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        let exported = json_call_with_artifact_root(
+            &mut db,
+            root.path(),
+            "POST",
+            "/artifacts/export-file",
+            json!({
+                "id": imported_id,
+                "file_name": "exported.bin",
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }),
+        );
+        let exported_path = PathBuf::from(exported["staged_path"].as_str().unwrap());
+        assert!(exported_path.starts_with(root.path().join(".exports")));
+        assert_eq!(fs::read(exported_path).unwrap(), b"streamed artifact bytes");
+
+        let outside_path = root.path().join("outside.bin");
+        fs::write(&outside_path, b"outside").unwrap();
+        let outside = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/import-file",
+            serde_json::to_string(&json!({
+                "staged_path": outside_path,
+                "subject": {
+                    "subject_type": "agent",
+                    "subject_id": "main",
+                    "permission": "read",
+                },
+            }))
+            .unwrap()
+            .as_bytes(),
+            Some(root.path()),
+        );
+        assert!(outside.is_err());
     }
 }

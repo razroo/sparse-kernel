@@ -7,6 +7,7 @@ import {
   runBuiltinFirewallHardEgressHelper,
   type BuiltinFirewallCommand,
   type BuiltinFirewallPlatform,
+  type SandboxWorkerIdentitySnapshot,
 } from "./hard-egress-firewall.js";
 import { resolveNetworkPolicyProxyRef } from "./network-policy.js";
 import type { SandboxAllocationRecord } from "./types.js";
@@ -89,6 +90,7 @@ export type HardEgressEnforcementSnapshot = {
     applied?: boolean;
     limitations?: string[];
   };
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
 };
 
 export type SandboxCommandResult = {
@@ -111,6 +113,7 @@ export type SandboxSpawnCommandRequest = {
   signal?: AbortSignal;
   timeoutMs: number;
   maxOutputBytes: number;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
 };
 
 export interface SandboxBroker {
@@ -160,6 +163,7 @@ type SandboxLeaseMetadata = {
   isolation?: string;
   policy?: SandboxPolicySnapshot;
   hardEgress?: HardEgressEnforcementSnapshot;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
 };
 
 type CommandResolver = (commands: string[]) => string | undefined;
@@ -186,7 +190,31 @@ function readSandboxLeaseMetadata(value: unknown): SandboxLeaseMetadata {
       : {}),
     ...(isRecord(value.policy) ? { policy: value.policy as SandboxPolicySnapshot } : {}),
     ...(isHardEgressEnforcementSnapshot(value.hardEgress) ? { hardEgress: value.hardEgress } : {}),
+    ...(isSandboxWorkerIdentitySnapshot(value.workerIdentity)
+      ? { workerIdentity: value.workerIdentity }
+      : {}),
   };
+}
+
+function isSandboxWorkerIdentitySnapshot(value: unknown): value is SandboxWorkerIdentitySnapshot {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const source = value.source;
+  const scope = value.scope;
+  const uid = value.uid;
+  const gid = value.gid;
+  const sid = value.sid;
+  return (
+    typeof value.id === "string" &&
+    source === "managed_pool" &&
+    isRecord(scope) &&
+    typeof scope.kind === "string" &&
+    typeof scope.value === "string" &&
+    (uid === undefined || typeof uid === "number") &&
+    (gid === undefined || typeof gid === "number") &&
+    (sid === undefined || typeof sid === "string")
+  );
 }
 
 function isHardEgressEnforcementSnapshot(value: unknown): value is HardEgressEnforcementSnapshot {
@@ -393,6 +421,7 @@ function runHardEgressHelper(params: {
   taskId?: string;
   policy?: SandboxPolicySnapshot;
   enforcement?: HardEgressEnforcementSnapshot;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
   env: NodeJS.ProcessEnv;
 }): HardEgressEnforcementSnapshot | undefined {
   const helper = resolveHardEgressHelper(params.env, params.enforcement);
@@ -411,6 +440,7 @@ function runHardEgressHelper(params: {
       backend: params.backend,
       policy: params.policy,
       enforcement: params.enforcement,
+      workerIdentity: params.workerIdentity,
       env: params.env,
     });
   }
@@ -499,6 +529,145 @@ function sandboxNetworkProxyValidationFailure(params: {
     return `backend cannot carry proxy-required sandbox egress in v0: ${params.backend}`;
   }
   return undefined;
+}
+
+function readInteger(value: unknown, name: string): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+function splitListEnv(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function managedIdentityFromRecord(
+  value: Record<string, unknown>,
+  index: number,
+): SandboxWorkerIdentitySnapshot {
+  const uid = readInteger(value.uid, "worker identity uid");
+  const gid = readInteger(value.gid, "worker identity gid");
+  const sid = typeof value.sid === "string" && value.sid.trim() ? value.sid.trim() : undefined;
+  const id =
+    typeof value.id === "string" && value.id.trim()
+      ? value.id.trim()
+      : sid
+        ? `sid:${sid}`
+        : uid !== undefined
+          ? `uid:${uid}${gid !== undefined ? `:gid:${gid}` : ""}`
+          : `worker:${index}`;
+  if (sid) {
+    return {
+      id,
+      source: "managed_pool",
+      sid,
+      scope: { kind: "sid", value: sid },
+    };
+  }
+  if (uid !== undefined) {
+    return {
+      id,
+      source: "managed_pool",
+      uid,
+      ...(gid !== undefined ? { gid } : {}),
+      scope: { kind: "uid", value: String(uid) },
+    };
+  }
+  if (gid !== undefined) {
+    return {
+      id,
+      source: "managed_pool",
+      gid,
+      scope: { kind: "gid", value: String(gid) },
+    };
+  }
+  throw new Error("worker identity requires uid, gid, or sid");
+}
+
+function readManagedWorkerIdentityPool(env: NodeJS.ProcessEnv): SandboxWorkerIdentitySnapshot[] {
+  const rawJson = env.OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITIES?.trim();
+  if (rawJson) {
+    const parsed = JSON.parse(rawJson) as unknown;
+    if (!Array.isArray(parsed)) {
+      throw new Error("OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITIES must be a JSON array");
+    }
+    return parsed.map((entry, index) => {
+      if (!isRecord(entry)) {
+        throw new Error("worker identity entries must be objects");
+      }
+      return managedIdentityFromRecord(entry, index);
+    });
+  }
+  const uids = splitListEnv(env.OPENCLAW_RUNTIME_SANDBOX_WORKER_UIDS);
+  const gids = splitListEnv(env.OPENCLAW_RUNTIME_SANDBOX_WORKER_GIDS);
+  if (uids.length === 0) {
+    return [];
+  }
+  return uids.map((uid, index) =>
+    managedIdentityFromRecord(
+      {
+        uid,
+        ...(gids[index] ? { gid: gids[index] } : {}),
+      },
+      index,
+    ),
+  );
+}
+
+function shouldUseManagedWorkerIdentity(env: NodeJS.ProcessEnv): boolean {
+  const mode = env.OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITY_MODE?.trim().toLowerCase();
+  return (
+    mode === "managed" ||
+    Boolean(env.OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITIES?.trim()) ||
+    Boolean(env.OPENCLAW_RUNTIME_SANDBOX_WORKER_UIDS?.trim())
+  );
+}
+
+function claimManagedWorkerIdentity(params: {
+  db: LocalKernelDatabase;
+  env: NodeJS.ProcessEnv;
+  backend: SandboxBackendKind;
+}): SandboxWorkerIdentitySnapshot | undefined {
+  if (!shouldUseManagedWorkerIdentity(params.env)) {
+    return undefined;
+  }
+  if (params.backend !== "local/no_isolation") {
+    throw new Error(
+      `managed worker identities are only supported for local/no_isolation command workers, got ${params.backend}`,
+    );
+  }
+  const pool = readManagedWorkerIdentityPool(params.env);
+  if (pool.length === 0) {
+    throw new Error("managed worker identity mode requires at least one configured identity");
+  }
+  const active = new Set(
+    params.db
+      .listResourceLeases({ resourceType: "sandbox", status: "active", limit: 1000 })
+      .map((lease) => readSandboxLeaseMetadata(lease.metadata).workerIdentity?.id)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const identity = pool.find((entry) => !active.has(entry.id));
+  if (!identity) {
+    throw new Error(`managed worker identity pool exhausted: ${pool.length} active`);
+  }
+  return identity;
+}
+
+function readProgramFirewallScope(metadata: SandboxLeaseMetadata): string | undefined {
+  const scope = metadata.hardEgress?.firewall?.scope;
+  if (!scope?.startsWith("program:")) {
+    return undefined;
+  }
+  const program = scope.slice("program:".length).trim();
+  return program || undefined;
 }
 
 export function buildSandboxProcessEnv(params: {
@@ -666,10 +835,14 @@ export async function runSandboxSpawnPlan(
   const timeoutMs = Math.max(1, request.timeoutMs);
   const maxOutputBytes = Math.max(1, request.maxOutputBytes);
   return await new Promise<SandboxCommandResult>((resolve, reject) => {
+    const workerIdentity =
+      request.backend === "local/no_isolation" ? request.workerIdentity : undefined;
     const child = spawn(request.spawnPlan.command, request.spawnPlan.args, {
       cwd: request.backend === "local/no_isolation" ? request.cwd : undefined,
       env: buildSandboxProcessEnv({ backend: request.backend, env: request.env }),
       stdio: [request.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      ...(workerIdentity?.uid !== undefined ? { uid: workerIdentity.uid } : {}),
+      ...(workerIdentity?.gid !== undefined ? { gid: workerIdentity.gid } : {}),
     });
     let timedOut = false;
     let stdout = Buffer.alloc(0);
@@ -757,11 +930,20 @@ export class LocalSandboxBroker implements SandboxBroker {
       backend,
     });
     let hardEgress: HardEgressEnforcementSnapshot | undefined;
+    let workerIdentity: SandboxWorkerIdentitySnapshot | undefined;
     if (
       isTruthyRuntimeFlag(process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS) &&
       policy.networkPolicy?.defaultAction === "allow"
     ) {
       try {
+        const helper = resolveHardEgressHelper(process.env);
+        if (isBuiltinFirewallHardEgressHelper(helper.command)) {
+          workerIdentity = claimManagedWorkerIdentity({
+            db: this.db,
+            env: process.env,
+            backend,
+          });
+        }
         hardEgress = runHardEgressHelper({
           action: "allocate",
           allocationId,
@@ -770,6 +952,7 @@ export class LocalSandboxBroker implements SandboxBroker {
           agentId: request.agentId,
           taskId: request.taskId,
           policy,
+          workerIdentity,
           env: process.env,
         });
       } catch (error) {
@@ -782,6 +965,7 @@ export class LocalSandboxBroker implements SandboxBroker {
           payload: {
             backend,
             reason,
+            ...(workerIdentity ? { workerIdentity } : {}),
           },
         });
         throw new Error(`Sandbox requires host-level egress enforcement: ${reason}`);
@@ -795,6 +979,7 @@ export class LocalSandboxBroker implements SandboxBroker {
           backend,
           allocationId,
           enforcement: hardEgress,
+          ...(workerIdentity ? { workerIdentity } : {}),
         },
       });
     }
@@ -844,6 +1029,7 @@ export class LocalSandboxBroker implements SandboxBroker {
           dockerImage: request.requirements?.dockerImage,
           isolation: describeSandboxBackend(backend),
           policy,
+          ...(workerIdentity ? { workerIdentity } : {}),
           ...(hardEgress ? { hardEgress } : {}),
         },
       });
@@ -859,6 +1045,7 @@ export class LocalSandboxBroker implements SandboxBroker {
             taskId: request.taskId,
             policy,
             enforcement: hardEgress,
+            workerIdentity,
             env: process.env,
           });
         } catch {
@@ -879,6 +1066,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         backend,
         isolation: describeSandboxBackend(backend),
         policy,
+        ...(workerIdentity ? { workerIdentity } : {}),
         ...(hardEgress ? { hardEgress } : {}),
       },
     });
@@ -908,6 +1096,7 @@ export class LocalSandboxBroker implements SandboxBroker {
           taskId: lease.ownerTaskId,
           policy: metadata.policy,
           enforcement: metadata.hardEgress,
+          workerIdentity: metadata.workerIdentity,
           env: process.env,
         });
       } catch (error) {
@@ -954,6 +1143,19 @@ export class LocalSandboxBroker implements SandboxBroker {
       throw new Error("Sandbox command is required");
     }
     const metadata = readSandboxLeaseMetadata(lease.metadata);
+    const programScope = readProgramFirewallScope(metadata);
+    if (programScope && command !== programScope) {
+      this.db.recordAudit({
+        actor: { type: "runtime" },
+        action: "sandbox.command_denied_firewall_scope",
+        objectType: "resource_lease",
+        objectId: request.allocationId,
+        payload: { command, requiredProgram: programScope },
+      });
+      throw new Error(
+        `Sandbox command does not match the scoped firewall program: ${programScope}`,
+      );
+    }
     const backend =
       request.backend ?? this.allocationBackends.get(request.allocationId) ?? metadata.backend;
     if (!backend) {
@@ -1029,6 +1231,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         signal: request.signal,
         timeoutMs,
         maxOutputBytes,
+        workerIdentity: backend === "local/no_isolation" ? metadata.workerIdentity : undefined,
       });
       this.db.recordUsage({
         resourceType: "sandbox_runtime",

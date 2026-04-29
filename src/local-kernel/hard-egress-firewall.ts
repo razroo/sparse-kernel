@@ -12,7 +12,17 @@ export type BuiltinFirewallPlatform = "linux_iptables" | "darwin_pf" | "windows_
 export type BuiltinFirewallScope =
   | { kind: "uid"; value: string }
   | { kind: "gid"; value: string }
-  | { kind: "program"; value: string };
+  | { kind: "program"; value: string }
+  | { kind: "sid"; value: string };
+
+export type SandboxWorkerIdentitySnapshot = {
+  id: string;
+  source: "managed_pool";
+  uid?: number;
+  gid?: number;
+  sid?: string;
+  scope: BuiltinFirewallScope;
+};
 
 export type BuiltinFirewallCommand = {
   command: string;
@@ -36,6 +46,7 @@ type BuiltinFirewallRunParams = {
   backend: SandboxBackendKind;
   policy?: SandboxPolicySnapshot;
   enforcement?: HardEgressEnforcementSnapshot;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
   env: NodeJS.ProcessEnv;
 };
 
@@ -86,7 +97,7 @@ function parseScopeValue(raw: string): BuiltinFirewallScope {
   const separator = trimmed.includes(":") ? ":" : trimmed.includes("=") ? "=" : "";
   if (!separator) {
     throw new Error(
-      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE must be uid:<id>, gid:<id>, or program:<path>",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE must be uid:<id>, gid:<id>, sid:<sid>, or program:<path>",
     );
   }
   const [kindRaw = "", ...valueParts] = trimmed.split(separator);
@@ -101,6 +112,12 @@ function parseScopeValue(raw: string): BuiltinFirewallScope {
     }
     return { kind, value };
   }
+  if (kind === "sid") {
+    if (!/^S-\d-\d+(?:-\d+)+$/i.test(value)) {
+      throw new Error("builtin firewall sid scope must be a Windows SID");
+    }
+    return { kind, value };
+  }
   if (kind === "program") {
     if (!value.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(value)) {
       throw new Error("builtin firewall program scope must be an absolute path");
@@ -110,7 +127,14 @@ function parseScopeValue(raw: string): BuiltinFirewallScope {
   throw new Error(`unsupported builtin firewall scope kind: ${kind}`);
 }
 
-function resolveFirewallScope(env: NodeJS.ProcessEnv): BuiltinFirewallScope {
+function resolveFirewallScope(params: {
+  env: NodeJS.ProcessEnv;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
+}): BuiltinFirewallScope {
+  if (params.workerIdentity) {
+    return params.workerIdentity.scope;
+  }
+  const env = params.env;
   const raw = env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE?.trim();
   if (raw) {
     return parseScopeValue(raw);
@@ -126,6 +150,10 @@ function resolveFirewallScope(env: NodeJS.ProcessEnv): BuiltinFirewallScope {
   const program = env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PROGRAM?.trim();
   if (program) {
     return parseScopeValue(`program:${program}`);
+  }
+  const sid = env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SID?.trim();
+  if (sid) {
+    return parseScopeValue(`sid:${sid}`);
   }
   throw new Error("builtin firewall manager requires OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE");
 }
@@ -206,6 +234,15 @@ function linuxOwnerArgs(scope: BuiltinFirewallScope): string[] {
 
 function firewallCommand(command: string, args: string[]): BuiltinFirewallCommand {
   return { command, args };
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function sanitizeFirewallToken(value: string): string {
+  const token = value.replace(/[^A-Za-z0-9_.-]/g, "_");
+  return token || "sandbox";
 }
 
 function buildLinuxIptablesPlan(params: {
@@ -308,6 +345,115 @@ function buildLinuxIptablesPlan(params: {
   };
 }
 
+function buildDarwinPfPlan(params: {
+  allocationId: string;
+  scope: BuiltinFirewallScope;
+  allowedCidrs: string[];
+  env: NodeJS.ProcessEnv;
+}): Pick<BuiltinFirewallEgressPlan, "commands" | "releaseCommands" | "limitations"> {
+  if (params.scope.kind !== "uid" && params.scope.kind !== "gid") {
+    throw new Error("macOS pf firewall manager supports only uid/gid scopes");
+  }
+  const pfctl = params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PFCTL?.trim() || "pfctl";
+  const anchorRoot =
+    params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PF_ANCHOR_ROOT?.trim() ||
+    "com.apple/openclaw_sparsekernel";
+  const anchor = `${anchorRoot}/${sanitizeFirewallToken(params.allocationId)}`;
+  const scopeRule =
+    params.scope.kind === "uid" ? `user ${params.scope.value}` : `group ${params.scope.value}`;
+  const cidrSet = `{ ${params.allowedCidrs.join(" ")} }`;
+  const rules = [
+    `pass out quick proto { tcp udp } ${scopeRule} to ${cidrSet} keep state`,
+    `block drop out quick proto { tcp udp } ${scopeRule}`,
+    "",
+  ].join("\n");
+  const loadScript = `printf %s ${shellSingleQuote(rules)} | ${shellSingleQuote(
+    pfctl,
+  )} -a ${shellSingleQuote(anchor)} -f - && ${shellSingleQuote(pfctl)} -E >/dev/null`;
+  return {
+    commands: [firewallCommand("/bin/sh", ["-c", loadScript])],
+    releaseCommands: [firewallCommand(pfctl, ["-a", anchor, "-F", "all"])],
+    limitations: [
+      "Requires macOS pf administrative privileges and the default com.apple/* anchor point.",
+      "pf user/group matching applies to TCP and UDP socket traffic; use a VM backend for whole-protocol host isolation.",
+      "The UID/GID scope must be dedicated to this SparseKernel allocation or policy can leak between processes sharing the scope.",
+    ],
+  };
+}
+
+function windowsLocalUserSddl(scope: BuiltinFirewallScope): string | undefined {
+  return scope.kind === "sid" ? `D:(A;;CC;;;${scope.value})` : undefined;
+}
+
+function buildWindowsAdvfirewallPlan(params: {
+  allocationId: string;
+  scope: BuiltinFirewallScope;
+  allowedCidrs: string[];
+  env: NodeJS.ProcessEnv;
+}): Pick<BuiltinFirewallEgressPlan, "commands" | "releaseCommands" | "limitations"> {
+  if (
+    !truthy(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED)
+  ) {
+    throw new Error(
+      "Windows builtin firewall manager requires an operator-managed outbound default-block profile; set OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED=1 only after that policy is active",
+    );
+  }
+  if (params.scope.kind !== "sid" && params.scope.kind !== "program") {
+    throw new Error("Windows builtin firewall manager supports only sid/program scopes");
+  }
+  const powershell =
+    params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_POWERSHELL?.trim() || "powershell.exe";
+  const baseName = `OpenClaw-SparseKernel-${sanitizeFirewallToken(params.allocationId)}`;
+  const commands = params.allowedCidrs.map((cidr, index) => {
+    const name = `${baseName}-${index}`;
+    const args = [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "New-NetFirewallRule",
+      "-Name",
+      name,
+      "-DisplayName",
+      name,
+      "-Direction",
+      "Outbound",
+      "-Action",
+      "Allow",
+      "-RemoteAddress",
+      cidr,
+      "-Protocol",
+      "Any",
+      "-Profile",
+      "Any",
+    ];
+    const localUser = windowsLocalUserSddl(params.scope);
+    if (localUser) {
+      args.push("-LocalUser", localUser);
+    } else if (params.scope.kind === "program") {
+      args.push("-Program", params.scope.value);
+    }
+    return firewallCommand(powershell, args);
+  });
+  return {
+    commands,
+    releaseCommands: params.allowedCidrs.map((_, index) =>
+      firewallCommand(powershell, [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Remove-NetFirewallRule",
+        "-Name",
+        `${baseName}-${index}`,
+      ]),
+    ),
+    limitations: [
+      "Requires an operator-managed Windows outbound default-block firewall profile; SparseKernel does not change the global default profile action.",
+      "Explicit Windows block rules take precedence over allow rules, so this manager only installs scoped allow rules under a confirmed default-block profile.",
+      "SID scopes require the command worker to run as the corresponding Windows principal; use an external launcher/helper to materialize that identity.",
+    ],
+  };
+}
+
 export function isBuiltinFirewallHardEgressHelper(command: string): boolean {
   const normalized = command.trim().toLowerCase();
   return (
@@ -322,17 +468,22 @@ export function buildBuiltinFirewallEgressPlan(params: {
   allocationId: string;
   backend: SandboxBackendKind;
   policy?: SandboxPolicySnapshot;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
   env: NodeJS.ProcessEnv;
 }): BuiltinFirewallEgressPlan {
-  if (!truthy(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED)) {
+  if (
+    !params.workerIdentity &&
+    !truthy(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED)
+  ) {
     throw new Error(
       "builtin firewall manager requires OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED=1",
     );
   }
   const platform = normalizePlatform(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM);
-  const scope = resolveFirewallScope(params.env);
+  const scope = resolveFirewallScope({ env: params.env, workerIdentity: params.workerIdentity });
   const allowedCidrs = collectFirewallAllowedCidrs(params.policy);
   const enforcementId = `builtin-firewall:${platform}:${params.allocationId}`;
+  const managedPrefix = params.workerIdentity ? "managed " : "";
   if (platform === "linux_iptables") {
     const linux = buildLinuxIptablesPlan({
       allocationId: params.allocationId,
@@ -347,18 +498,44 @@ export function buildBuiltinFirewallEgressPlan(params: {
       allowedCidrs,
       commands: linux.commands,
       releaseCommands: linux.releaseCommands,
-      description: `Linux iptables owner-match allowlist for ${scope.kind}:${scope.value}`,
+      description: `Linux iptables owner-match allowlist for ${managedPrefix}${scope.kind}:${scope.value}`,
       limitations: linux.limitations,
     };
   }
   if (platform === "darwin_pf") {
-    throw new Error(
-      "builtin firewall manager does not install macOS pf anchors yet; use an external helper, VM, bwrap, or Docker no-network backend",
-    );
+    const darwin = buildDarwinPfPlan({
+      allocationId: params.allocationId,
+      scope,
+      allowedCidrs,
+      env: params.env,
+    });
+    return {
+      platform,
+      enforcementId,
+      scope,
+      allowedCidrs,
+      commands: darwin.commands,
+      releaseCommands: darwin.releaseCommands,
+      description: `macOS pf scoped allowlist for ${managedPrefix}${scope.kind}:${scope.value}`,
+      limitations: darwin.limitations,
+    };
   }
-  throw new Error(
-    "builtin firewall manager does not provide Windows allowlist semantics yet; use an external helper, VM, bwrap, or Docker no-network backend",
-  );
+  const windows = buildWindowsAdvfirewallPlan({
+    allocationId: params.allocationId,
+    scope,
+    allowedCidrs,
+    env: params.env,
+  });
+  return {
+    platform,
+    enforcementId,
+    scope,
+    allowedCidrs,
+    commands: windows.commands,
+    releaseCommands: windows.releaseCommands,
+    description: `Windows Firewall default-block allowlist for ${scope.kind}:${scope.value}`,
+    limitations: windows.limitations,
+  };
 }
 
 function executeFirewallCommands(params: {
@@ -406,6 +583,7 @@ function bestEffortFirewallRelease(params: {
 function assertFirewallScopeMatchesSandboxRunner(params: {
   backend: SandboxBackendKind;
   scope: BuiltinFirewallScope;
+  workerIdentity?: SandboxWorkerIdentitySnapshot;
 }): void {
   if (params.backend !== "local/no_isolation") {
     throw new Error(
@@ -413,6 +591,31 @@ function assertFirewallScopeMatchesSandboxRunner(params: {
     );
   }
   if (params.scope.kind === "uid") {
+    if (params.workerIdentity?.uid !== undefined) {
+      const getuid = process.getuid;
+      if (
+        typeof getuid === "function" &&
+        getuid() !== 0 &&
+        getuid() !== params.workerIdentity.uid
+      ) {
+        throw new Error(
+          "managed worker uid requires the broker to run as root or as the target uid",
+        );
+      }
+      const getgid = process.getgid;
+      if (
+        params.workerIdentity.gid !== undefined &&
+        typeof getgid === "function" &&
+        typeof getuid === "function" &&
+        getuid() !== 0 &&
+        getgid() !== params.workerIdentity.gid
+      ) {
+        throw new Error(
+          "managed worker gid requires the broker to run as root or as the target gid",
+        );
+      }
+      return;
+    }
     const getuid = process.getuid;
     if (typeof getuid !== "function") {
       throw new Error("builtin firewall manager cannot verify local runner uid on this platform");
@@ -425,6 +628,21 @@ function assertFirewallScopeMatchesSandboxRunner(params: {
     return;
   }
   if (params.scope.kind === "gid") {
+    if (params.workerIdentity?.gid !== undefined) {
+      const getgid = process.getgid;
+      const getuid = process.getuid;
+      if (
+        typeof getgid === "function" &&
+        typeof getuid === "function" &&
+        getuid() !== 0 &&
+        getgid() !== params.workerIdentity.gid
+      ) {
+        throw new Error(
+          "managed worker gid requires the broker to run as root or as the target gid",
+        );
+      }
+      return;
+    }
     const getgid = process.getgid;
     if (typeof getgid !== "function") {
       throw new Error("builtin firewall manager cannot verify local runner gid on this platform");
@@ -436,8 +654,11 @@ function assertFirewallScopeMatchesSandboxRunner(params: {
     }
     return;
   }
+  if (params.scope.kind === "program") {
+    return;
+  }
   throw new Error(
-    "builtin firewall program scope is not tied to the local sandbox runner in v0; use an external helper",
+    "builtin firewall scope is not tied to the local sandbox runner in v0; use a managed UID/GID identity, program scope, or an external helper",
   );
 }
 
@@ -476,6 +697,7 @@ export function runBuiltinFirewallHardEgressHelper(
     allocationId: params.allocationId,
     backend: params.backend,
     policy: params.policy,
+    workerIdentity: params.workerIdentity,
     env: params.env,
   });
   if (!truthy(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY)) {
@@ -483,7 +705,11 @@ export function runBuiltinFirewallHardEgressHelper(
       `builtin firewall manager generated a ${plan.platform} plan but will not mutate the host firewall without OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY=1`,
     );
   }
-  assertFirewallScopeMatchesSandboxRunner({ backend: params.backend, scope: plan.scope });
+  assertFirewallScopeMatchesSandboxRunner({
+    backend: params.backend,
+    scope: plan.scope,
+    workerIdentity: params.workerIdentity,
+  });
   try {
     executeFirewallCommands({
       commands: plan.commands,
@@ -507,5 +733,6 @@ export function runBuiltinFirewallHardEgressHelper(
       applied: true,
       limitations: plan.limitations,
     },
+    ...(params.workerIdentity ? { workerIdentity: params.workerIdentity } : {}),
   };
 }

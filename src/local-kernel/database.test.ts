@@ -904,6 +904,68 @@ describe("local runtime kernel database", () => {
     expect(plan.releaseCommands.length).toBeGreaterThan(0);
   });
 
+  it("builds scoped macOS pf firewall plans", () => {
+    const plan = buildBuiltinFirewallEgressPlan({
+      allocationId: "sandbox_test",
+      backend: "local/no_isolation",
+      policy: {
+        trustZoneId: "public_web",
+        backend: "local/no_isolation",
+        networkPolicy: {
+          id: "public_web_default",
+          defaultAction: "allow",
+          allowPrivateNetwork: false,
+          allowedHosts: ["203.0.113.10"],
+          proxyRef: "http://127.0.0.1:8080",
+        },
+      },
+      env: {
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM: "darwin_pf",
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE: "uid:4242",
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED: "1",
+      } as NodeJS.ProcessEnv,
+    });
+    expect(plan.platform).toBe("darwin_pf");
+    expect(plan.commands[0]?.command).toBe("/bin/sh");
+    expect(plan.commands[0]?.args.join(" ")).toContain("pfctl");
+    expect(plan.commands[0]?.args.join(" ")).toContain("user 4242");
+    expect(plan.releaseCommands[0]?.args).toEqual(
+      expect.arrayContaining(["-a", "com.apple/openclaw_sparsekernel/sandbox_test"]),
+    );
+  });
+
+  it("builds scoped Windows default-block allowlist plans", () => {
+    const sid = "S-1-5-21-1000-1000-1000-1001";
+    const plan = buildBuiltinFirewallEgressPlan({
+      allocationId: "sandbox_test",
+      backend: "local/no_isolation",
+      policy: {
+        trustZoneId: "public_web",
+        backend: "local/no_isolation",
+        networkPolicy: {
+          id: "public_web_default",
+          defaultAction: "allow",
+          allowPrivateNetwork: false,
+          allowedHosts: ["203.0.113.10"],
+        },
+      },
+      env: {
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM: "windows_advfirewall",
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE: `sid:${sid}`,
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED: "1",
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED: "1",
+      } as NodeJS.ProcessEnv,
+    });
+    expect(plan.platform).toBe("windows_advfirewall");
+    expect(plan.commands[0]?.command).toBe("powershell.exe");
+    expect(plan.commands[0]?.args).toEqual(
+      expect.arrayContaining(["-LocalUser", `D:(A;;CC;;;${sid})`]),
+    );
+    expect(plan.releaseCommands[0]?.args).toEqual(
+      expect.arrayContaining(["Remove-NetFirewallRule"]),
+    );
+  });
+
   it("rejects firewall plans that cannot be expressed as a host firewall allowlist", () => {
     expect(() =>
       buildBuiltinFirewallEgressPlan({
@@ -926,6 +988,147 @@ describe("local runtime kernel database", () => {
         } as NodeJS.ProcessEnv,
       }),
     ).toThrow(/IP\/CIDR allowed_hosts/);
+  });
+
+  it("allocates builtin firewall leases with broker-managed worker identities", async () => {
+    if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
+      return;
+    }
+    const trueCommand = fs.existsSync("/usr/bin/true") ? "/usr/bin/true" : "true";
+    const uid = process.getuid();
+    const gid = process.getgid();
+    const envNames = [
+      "OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_IPTABLES",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_IP6TABLES",
+      "OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITIES",
+      "OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITY_MODE",
+    ];
+    const previous = new Map(envNames.map((name) => [name, process.env[name]]));
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = "builtin-firewall";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM = "linux_iptables";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE;
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_IPTABLES = trueCommand;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_IP6TABLES = trueCommand;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITY_MODE = "managed";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITIES = JSON.stringify([
+      { id: "current", uid, gid },
+    ]);
+    try {
+      const db = openTempDb();
+      db.db
+        .prepare("UPDATE network_policies SET proxy_ref = ? WHERE id = 'public_web_default'")
+        .run("http://127.0.0.1:8080");
+      const broker = new LocalSandboxBroker(db);
+      const allocation = broker.allocateSandbox({
+        taskId: "task-a",
+        trustZoneId: "public_web",
+        requirements: { backend: "local/no_isolation" },
+      });
+      const metadata = db.getResourceLease(allocation.id)?.metadata;
+      expect(metadata).toMatchObject({
+        workerIdentity: {
+          id: "current",
+          uid,
+          gid,
+        },
+        hardEgress: {
+          helper: "builtin-firewall",
+          boundary: "host_firewall",
+          workerIdentity: {
+            id: "current",
+          },
+        },
+      });
+      const result = await broker.runCommand({
+        allocationId: allocation.id,
+        command: process.execPath,
+        args: ["-e", "console.log(`${process.getuid?.()}:${process.getgid?.()}`)"],
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(`${uid}:${gid}`);
+      expect(broker.releaseSandbox(allocation.id)).toBe(true);
+    } finally {
+      for (const name of envNames) {
+        const value = previous.get(name);
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
+  });
+
+  it("enforces program-scoped Windows firewall leases at command execution", async () => {
+    const trueCommand = fs.existsSync("/usr/bin/true") ? "/usr/bin/true" : "true";
+    const envNames = [
+      "OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_POWERSHELL",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED",
+    ];
+    const previous = new Map(envNames.map((name) => [name, process.env[name]]));
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = "builtin-firewall";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM = "windows_advfirewall";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE = `program:${process.execPath}`;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_POWERSHELL = trueCommand;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED = "1";
+    try {
+      const db = openTempDb();
+      db.db
+        .prepare("UPDATE network_policies SET proxy_ref = ? WHERE id = 'public_web_default'")
+        .run("http://127.0.0.1:8080");
+      const broker = new LocalSandboxBroker(db);
+      const allocation = broker.allocateSandbox({
+        taskId: "task-a",
+        trustZoneId: "public_web",
+        requirements: { backend: "local/no_isolation" },
+      });
+      await expect(
+        broker.runCommand({
+          allocationId: allocation.id,
+          command: "/bin/echo",
+          args: ["blocked"],
+        }),
+      ).rejects.toThrow(/scoped firewall program/);
+      const result = await broker.runCommand({
+        allocationId: allocation.id,
+        command: process.execPath,
+        args: ["-e", "console.log('ok')"],
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("ok");
+      expect(broker.releaseSandbox(allocation.id)).toBe(true);
+    } finally {
+      for (const name of envNames) {
+        const value = previous.get(name);
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
   });
 
   it("fails closed for builtin firewall hard egress without explicit host mutation", () => {

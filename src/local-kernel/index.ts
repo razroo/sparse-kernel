@@ -42,6 +42,7 @@ export type {
   BuiltinFirewallEgressPlan,
   BuiltinFirewallPlatform,
   BuiltinFirewallScope,
+  SandboxWorkerIdentitySnapshot,
 } from "./hard-egress-firewall.js";
 export {
   compactLedgerContent,

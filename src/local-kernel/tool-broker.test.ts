@@ -330,6 +330,68 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("can run an opt-in plugin tool through a subprocess worker", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-plugin-worker-"));
+    const workerPath = path.join(root, "worker.mjs");
+    fs.writeFileSync(
+      workerPath,
+      [
+        "let input = '';",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', chunk => { input += chunk; });",
+        "process.stdin.on('end', () => {",
+        "  const request = JSON.parse(input);",
+        "  process.stdout.write(JSON.stringify({",
+        "    content: [{ type: 'text', text: `worker:${request.params.value}` }],",
+        "    details: { pluginId: request.pluginId, toolName: request.toolName }",
+        "  }));",
+        "});",
+      ].join("\n"),
+    );
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "plugin_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("plugin_tool");
+      setPluginToolMeta(rawTool, {
+        pluginId: "community-plugin",
+        optional: false,
+        subprocess: {
+          command: process.execPath,
+          args: [workerPath],
+          timeoutMs: 5_000,
+        },
+      });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "subprocess" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-plugin-worker", { value: "ok" })).resolves.toEqual({
+        content: [{ type: "text", text: "worker:ok" }],
+        details: { pluginId: "community-plugin", toolName: "plugin_tool" },
+      });
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining([
+          "plugin_tool.subprocess_started",
+          "plugin_tool.subprocess_finished",
+          "tool_call.completed",
+        ]),
+      );
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not auto-grant sensitive tools in strict capability mode", async () => {
     const run = brokerToolsForRun({
       tools: [makeTool("exec")],
@@ -881,6 +943,7 @@ describe("CapabilityToolBroker", () => {
     const nativeAcquire = vi.fn(
       async (input: NativeBrowserProcessAcquireInput): Promise<NativeBrowserProcessLease> => {
         expect(input.trustZoneId).toBe("authenticated_web");
+        expect(input.proxyServer).toBe("http://127.0.0.1:18080/");
         return {
           cdpEndpoint: "http://127.0.0.1:19222",
           trustZoneId: input.trustZoneId,
@@ -892,7 +955,10 @@ describe("CapabilityToolBroker", () => {
     );
     const proxyInputs: SparseKernelBrowserToolCdpProxyInput[] = [];
     const broker = new CapabilityToolBroker(db, {
-      env: { OPENCLAW_RUNTIME_BROWSER_BROKER: "native" } as NodeJS.ProcessEnv,
+      env: {
+        OPENCLAW_RUNTIME_BROWSER_BROKER: "native",
+        OPENCLAW_RUNTIME_BROWSER_REQUIRE_PROXY: "1",
+      } as NodeJS.ProcessEnv,
       browserNativeAcquire: nativeAcquire,
       browserCdpProxyFactory: async (input) => {
         proxyInputs.push(input);
@@ -922,6 +988,9 @@ describe("CapabilityToolBroker", () => {
         resourceId: "browser",
         action: "invoke",
       });
+      db.db
+        .prepare("UPDATE network_policies SET proxy_ref = ? WHERE id = 'authenticated_web_default'")
+        .run("http://127.0.0.1:18080/");
       const tool = broker.wrapTool(
         {
           name: "browser",

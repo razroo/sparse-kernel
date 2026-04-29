@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acquireNativeBrowserProcess,
+  inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
   stopAllNativeBrowserProcesses,
 } from "./browser-process-pool.js";
@@ -78,6 +79,7 @@ describe("native browser process pool", () => {
     );
     expect(spawnCalls[0]?.args.some((arg) => arg.startsWith("--user-data-dir="))).toBe(true);
     expect(spawnCalls[0]?.args).not.toContain("--no-sandbox");
+    expect(spawnCalls[0]?.args).toContain("--no-proxy-server");
     expect(fakeProcess.unref).toHaveBeenCalledTimes(1);
 
     await first.release();
@@ -87,6 +89,14 @@ describe("native browser process pool", () => {
     expect(fakeProcess.kill).not.toHaveBeenCalled();
     await second.release();
     expect(fakeProcess.kill).toHaveBeenCalledTimes(1);
+    expect(inspectNativeBrowserPoolStats()).toEqual([
+      expect.objectContaining({
+        key: "public_web:default",
+        starts: 1,
+        cleanStops: 1,
+        crashes: 0,
+      }),
+    ]);
 
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -131,6 +141,42 @@ describe("native browser process pool", () => {
       }),
     ).rejects.toThrow(/no available context slots/);
     await first.release();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("can launch a native pool through an explicit proxy server", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-browser-pool-"));
+    const fakeExecutable = path.join(root, "chrome");
+    fs.writeFileSync(fakeExecutable, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(fakeExecutable, 0o700);
+
+    const fakeProcess = new FakeBrowserProcess();
+    const spawnCalls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
+    const spawnImpl = vi.fn((command: string, args?: readonly string[], options?: SpawnOptions) => {
+      spawnCalls.push({ command, args: [...(args ?? [])], options: options ?? {} });
+      return fakeProcess as unknown as ChildProcess;
+    }) as unknown as typeof spawn;
+    const fetchImpl = vi.fn(async () =>
+      Response.json({ Browser: "Chrome/123" }),
+    ) as unknown as typeof fetch;
+    const env = {
+      OPENCLAW_STATE_DIR: root,
+      OPENCLAW_SPARSEKERNEL_BROWSER_EXECUTABLE: fakeExecutable,
+    } as NodeJS.ProcessEnv;
+
+    const lease = await acquireNativeBrowserProcess({
+      trustZoneId: "public_web",
+      env,
+      fetchImpl,
+      spawnImpl,
+      allocatePort: async () => 19224,
+      idleTimeoutMs: 0,
+      proxyServer: "http://127.0.0.1:18080/",
+    });
+
+    expect(spawnCalls[0]?.args).toContain("--proxy-server=http://127.0.0.1:18080/");
+    expect(spawnCalls[0]?.args).not.toContain("--no-proxy-server");
+    await lease.release();
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

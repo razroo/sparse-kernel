@@ -6,6 +6,7 @@ export type ManagedBrowserCdpEndpointInput = {
   profile?: string;
   trustZoneId?: string;
   timeoutMs?: number;
+  proxyServer?: string;
   nativeAcquire?: typeof acquireNativeBrowserProcess;
 };
 
@@ -46,6 +47,7 @@ export async function resolveSparseKernelBrowserCdpEndpoint(
       profile: input.profile,
       trustZoneId: input.trustZoneId ?? "public_web",
       readyTimeoutMs: input.timeoutMs,
+      proxyServer: input.proxyServer,
     });
     return {
       cdpEndpoint: lease.cdpEndpoint,

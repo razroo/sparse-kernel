@@ -13,6 +13,10 @@ export type NetworkPolicyDnsLookup = (
   options: { all: true },
 ) => Promise<Array<{ address: string; family: number }>>;
 
+export type NetworkPolicyProxyDecision =
+  | { ok: true; proxyServer: string }
+  | { ok: false; reason: string };
+
 function hostMatchesPattern(host: string, pattern: string): boolean {
   const normalizedHost = host.toLowerCase();
   const normalizedPattern = pattern.trim().toLowerCase();
@@ -31,6 +35,34 @@ function normalizeUrlHostname(host: string): string {
     return host.slice(1, -1);
   }
   return host;
+}
+
+function normalizeProxyHost(host: string): string {
+  return normalizeUrlHostname(host).toLowerCase();
+}
+
+export function resolveNetworkPolicyProxyRef(
+  proxyRef: string | undefined,
+): NetworkPolicyProxyDecision {
+  const raw = proxyRef?.trim();
+  if (!raw) {
+    return { ok: false, reason: "missing proxy_ref" };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return { ok: false, reason: "invalid proxy_ref url" };
+  }
+  if (!["http:", "https:", "socks5:"].includes(parsed.protocol)) {
+    return { ok: false, reason: "unsupported proxy_ref scheme" };
+  }
+  const host = normalizeProxyHost(parsed.hostname);
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") {
+    return { ok: false, reason: "proxy_ref must be loopback in v0" };
+  }
+  parsed.hash = "";
+  return { ok: true, proxyServer: parsed.toString() };
 }
 
 function isPrivateIpv4(host: string): boolean {

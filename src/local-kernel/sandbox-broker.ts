@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import type { LocalKernelDatabase } from "./database.js";
+import { resolveNetworkPolicyProxyRef } from "./network-policy.js";
 import type { SandboxAllocationRecord } from "./types.js";
 
 export type SandboxBackendKind =
@@ -38,6 +39,31 @@ export type SandboxCommandRequest = {
   env?: Record<string, string>;
   timeoutMs?: number;
   maxOutputBytes?: number;
+};
+
+export type DockerSandboxPolicy = {
+  networkMode: "none" | "bridge";
+  proxyServer?: string;
+  memoryMb?: number;
+  pidsLimit?: number;
+  readOnlyRoot?: boolean;
+  tmpfs?: string[];
+};
+
+export type SandboxPolicySnapshot = {
+  trustZoneId: string;
+  backend: SandboxBackendKind;
+  filesystemPolicy?: unknown;
+  maxProcesses?: number;
+  maxMemoryMb?: number;
+  maxRuntimeSeconds?: number;
+  networkPolicy?: {
+    id: string;
+    defaultAction: "allow" | "deny";
+    allowPrivateNetwork: boolean;
+    proxyRef?: string;
+  };
+  docker?: DockerSandboxPolicy;
 };
 
 export type SandboxCommandResult = {
@@ -95,6 +121,7 @@ type SandboxLeaseMetadata = {
   backend?: SandboxBackendKind;
   dockerImage?: string;
   isolation?: string;
+  policy?: SandboxPolicySnapshot;
 };
 
 type CommandResolver = (commands: string[]) => string | undefined;
@@ -115,7 +142,55 @@ function readSandboxLeaseMetadata(value: unknown): SandboxLeaseMetadata {
     ...(typeof value.isolation === "string" && value.isolation.trim()
       ? { isolation: value.isolation.trim() }
       : {}),
+    ...(isRecord(value.policy) ? { policy: value.policy as SandboxPolicySnapshot } : {}),
   };
+}
+
+function resolveSandboxPolicySnapshot(params: {
+  db: LocalKernelDatabase;
+  trustZoneId: string;
+  backend: SandboxBackendKind;
+}): SandboxPolicySnapshot {
+  const zone = params.db.listTrustZones().find((entry) => entry.id === params.trustZoneId);
+  const networkPolicy = params.db.getNetworkPolicyForTrustZone(params.trustZoneId);
+  const proxyDecision = resolveNetworkPolicyProxyRef(networkPolicy?.proxyRef);
+  const dockerNetworkMode =
+    networkPolicy?.defaultAction === "allow" && proxyDecision.ok ? "bridge" : "none";
+  return {
+    trustZoneId: params.trustZoneId,
+    backend: params.backend,
+    ...(zone?.filesystemPolicy !== undefined ? { filesystemPolicy: zone.filesystemPolicy } : {}),
+    ...(zone?.maxProcesses !== undefined ? { maxProcesses: zone.maxProcesses } : {}),
+    ...(zone?.maxMemoryMb !== undefined ? { maxMemoryMb: zone.maxMemoryMb } : {}),
+    ...(zone?.maxRuntimeSeconds !== undefined ? { maxRuntimeSeconds: zone.maxRuntimeSeconds } : {}),
+    ...(networkPolicy
+      ? {
+          networkPolicy: {
+            id: networkPolicy.id,
+            defaultAction: networkPolicy.defaultAction,
+            allowPrivateNetwork: networkPolicy.allowPrivateNetwork,
+            ...(networkPolicy.proxyRef ? { proxyRef: networkPolicy.proxyRef } : {}),
+          },
+        }
+      : {}),
+    docker: {
+      networkMode: dockerNetworkMode,
+      ...(proxyDecision.ok ? { proxyServer: proxyDecision.proxyServer } : {}),
+      ...(zone?.maxMemoryMb !== undefined ? { memoryMb: zone.maxMemoryMb } : {}),
+      ...(zone?.maxProcesses !== undefined ? { pidsLimit: zone.maxProcesses } : {}),
+      readOnlyRoot: zone?.filesystemPolicy
+        ? readFilesystemMode(zone.filesystemPolicy) !== "readwrite"
+        : true,
+      tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"],
+    },
+  };
+}
+
+function readFilesystemMode(policy: unknown): string {
+  if (!isRecord(policy)) {
+    return "";
+  }
+  return typeof policy.mode === "string" ? policy.mode : "";
 }
 
 function describeSandboxBackend(backend: SandboxBackendKind): string {
@@ -150,6 +225,7 @@ export function buildSandboxSpawnPlan(params: {
   cwd?: string;
   env?: Record<string, string>;
   dockerImage?: string;
+  dockerPolicy?: DockerSandboxPolicy;
   resolveCommand?: CommandResolver;
 }): SandboxSpawnPlan {
   const resolveCommand = params.resolveCommand ?? firstAvailableCommand;
@@ -213,8 +289,39 @@ export function buildSandboxSpawnPlan(params: {
           "Sandbox backend docker requires an explicit dockerImage or OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE.",
         );
       }
-      const args = ["run", "--rm", "--pull", "never", "--network", "none"];
-      for (const [name, value] of Object.entries(params.env ?? {})) {
+      const dockerPolicy = params.dockerPolicy ?? { networkMode: "none" as const };
+      const args = [
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        dockerPolicy.networkMode,
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+      ];
+      if (dockerPolicy.readOnlyRoot !== false) {
+        args.push("--read-only");
+      }
+      for (const tmpfs of dockerPolicy.tmpfs ?? ["/tmp:rw,nosuid,nodev,noexec,size=64m"]) {
+        args.push("--tmpfs", tmpfs);
+      }
+      if (dockerPolicy.memoryMb) {
+        args.push("--memory", `${Math.max(1, Math.trunc(dockerPolicy.memoryMb))}m`);
+      }
+      if (dockerPolicy.pidsLimit) {
+        args.push("--pids-limit", String(Math.max(1, Math.trunc(dockerPolicy.pidsLimit))));
+      }
+      const env = { ...(params.env ?? {}) };
+      if (dockerPolicy.proxyServer) {
+        env.HTTP_PROXY ??= dockerPolicy.proxyServer;
+        env.HTTPS_PROXY ??= dockerPolicy.proxyServer;
+        env.ALL_PROXY ??= dockerPolicy.proxyServer;
+        env.NO_PROXY ??= "127.0.0.1,localhost,::1";
+      }
+      for (const [name, value] of Object.entries(env)) {
         if (validDockerEnvName(name)) {
           args.push("--env", `${name}=${value}`);
         }
@@ -270,6 +377,11 @@ export class LocalSandboxBroker implements SandboxBroker {
       });
       throw new Error(`Sandbox backend unavailable: ${backend}`);
     }
+    const policy = resolveSandboxPolicySnapshot({
+      db: this.db,
+      trustZoneId: request.trustZoneId,
+      backend,
+    });
     const allocationId = `sandbox_${crypto.randomUUID()}`;
     const ownerTaskId =
       request.taskId && this.db.getTask(request.taskId) ? request.taskId : undefined;
@@ -288,6 +400,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         backend,
         dockerImage: request.requirements?.dockerImage,
         isolation: describeSandboxBackend(backend),
+        policy,
       },
     });
     this.db.recordAudit({
@@ -300,6 +413,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         trustZoneId: request.trustZoneId,
         backend,
         isolation: describeSandboxBackend(backend),
+        policy,
       },
     });
     this.allocationBackends.set(allocationId, backend);
@@ -370,6 +484,7 @@ export class LocalSandboxBroker implements SandboxBroker {
           request.dockerImage ??
           metadata.dockerImage ??
           process.env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE,
+        dockerPolicy: metadata.policy?.docker,
       });
     } catch (error) {
       this.db.recordAudit({

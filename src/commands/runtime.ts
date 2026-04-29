@@ -9,6 +9,7 @@ import {
   ContentAddressedArtifactStore,
   exportSessionAsJsonl,
   importLegacySessionStore,
+  inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
   openLocalKernelDatabase,
   recoverEmbeddedRunTasks,
@@ -392,12 +393,15 @@ export async function runtimeBrowserPoolsCommand(
     const nativePools = inspectNativeBrowserPools().filter(
       (pool) => !opts.trustZone || pool.trustZoneId === opts.trustZone,
     );
-    const result = { ledgerPools, nativePools };
+    const nativeStats = inspectNativeBrowserPoolStats().filter(
+      (pool) => !opts.trustZone || pool.trustZoneId === opts.trustZone,
+    );
+    const result = { ledgerPools, nativePools, nativeStats };
     if (opts.json) {
       writeRuntimeJson(runtime, result);
       return;
     }
-    if (ledgerPools.length === 0 && nativePools.length === 0) {
+    if (ledgerPools.length === 0 && nativePools.length === 0 && nativeStats.length === 0) {
       runtime.log("No SparseKernel browser pools found.");
       return;
     }
@@ -409,6 +413,11 @@ export async function runtimeBrowserPoolsCommand(
     for (const pool of nativePools) {
       runtime.log(
         `native:${pool.key} trustZone=${pool.trustZoneId} profile=${pool.profile} refs=${pool.refs}/${pool.maxContexts} exited=${pool.exited} endpoint=${pool.cdpEndpoint}`,
+      );
+    }
+    for (const stats of nativeStats) {
+      runtime.log(
+        `native-stats:${stats.key} starts=${stats.starts} cleanStops=${stats.cleanStops} crashes=${stats.crashes} lastExit=${stats.lastExitAt ?? "-"}`,
       );
     }
   } finally {

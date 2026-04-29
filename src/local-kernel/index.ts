@@ -4,6 +4,7 @@ export { LocalBrowserBroker } from "./browser-broker.js";
 export type { BrowserBroker, BrowserContextLeaseRequest } from "./browser-broker.js";
 export {
   acquireNativeBrowserProcess,
+  inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
   resolveNativeBrowserExecutable,
   stopAllNativeBrowserProcesses,
@@ -11,12 +12,21 @@ export {
 export type {
   NativeBrowserProcessAcquireInput,
   NativeBrowserProcessLease,
+  NativeBrowserPoolStatsSnapshot,
   NativeBrowserPoolSnapshot,
 } from "./browser-process-pool.js";
 export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
-export { checkTrustZoneNetworkUrl, checkTrustZoneNetworkUrlWithDns } from "./network-policy.js";
-export type { NetworkPolicyDecision, NetworkPolicyDnsLookup } from "./network-policy.js";
+export {
+  checkTrustZoneNetworkUrl,
+  checkTrustZoneNetworkUrlWithDns,
+  resolveNetworkPolicyProxyRef,
+} from "./network-policy.js";
+export type {
+  NetworkPolicyDecision,
+  NetworkPolicyDnsLookup,
+  NetworkPolicyProxyDecision,
+} from "./network-policy.js";
 export {
   compactLedgerContent,
   materializeEmbeddedRunInKernel,
@@ -47,6 +57,7 @@ export type {
   SandboxCommandRequest,
   SandboxCommandResult,
   SandboxBroker,
+  SandboxPolicySnapshot,
   SandboxSpawnPlan,
 } from "./sandbox-broker.js";
 export { buildSandboxSpawnPlan, isSandboxBackendAvailable } from "./sandbox-broker.js";

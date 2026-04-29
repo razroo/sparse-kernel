@@ -548,7 +548,13 @@ describe("local runtime kernel database", () => {
       requirements: { backend: "local/no_isolation", maxRuntimeMs: 5_000 },
     });
     expect(db.getResourceLease(allocation.id)).toMatchObject({
-      metadata: expect.objectContaining({ backend: "local/no_isolation" }),
+      metadata: expect.objectContaining({
+        backend: "local/no_isolation",
+        policy: expect.objectContaining({
+          trustZoneId: "code_execution",
+          backend: "local/no_isolation",
+        }),
+      }),
     });
     await expect(
       new LocalSandboxBroker(db).runCommand({
@@ -626,6 +632,13 @@ describe("local runtime kernel database", () => {
         args: ["-v"],
         cwd: "/work",
         dockerImage: "openclaw-runtime:local",
+        dockerPolicy: {
+          networkMode: "bridge",
+          proxyServer: "http://127.0.0.1:18080/",
+          memoryMb: 512,
+          pidsLimit: 16,
+          readOnlyRoot: true,
+        },
         env: { SAFE_ENV: "1", "BAD-NAME": "skip" },
         resolveCommand: () => "docker",
       }),
@@ -637,9 +650,20 @@ describe("local runtime kernel database", () => {
         "--pull",
         "never",
         "--network",
-        "none",
+        "bridge",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--memory",
+        "512m",
+        "--pids-limit",
+        "16",
         "--env",
         "SAFE_ENV=1",
+        "--env",
+        "HTTP_PROXY=http://127.0.0.1:18080/",
         "-v",
         "/work:/workspace:rw",
         "openclaw-runtime:local",

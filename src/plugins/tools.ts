@@ -16,6 +16,12 @@ import type { OpenClawPluginToolContext } from "./types.js";
 export type PluginToolMeta = {
   pluginId: string;
   optional: boolean;
+  subprocess?: {
+    command: string;
+    args?: string[];
+    cwd?: string;
+    timeoutMs?: number;
+  };
 };
 
 const pluginToolMeta = new WeakMap<AnyAgentTool, PluginToolMeta>();

@@ -1,6 +1,7 @@
+import { spawn } from "node:child_process";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
 import type { AnyAgentTool } from "../agents/tools/common.js";
-import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
+import { copyPluginToolMeta, getPluginToolMeta, type PluginToolMeta } from "../plugins/tools.js";
 import { ContentAddressedArtifactStore } from "./artifact-store.js";
 import { LocalBrowserBroker } from "./browser-broker.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
@@ -8,7 +9,11 @@ import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
 import { attachSparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 import type { LocalKernelDatabase } from "./database.js";
-import { checkTrustZoneNetworkUrl, checkTrustZoneNetworkUrlWithDns } from "./network-policy.js";
+import {
+  checkTrustZoneNetworkUrl,
+  checkTrustZoneNetworkUrlWithDns,
+  resolveNetworkPolicyProxyRef,
+} from "./network-policy.js";
 import { LocalSandboxBroker, type SandboxBackendKind } from "./sandbox-broker.js";
 
 const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
@@ -91,6 +96,22 @@ function requiresPluginSubprocess(raw: string | undefined): boolean {
   );
 }
 
+function resolvePluginSubprocessPlan(
+  meta: PluginToolMeta | undefined,
+): PluginToolMeta["subprocess"] {
+  if (!meta?.subprocess?.command?.trim()) {
+    return undefined;
+  }
+  return {
+    command: meta.subprocess.command.trim(),
+    args: meta.subprocess.args?.map(String) ?? [],
+    ...(meta.subprocess.cwd?.trim() ? { cwd: meta.subprocess.cwd.trim() } : {}),
+    ...(typeof meta.subprocess.timeoutMs === "number" && Number.isFinite(meta.subprocess.timeoutMs)
+      ? { timeoutMs: Math.max(1, Math.trunc(meta.subprocess.timeoutMs)) }
+      : {}),
+  };
+}
+
 export function isSandboxCommandToolName(name: string): boolean {
   const normalized = name.trim().toLowerCase();
   return normalized === "exec" || normalized === "bash" || normalized === "shell";
@@ -162,13 +183,15 @@ export class CapabilityToolBroker {
           throw err;
         }
         const env = this.options.env ?? process.env;
+        const pluginSubprocessPlan = resolvePluginSubprocessPlan(pluginMeta);
         if (
           pluginMeta &&
           (requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
-            requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS))
+            requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS)) &&
+          !pluginSubprocessPlan
         ) {
           const err = new Error(
-            `Plugin tool ${tool.name} from ${pluginMeta.pluginId} requires out-of-process execution, which is not implemented in v0.`,
+            `Plugin tool ${tool.name} from ${pluginMeta.pluginId} requires out-of-process execution, but no subprocess worker is configured.`,
           );
           this.db.recordAudit({
             actor: { type: context.subject.subjectType, id: context.subject.subjectId },
@@ -186,6 +209,24 @@ export class CapabilityToolBroker {
         }
         this.db.startToolCall(toolCallDbId);
         try {
+          if (pluginSubprocessPlan && pluginMeta) {
+            const result = await this.runPluginToolSubprocess({
+              plan: pluginSubprocessPlan,
+              pluginMeta,
+              tool,
+              toolCallId,
+              params,
+              context,
+              signal,
+            });
+            const ledgerOutput = await this.prepareToolOutputForLedger(
+              toolCallDbId,
+              context,
+              result,
+            );
+            this.db.finishToolCall(toolCallDbId, ledgerOutput);
+            return result;
+          }
           const sandboxResult = await this.maybeRunBrokeredSandboxCommand(tool, context, params);
           if (sandboxResult) {
             const ledgerOutput = await this.prepareToolOutputForLedger(
@@ -228,6 +269,121 @@ export class CapabilityToolBroker {
     if (rejected?.status === "rejected") {
       throw rejected.reason;
     }
+  }
+
+  private async runPluginToolSubprocess(input: {
+    plan: NonNullable<PluginToolMeta["subprocess"]>;
+    pluginMeta: PluginToolMeta;
+    tool: AnyAgentTool;
+    toolCallId: string;
+    params: unknown;
+    context: ToolBrokerContext;
+    signal?: AbortSignal;
+  }): Promise<AgentToolResult<unknown>> {
+    const timeoutMs = Math.max(1, input.plan.timeoutMs ?? 30_000);
+    const payload = JSON.stringify({
+      protocol: "openclaw.sparsekernel.plugin_tool.v1",
+      pluginId: input.pluginMeta.pluginId,
+      toolName: input.tool.name,
+      toolCallId: input.toolCallId,
+      params: input.params,
+      context: {
+        agentId: input.context.agentId,
+        sessionId: input.context.sessionId,
+        taskId: input.context.taskId,
+        runId: input.context.runId,
+        subject: input.context.subject,
+      },
+    });
+    this.db.recordAudit({
+      actor: { type: input.context.subject.subjectType, id: input.context.subject.subjectId },
+      action: "plugin_tool.subprocess_started",
+      objectType: "tool",
+      objectId: input.tool.name,
+      payload: {
+        pluginId: input.pluginMeta.pluginId,
+        command: input.plan.command,
+        args: input.plan.args ?? [],
+        timeoutMs,
+      },
+    });
+
+    return await new Promise<AgentToolResult<unknown>>((resolve, reject) => {
+      const child = spawn(input.plan.command, input.plan.args ?? [], {
+        cwd: input.plan.cwd,
+        env: process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        input.signal?.removeEventListener("abort", abort);
+        fn();
+      };
+      const abort = () => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        finish(() => reject(new Error("Plugin subprocess aborted.")));
+      };
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        finish(() => reject(new Error(`Plugin subprocess timed out after ${timeoutMs}ms.`)));
+      }, timeoutMs);
+      timer.unref?.();
+      input.signal?.addEventListener("abort", abort, { once: true });
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.on("error", (error) => {
+        finish(() => reject(error));
+      });
+      child.on("close", (exitCode, signal) => {
+        finish(() => {
+          if (exitCode !== 0) {
+            reject(
+              new Error(
+                `Plugin subprocess failed: exit=${exitCode ?? signal ?? "unknown"} stderr=${stderr.trim()}`,
+              ),
+            );
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout) as AgentToolResult<unknown>);
+          } catch (error) {
+            reject(
+              new Error(
+                `Plugin subprocess returned invalid JSON: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              ),
+            );
+          }
+        });
+      });
+      child.stdin.end(payload);
+    }).finally(() => {
+      this.db.recordAudit({
+        actor: { type: input.context.subject.subjectType, id: input.context.subject.subjectId },
+        action: "plugin_tool.subprocess_finished",
+        objectType: "tool",
+        objectId: input.tool.name,
+        payload: { pluginId: input.pluginMeta.pluginId },
+      });
+    });
   }
 
   private async prepareToolOutputForLedger(
@@ -319,6 +475,33 @@ export class CapabilityToolBroker {
     const shouldEnforceNetwork =
       env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "1" ||
       env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "true";
+    const policy = this.db.getNetworkPolicyForTrustZone(trustZoneId);
+    const proxyDecision = resolveNetworkPolicyProxyRef(policy?.proxyRef);
+    const requireProxy = isTruthyBrowserFlag(env.OPENCLAW_RUNTIME_BROWSER_REQUIRE_PROXY);
+    if (policy?.proxyRef && !proxyDecision.ok) {
+      this.db.recordAudit({
+        actor: { type: "agent", id: context.agentId },
+        action: "network_policy.proxy_ref_invalid",
+        objectType: "network_policy",
+        objectId: policy.id,
+        payload: { trustZoneId, reason: proxyDecision.reason },
+      });
+      if (shouldEnforceNetwork || requireProxy) {
+        throw new Error(`Browser tool proxy policy is invalid: ${proxyDecision.reason}`);
+      }
+    }
+    if (requireProxy && !proxyDecision.ok) {
+      this.db.recordAudit({
+        actor: { type: "agent", id: context.agentId },
+        action: "network_policy.proxy_required_missing",
+        objectType: "trust_zone",
+        objectId: trustZoneId,
+        payload: { reason: proxyDecision.reason },
+      });
+      throw new Error(
+        `Browser tool requires a proxy-backed network policy: ${proxyDecision.reason}`,
+      );
+    }
     const dnsPolicyMode = env.OPENCLAW_RUNTIME_BROWSER_POLICY_DNS?.trim().toLowerCase();
     const shouldResolveNetworkDns =
       shouldEnforceNetwork &&
@@ -360,8 +543,26 @@ export class CapabilityToolBroker {
             nativeAcquire: this.options.browserNativeAcquire,
             profile: profile || undefined,
             trustZoneId,
+            proxyServer: proxyDecision.ok ? proxyDecision.proxyServer : undefined,
           })
         : null;
+    if (
+      requireProxy &&
+      managedCdp &&
+      managedCdp.source !== "native-pool" &&
+      !isTruthyBrowserFlag(env.OPENCLAW_RUNTIME_BROWSER_EXTERNAL_PROXY_OK)
+    ) {
+      this.db.recordAudit({
+        actor: { type: "agent", id: context.agentId },
+        action: "network_policy.proxy_required_unverified_browser",
+        objectType: "trust_zone",
+        objectId: trustZoneId,
+        payload: { endpointSource: managedCdp.source },
+      });
+      throw new Error(
+        `Browser tool requires a SparseKernel-managed native browser proxy path, got ${managedCdp.source}.`,
+      );
+    }
     const shouldUseCdpBroker =
       cdpEligibleTarget &&
       !cdpBrokerDisabled &&

@@ -24,6 +24,7 @@ export type NativeBrowserProcessAcquireInput = {
   idleTimeoutMs?: number;
   executablePath?: string;
   maxContexts?: number;
+  proxyServer?: string;
 };
 
 type NativeBrowserPool = {
@@ -58,7 +59,21 @@ export type NativeBrowserPoolSnapshot = {
   lastActivityAt: string;
 };
 
+export type NativeBrowserPoolStatsSnapshot = {
+  key: string;
+  trustZoneId: string;
+  profile: string;
+  starts: number;
+  cleanStops: number;
+  crashes: number;
+  lastStartedAt?: string;
+  lastExitAt?: string;
+  lastExitCode?: number;
+  lastExitSignal?: string;
+};
+
 const pools = new Map<string, NativeBrowserPool>();
+const poolStats = new Map<string, NativeBrowserPoolStatsSnapshot>();
 let exitHookInstalled = false;
 
 export async function acquireNativeBrowserProcess(
@@ -110,6 +125,7 @@ export async function acquireNativeBrowserProcess(
     cdpPort,
     userDataDir,
     env,
+    proxyServer: input.proxyServer,
   });
   const proc = spawnImpl(executablePath, args, {
     detached: process.platform !== "win32",
@@ -118,6 +134,11 @@ export async function acquireNativeBrowserProcess(
   });
   proc.unref?.();
   const now = new Date().toISOString();
+  updatePoolStats(key, trustZoneId, profile, (current) => ({
+    ...current,
+    starts: current.starts + 1,
+    lastStartedAt: now,
+  }));
   const pool: NativeBrowserPool = {
     key,
     trustZoneId,
@@ -133,11 +154,25 @@ export async function acquireNativeBrowserProcess(
     lastActivityAt: now,
     exited: false,
   };
-  proc.once("exit", () => {
+  proc.once("exit", (code, signal) => {
+    const cleanStop = pool.refs === 0;
+    updatePoolStats(key, trustZoneId, profile, (current) => ({
+      ...current,
+      cleanStops: current.cleanStops + (cleanStop ? 1 : 0),
+      crashes: current.crashes + (cleanStop ? 0 : 1),
+      lastExitAt: new Date().toISOString(),
+      ...(typeof code === "number" ? { lastExitCode: code } : {}),
+      ...(signal ? { lastExitSignal: String(signal) } : {}),
+    }));
     pool.exited = true;
     pools.delete(key);
   });
   proc.once("error", () => {
+    updatePoolStats(key, trustZoneId, profile, (current) => ({
+      ...current,
+      crashes: current.crashes + 1,
+      lastExitAt: new Date().toISOString(),
+    }));
     pool.exited = true;
     pools.delete(key);
   });
@@ -184,6 +219,10 @@ export function inspectNativeBrowserPools(): NativeBrowserPoolSnapshot[] {
       lastActivityAt: pool.lastActivityAt,
     }))
     .toSorted((left, right) => left.key.localeCompare(right.key));
+}
+
+export function inspectNativeBrowserPoolStats(): NativeBrowserPoolStatsSnapshot[] {
+  return [...poolStats.values()].toSorted((left, right) => left.key.localeCompare(right.key));
 }
 
 export function resolveNativeBrowserExecutable(
@@ -253,6 +292,7 @@ function buildNativeBrowserArgs(params: {
   cdpPort: number;
   userDataDir: string;
   env: NodeJS.ProcessEnv;
+  proxyServer?: string;
 }): string[] {
   const args = [
     `--remote-debugging-port=${params.cdpPort}`,
@@ -267,8 +307,13 @@ function buildNativeBrowserArgs(params: {
     "--disable-session-crashed-bubble",
     "--hide-crash-restore-bubble",
     "--password-store=basic",
-    "--no-proxy-server",
   ];
+  const proxyServer = params.proxyServer?.trim() || params.env.OPENCLAW_SPARSEKERNEL_BROWSER_PROXY;
+  if (proxyServer?.trim()) {
+    args.push(`--proxy-server=${proxyServer.trim()}`);
+  } else {
+    args.push("--no-proxy-server");
+  }
   if (readBooleanEnv(params.env.OPENCLAW_SPARSEKERNEL_BROWSER_HEADLESS, true)) {
     args.push("--headless=new", "--disable-gpu");
   }
@@ -475,6 +520,27 @@ function isExecutable(filePath: string): boolean {
   } catch {
     return false;
   }
+}
+
+function updatePoolStats(
+  key: string,
+  trustZoneId: string,
+  profile: string,
+  update: (current: NativeBrowserPoolStatsSnapshot) => NativeBrowserPoolStatsSnapshot,
+): NativeBrowserPoolStatsSnapshot {
+  const current =
+    poolStats.get(key) ??
+    ({
+      key,
+      trustZoneId,
+      profile,
+      starts: 0,
+      cleanStops: 0,
+      crashes: 0,
+    } satisfies NativeBrowserPoolStatsSnapshot);
+  const next = update(current);
+  poolStats.set(key, next);
+  return next;
 }
 
 function splitShellWords(raw: string): string[] {

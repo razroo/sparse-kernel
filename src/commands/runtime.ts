@@ -9,6 +9,7 @@ import {
   ContentAddressedArtifactStore,
   exportSessionAsJsonl,
   importLegacySessionStore,
+  inspectNativeBrowserPools,
   openLocalKernelDatabase,
   recoverEmbeddedRunTasks,
 } from "../local-kernel/index.js";
@@ -157,6 +158,14 @@ function parseRetentionPolicies(raw: string | undefined): RuntimeRetentionPolicy
     throw new Error(`Unsupported retention policy: ${invalid}`);
   }
   return policies as RuntimeRetentionPolicy[];
+}
+
+function readRuntimeInfoNumber(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 export async function runtimeSessionsCommand(
@@ -370,6 +379,112 @@ export async function runtimeBrowserObservationsCommand(
   }
 }
 
+export async function runtimeBrowserPoolsCommand(
+  opts: { trustZone?: string; status?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const db = openLocalKernelDatabase();
+  try {
+    const ledgerPools = db.listBrowserPools({
+      trustZoneId: opts.trustZone,
+      status: opts.status,
+    });
+    const nativePools = inspectNativeBrowserPools().filter(
+      (pool) => !opts.trustZone || pool.trustZoneId === opts.trustZone,
+    );
+    const result = { ledgerPools, nativePools };
+    if (opts.json) {
+      writeRuntimeJson(runtime, result);
+      return;
+    }
+    if (ledgerPools.length === 0 && nativePools.length === 0) {
+      runtime.log("No SparseKernel browser pools found.");
+      return;
+    }
+    for (const pool of ledgerPools) {
+      runtime.log(
+        `${pool.id} trustZone=${pool.trustZoneId} kind=${pool.browserKind} status=${pool.status} contexts=${pool.activeContexts}/${pool.maxContexts} cdp=${pool.cdpEndpoint ?? "-"}`,
+      );
+    }
+    for (const pool of nativePools) {
+      runtime.log(
+        `native:${pool.key} trustZone=${pool.trustZoneId} profile=${pool.profile} refs=${pool.refs}/${pool.maxContexts} exited=${pool.exited} endpoint=${pool.cdpEndpoint}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeLeasesCommand(
+  opts: {
+    resourceType?: string;
+    status?: string;
+    trustZone?: string;
+    agent?: string;
+    limit?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let limit: number;
+  try {
+    limit = parseLimit(opts.limit, 100);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const leases = db.listResourceLeases({
+      resourceType: opts.resourceType,
+      status: opts.status,
+      trustZoneId: opts.trustZone,
+      ownerAgentId: opts.agent,
+      limit,
+    });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { leases });
+      return;
+    }
+    if (leases.length === 0) {
+      runtime.log("No SparseKernel resource leases found.");
+      return;
+    }
+    for (const lease of leases) {
+      runtime.log(
+        `${lease.id} type=${lease.resourceType} resource=${lease.resourceId} status=${lease.status} trustZone=${lease.trustZoneId ?? "-"} owner=${lease.ownerAgentId ?? "-"} leaseUntil=${lease.leaseUntil ?? "-"}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeArtifactSummaryCommand(
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const db = openLocalKernelDatabase();
+  try {
+    const artifacts = db.summarizeArtifactRetention();
+    if (opts.json) {
+      writeRuntimeJson(runtime, { artifacts });
+      return;
+    }
+    if (artifacts.length === 0) {
+      runtime.log("No SparseKernel artifacts found.");
+      return;
+    }
+    for (const row of artifacts) {
+      runtime.log(`${row.retentionPolicy}: ${row.count} artifact(s), ${row.sizeBytes} byte(s)`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
 export async function runtimeArtifactAccessCommand(
   opts: {
     artifact?: string;
@@ -438,14 +553,25 @@ export async function runtimeRecoverCommand(
 }
 
 export async function runtimeMaintainCommand(
-  opts: { olderThan?: string; retention?: string; task?: string; json?: boolean },
+  opts: {
+    olderThan?: string;
+    retention?: string;
+    task?: string;
+    scheduleEvery?: string;
+    runDue?: boolean;
+    json?: boolean;
+  },
   runtime: RuntimeEnv,
 ): Promise<void> {
   const olderThanRaw = opts.olderThan ?? "7d";
   let olderThanMs: number;
+  let scheduleEveryMs: number | undefined;
   let retentionPolicies: RuntimeRetentionPolicy[] | undefined;
   try {
     olderThanMs = parseDurationMs(olderThanRaw, { defaultUnit: "d" });
+    scheduleEveryMs = opts.scheduleEvery
+      ? parseDurationMs(opts.scheduleEvery, { defaultUnit: "m" })
+      : undefined;
     retentionPolicies = parseRetentionPolicies(opts.retention);
   } catch (err) {
     runtime.error(formatErrorMessage(err));
@@ -455,6 +581,42 @@ export async function runtimeMaintainCommand(
   const olderThan = new Date(Date.now() - olderThanMs).toISOString();
   const db = openLocalKernelDatabase();
   try {
+    if (scheduleEveryMs !== undefined) {
+      db.setRuntimeInfo("maintenance.schedule_every_ms", String(scheduleEveryMs));
+      db.recordAudit({
+        actor: { type: "operator" },
+        action: "maintenance.schedule_updated",
+        objectType: "runtime_info",
+        objectId: "maintenance.schedule_every_ms",
+        payload: { scheduleEveryMs },
+      });
+    } else {
+      scheduleEveryMs = readRuntimeInfoNumber(
+        db.getRuntimeInfo("maintenance.schedule_every_ms")?.value,
+      );
+    }
+    if (opts.runDue && scheduleEveryMs) {
+      const lastRunRaw = db.getRuntimeInfo("maintenance.last_run_at")?.value;
+      const lastRunMs = lastRunRaw ? Date.parse(lastRunRaw) : Number.NaN;
+      const nowMs = Date.now();
+      if (Number.isFinite(lastRunMs) && nowMs - lastRunMs < scheduleEveryMs) {
+        const nextRunAt = new Date(lastRunMs + scheduleEveryMs).toISOString();
+        const result = {
+          skipped: true,
+          reason: "not due",
+          scheduleEveryMs,
+          lastRunAt: lastRunRaw,
+          nextRunAt,
+        };
+        db.setRuntimeInfo("maintenance.last_due_check_at", new Date(nowMs).toISOString());
+        if (opts.json) {
+          writeRuntimeJson(runtime, result);
+          return;
+        }
+        runtime.log(`Runtime maintenance not due until ${nextRunAt}.`);
+        return;
+      }
+    }
     const releasedExpiredLeases = db.releaseExpiredLeases();
     const embeddedRuns = recoverEmbeddedRunTasks({ db, taskId: opts.task });
     const store = new ContentAddressedArtifactStore(db);
@@ -468,7 +630,11 @@ export async function runtimeMaintainCommand(
       prunedArtifacts: prunedArtifacts.artifacts.length,
       deletedFiles: prunedArtifacts.deletedFiles,
       prunedBrowserObservations,
+      scheduleEveryMs,
     };
+    const completedAt = new Date().toISOString();
+    db.setRuntimeInfo("maintenance.last_run_at", completedAt);
+    db.setRuntimeInfo("maintenance.last_result_json", JSON.stringify(result));
     if (opts.json) {
       writeRuntimeJson(runtime, result);
       return;

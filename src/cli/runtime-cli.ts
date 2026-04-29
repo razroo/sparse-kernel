@@ -1,11 +1,14 @@
 import type { Command } from "commander";
 import {
   runtimeArtifactAccessCommand,
+  runtimeArtifactSummaryCommand,
   runtimeBrowserObservationsCommand,
+  runtimeBrowserPoolsCommand,
   runtimeBrowserTargetsCommand,
   runtimeBudgetCommand,
   runtimeBudgetSetCommand,
   runtimeInspectCommand,
+  runtimeLeasesCommand,
   runtimeMaintainCommand,
   runtimeMigrateCommand,
   runtimePruneCommand,
@@ -52,17 +55,23 @@ export function registerRuntimeCli(program: Command) {
             "List artifact access grants.",
           ],
           ["openclaw sparsekernel browser-targets --json", "List brokered browser targets."],
+          ["openclaw sparsekernel browser-pools --json", "List brokered browser pools."],
           [
             "openclaw sparsekernel browser-observations --context <id>",
             "List browser observations.",
           ],
+          ["openclaw sparsekernel leases --status active", "List active resource leases."],
+          ["openclaw sparsekernel artifacts summary", "Summarize artifact retention."],
           ["openclaw sparsekernel recover", "Recover expired or dead embedded-run leases."],
           ["openclaw runtime budget", "List trust-zone budgets and usage."],
           [
             "openclaw runtime budget set --trust-zone code_execution --max-runtime-seconds 600",
             "Update a trust-zone budget.",
           ],
-          ["openclaw runtime maintain --older-than 7d", "Recover leases and prune old artifacts."],
+          [
+            "openclaw runtime maintain --run-due --schedule-every 1h",
+            "Run scheduled runtime maintenance when due.",
+          ],
           ["openclaw runtime prune --older-than 7d", "Prune ephemeral/debug artifacts."],
           ["openclaw runtime vacuum", "Vacuum the runtime DB."],
         ])}`,
@@ -190,6 +199,25 @@ export function registerRuntimeCli(program: Command) {
     );
 
   runtime
+    .command("browser-pools")
+    .description("List SparseKernel browser pools")
+    .option("--trust-zone <id>", "Filter by trust zone id")
+    .option("--status <status>", "Filter by pool status")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeBrowserPoolsCommand(
+          {
+            trustZone: opts.trustZone as string | undefined,
+            status: opts.status as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
     .command("browser-observations")
     .description("List SparseKernel browser observations")
     .option("--context <id>", "Filter by browser context id")
@@ -211,6 +239,43 @@ export function registerRuntimeCli(program: Command) {
           },
           defaultRuntime,
         ),
+      ),
+    );
+
+  runtime
+    .command("leases")
+    .description("List SparseKernel resource leases")
+    .option("--resource-type <type>", "Filter by resource type")
+    .option("--status <status>", "Filter by lease status")
+    .option("--trust-zone <id>", "Filter by trust zone id")
+    .option("--agent <id>", "Filter by owning agent id")
+    .option("--limit <n>", "Maximum leases to return", "100")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeLeasesCommand(
+          {
+            resourceType: opts.resourceType as string | undefined,
+            status: opts.status as string | undefined,
+            trustZone: opts.trustZone as string | undefined,
+            agent: opts.agent as string | undefined,
+            limit: opts.limit as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("artifacts")
+    .description("Inspect SparseKernel artifacts")
+    .command("summary")
+    .description("Summarize artifacts by retention policy")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeArtifactSummaryCommand({ json: Boolean(opts.json) }, defaultRuntime),
       ),
     );
 
@@ -265,6 +330,8 @@ export function registerRuntimeCli(program: Command) {
       "Comma-separated retention policies (default: ephemeral,debug)",
     )
     .option("--task <id>", "Only recover one embedded-run task")
+    .option("--schedule-every <duration>", "Persist a maintenance cadence such as 1h or 30m")
+    .option("--run-due", "Skip maintenance when the persisted cadence is not due", false)
     .option("--json", "Output JSON", false)
     .action(
       createRunner((opts) =>
@@ -273,6 +340,8 @@ export function registerRuntimeCli(program: Command) {
             olderThan: opts.olderThan as string | undefined,
             retention: opts.retention as string | undefined,
             task: opts.task as string | undefined,
+            scheduleEvery: opts.scheduleEvery as string | undefined,
+            runDue: Boolean(opts.runDue),
             json: Boolean(opts.json),
           },
           defaultRuntime,

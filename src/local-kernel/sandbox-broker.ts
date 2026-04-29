@@ -20,6 +20,7 @@ export type SandboxAllocationRequest = {
   trustZoneId: string;
   requirements?: {
     backend?: SandboxBackendKind;
+    dockerImage?: string;
     maxRuntimeMs?: number;
     maxBytesOut?: number;
     maxTokens?: number;
@@ -30,6 +31,7 @@ export type SandboxAllocationRequest = {
 export type SandboxCommandRequest = {
   allocationId: string;
   backend?: SandboxBackendKind;
+  dockerImage?: string;
   command: string;
   args?: string[];
   cwd?: string;
@@ -83,27 +85,83 @@ export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean 
   }
 }
 
-type SandboxSpawnPlan = {
+export type SandboxSpawnPlan = {
   command: string;
   args: string[];
   isolation: string;
 };
 
-function buildSandboxSpawnPlan(params: {
+type SandboxLeaseMetadata = {
+  backend?: SandboxBackendKind;
+  dockerImage?: string;
+  isolation?: string;
+};
+
+type CommandResolver = (commands: string[]) => string | undefined;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function readSandboxLeaseMetadata(value: unknown): SandboxLeaseMetadata {
+  if (!isRecord(value)) {
+    return {};
+  }
+  return {
+    ...(typeof value.backend === "string" ? { backend: value.backend as SandboxBackendKind } : {}),
+    ...(typeof value.dockerImage === "string" && value.dockerImage.trim()
+      ? { dockerImage: value.dockerImage.trim() }
+      : {}),
+    ...(typeof value.isolation === "string" && value.isolation.trim()
+      ? { isolation: value.isolation.trim() }
+      : {}),
+  };
+}
+
+function describeSandboxBackend(backend: SandboxBackendKind): string {
+  switch (backend) {
+    case "local/no_isolation":
+      return "local/no_isolation command runner; trusted execution only";
+    case "bwrap":
+      return "bubblewrap process namespace with broker-selected binds";
+    case "minijail":
+      return "minijail process jail with backend-defined limits";
+    case "docker":
+      return "Docker container process with broker-selected image, no pull, and network disabled by default";
+    case "ssh":
+      return "remote SSH backend placeholder; no v0 command execution";
+    case "openshell":
+      return "OpenShell backend placeholder; no v0 command execution";
+    case "vm":
+      return "VM backend placeholder; no v0 command execution";
+    case "other":
+      return "unknown sandbox backend placeholder; no v0 command execution";
+  }
+}
+
+function validDockerEnvName(name: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+}
+
+export function buildSandboxSpawnPlan(params: {
   backend: SandboxBackendKind;
   command: string;
   args: string[];
   cwd?: string;
+  env?: Record<string, string>;
+  dockerImage?: string;
+  resolveCommand?: CommandResolver;
 }): SandboxSpawnPlan {
+  const resolveCommand = params.resolveCommand ?? firstAvailableCommand;
   switch (params.backend) {
     case "local/no_isolation":
       return {
         command: params.command,
         args: params.args,
-        isolation: "local/no_isolation command runner; trusted execution only",
+        isolation: describeSandboxBackend(params.backend),
       };
     case "bwrap": {
-      const binary = firstAvailableCommand(["bwrap", "bubblewrap"]);
+      const binary = resolveCommand(["bwrap", "bubblewrap"]);
       if (!binary) {
         throw new Error("Sandbox backend unavailable: bwrap");
       }
@@ -130,21 +188,47 @@ function buildSandboxSpawnPlan(params: {
       return {
         command: binary,
         args,
-        isolation: "bubblewrap process namespace with broker-selected binds",
+        isolation: describeSandboxBackend(params.backend),
       };
     }
     case "minijail": {
-      const binary = firstAvailableCommand(["minijail0", "minijail"]);
+      const binary = resolveCommand(["minijail0", "minijail"]);
       if (!binary) {
         throw new Error("Sandbox backend unavailable: minijail");
       }
       return {
         command: binary,
         args: ["-p", "-v", "--", params.command, ...params.args],
-        isolation: "minijail process jail with backend-defined limits",
+        isolation: describeSandboxBackend(params.backend),
       };
     }
-    case "docker":
+    case "docker": {
+      const binary = resolveCommand(["docker"]);
+      if (!binary) {
+        throw new Error("Sandbox backend unavailable: docker");
+      }
+      const image = params.dockerImage?.trim();
+      if (!image) {
+        throw new Error(
+          "Sandbox backend docker requires an explicit dockerImage or OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE.",
+        );
+      }
+      const args = ["run", "--rm", "--pull", "never", "--network", "none"];
+      for (const [name, value] of Object.entries(params.env ?? {})) {
+        if (validDockerEnvName(name)) {
+          args.push("--env", `${name}=${value}`);
+        }
+      }
+      if (params.cwd) {
+        args.push("-v", `${params.cwd}:/workspace:rw`, "-w", "/workspace");
+      }
+      args.push(image, params.command, ...params.args);
+      return {
+        command: binary,
+        args,
+        isolation: describeSandboxBackend(params.backend),
+      };
+    }
     case "ssh":
     case "openshell":
     case "vm":
@@ -200,6 +284,11 @@ export class LocalSandboxBroker implements SandboxBroker {
       maxRuntimeMs: request.requirements?.maxRuntimeMs,
       maxBytesOut: request.requirements?.maxBytesOut,
       maxTokens: request.requirements?.maxTokens,
+      metadata: {
+        backend,
+        dockerImage: request.requirements?.dockerImage,
+        isolation: describeSandboxBackend(backend),
+      },
     });
     this.db.recordAudit({
       actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
@@ -210,10 +299,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         taskId: request.taskId,
         trustZoneId: request.trustZoneId,
         backend,
-        isolation:
-          backend === "local/no_isolation"
-            ? "accounting only; no hard process, filesystem, or network isolation"
-            : "backend-defined",
+        isolation: describeSandboxBackend(backend),
       },
     });
     this.allocationBackends.set(allocationId, backend);
@@ -243,21 +329,8 @@ export class LocalSandboxBroker implements SandboxBroker {
   }
 
   async runCommand(request: SandboxCommandRequest): Promise<SandboxCommandResult> {
-    const lease = this.db.db
-      .prepare(
-        `SELECT status, trust_zone_id, max_runtime_ms, max_bytes_out
-         FROM resource_leases
-         WHERE id = ? AND resource_type = 'sandbox'`,
-      )
-      .get(request.allocationId) as
-      | {
-          status: string;
-          trust_zone_id: string | null;
-          max_runtime_ms: number | bigint | null;
-          max_bytes_out: number | bigint | null;
-        }
-      | undefined;
-    if (!lease || lease.status !== "active") {
+    const lease = this.db.getResourceLease(request.allocationId);
+    if (!lease || lease.resourceType !== "sandbox" || lease.status !== "active") {
       this.db.recordAudit({
         actor: { type: "runtime" },
         action: "sandbox.command_denied_inactive_allocation",
@@ -270,7 +343,9 @@ export class LocalSandboxBroker implements SandboxBroker {
     if (!command) {
       throw new Error("Sandbox command is required");
     }
-    const backend = request.backend ?? this.allocationBackends.get(request.allocationId);
+    const metadata = readSandboxLeaseMetadata(lease.metadata);
+    const backend =
+      request.backend ?? this.allocationBackends.get(request.allocationId) ?? metadata.backend;
     if (!backend) {
       this.db.recordAudit({
         actor: { type: "runtime" },
@@ -290,6 +365,11 @@ export class LocalSandboxBroker implements SandboxBroker {
         command,
         args: request.args ?? [],
         cwd: request.cwd,
+        env: request.env,
+        dockerImage:
+          request.dockerImage ??
+          metadata.dockerImage ??
+          process.env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE,
       });
     } catch (error) {
       this.db.recordAudit({
@@ -304,12 +384,11 @@ export class LocalSandboxBroker implements SandboxBroker {
       });
       throw error;
     }
-    const requestedTimeoutMs = request.timeoutMs ?? Number(lease.max_runtime_ms ?? 30_000);
-    const leaseTimeoutMs = Number(lease.max_runtime_ms ?? requestedTimeoutMs);
+    const requestedTimeoutMs = request.timeoutMs ?? Number(lease.maxRuntimeMs ?? 30_000);
+    const leaseTimeoutMs = Number(lease.maxRuntimeMs ?? requestedTimeoutMs);
     const timeoutMs = Math.max(1, Math.min(requestedTimeoutMs || 30_000, leaseTimeoutMs || 30_000));
-    const requestedOutputBytes =
-      request.maxOutputBytes ?? Number(lease.max_bytes_out ?? 256 * 1024);
-    const leaseOutputBytes = Number(lease.max_bytes_out ?? requestedOutputBytes);
+    const requestedOutputBytes = request.maxOutputBytes ?? Number(lease.maxBytesOut ?? 256 * 1024);
+    const leaseOutputBytes = Number(lease.maxBytesOut ?? requestedOutputBytes);
     const maxOutputBytes = Math.max(
       1,
       Math.min(requestedOutputBytes || 256 * 1024, leaseOutputBytes || 256 * 1024),
@@ -323,7 +402,7 @@ export class LocalSandboxBroker implements SandboxBroker {
       payload: {
         command,
         args: request.args ?? [],
-        trustZoneId: lease.trust_zone_id,
+        trustZoneId: lease.trustZoneId,
         backend,
         isolation: spawnPlan.isolation,
       },

@@ -15,8 +15,8 @@ export type {
 } from "./browser-process-pool.js";
 export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
-export { checkTrustZoneNetworkUrl } from "./network-policy.js";
-export type { NetworkPolicyDecision } from "./network-policy.js";
+export { checkTrustZoneNetworkUrl, checkTrustZoneNetworkUrlWithDns } from "./network-policy.js";
+export type { NetworkPolicyDecision, NetworkPolicyDnsLookup } from "./network-policy.js";
 export {
   compactLedgerContent,
   materializeEmbeddedRunInKernel,
@@ -47,8 +47,9 @@ export type {
   SandboxCommandRequest,
   SandboxCommandResult,
   SandboxBroker,
+  SandboxSpawnPlan,
 } from "./sandbox-broker.js";
-export { isSandboxBackendAvailable } from "./sandbox-broker.js";
+export { buildSandboxSpawnPlan, isSandboxBackendAvailable } from "./sandbox-broker.js";
 export { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat.js";
 export type { SessionImportResult, SessionStoreImportTarget } from "./session-compat.js";
 export { CapabilityToolBroker, isSandboxCommandToolName } from "./tool-broker.js";

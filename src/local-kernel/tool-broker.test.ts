@@ -17,6 +17,7 @@ import type {
   SparseKernelUpsertSessionInput,
 } from "../../packages/sparsekernel-client/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import { setPluginToolMeta } from "../plugins/tools.js";
 import type {
   NativeBrowserProcessAcquireInput,
   NativeBrowserProcessLease,
@@ -295,6 +296,35 @@ describe("CapabilityToolBroker", () => {
         status: string;
       };
       expect(row.status).toBe("succeeded");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("fails closed for plugin tools when subprocess execution is required", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "plugin_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("plugin_tool");
+      setPluginToolMeta(rawTool, { pluginId: "community-plugin", optional: false });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "subprocess" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-plugin", {})).rejects.toThrow(/out-of-process execution/);
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining(["plugin_tool.subprocess_required", "tool_call.failed"]),
+      );
     } finally {
       db.close();
     }

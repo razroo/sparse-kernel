@@ -18,8 +18,11 @@ SparseKernel security claims must be precise.
 - `local/no_isolation` is only for trusted operations and accounting.
 - The local/no-isolation sandbox command runner schedules and audits trusted commands behind a lease, but it does not confine process, filesystem, or network access.
 - The bwrap and minijail command runners use the installed backend binaries when available, but their exact isolation depends on host kernel support and the broker-selected bind policy.
-- SparseKernel network policy checks are broker-side request guards unless backed by a real proxy, firewall, sandbox, or VM boundary.
+- SparseKernel network policy checks, including DNS-aware hostname resolution, are broker-side request guards unless backed by a real proxy, firewall, sandbox, or VM boundary.
+- Docker command execution requires an explicit image and disables container networking by default, but its isolation is only the host Docker daemon's isolation; it is not a per-agent security model.
+- Persisted lease metadata records the selected backend and policy intent; it is audit/accounting state, not isolation by itself.
 - Untrusted plugins must not get ambient host authority.
+- The subprocess-required plugin mode fails closed until a real subprocess/WASI worker exists; it does not itself execute untrusted plugins safely.
 - Secrets should be referenced, not stored as plaintext in SQLite.
 
 Capabilities are the v0 policy primitive. They are intentionally simple: subject, resource, action, optional constraints, optional expiry. Denied sensitive checks are audit-logged.

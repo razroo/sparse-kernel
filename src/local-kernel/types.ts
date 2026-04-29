@@ -190,6 +190,18 @@ export type BrowserContextRecord = {
   expiresAt?: string;
 };
 
+export type BrowserPoolRecord = {
+  id: string;
+  trustZoneId: string;
+  browserKind: string;
+  status: string;
+  maxContexts: number;
+  activeContexts: number;
+  cdpEndpoint?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type BrowserTargetInput = {
   contextId: string;
   targetId: string;
@@ -247,6 +259,23 @@ export type SandboxAllocationRecord = {
   leaseUntil?: string;
 };
 
+export type ResourceLeaseRecord = {
+  id: string;
+  resourceType: string;
+  resourceId: string;
+  ownerTaskId?: string;
+  ownerAgentId?: string;
+  trustZoneId?: string;
+  status: string;
+  leaseUntil?: string;
+  maxRuntimeMs?: number;
+  maxBytesOut?: number;
+  maxTokens?: number;
+  metadata?: unknown;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type TrustZoneRecord = {
   id: string;
   description?: string;
@@ -263,6 +292,18 @@ export type UsageSummaryRecord = {
   resourceType: string;
   unit: string;
   amount: number;
+};
+
+export type ArtifactRetentionSummaryRecord = {
+  retentionPolicy: RuntimeRetentionPolicy | "unknown";
+  count: number;
+  sizeBytes: number;
+};
+
+export type RuntimeInfoRecord = {
+  key: string;
+  value: string;
+  updatedAt: string;
 };
 
 export type NetworkPolicyRecord = {

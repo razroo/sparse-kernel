@@ -9,7 +9,9 @@ import {
 import {
   accountSandboxForRun,
   accountSandboxForRunEffective,
+  buildSandboxSpawnPlan,
   checkTrustZoneNetworkUrl,
+  checkTrustZoneNetworkUrlWithDns,
   ContentAddressedArtifactStore,
   LocalBrowserBroker,
   LocalKernelDatabase,
@@ -46,17 +48,17 @@ describe("local runtime kernel database", () => {
   it("migrates an empty database idempotently", () => {
     const root = tempRoot();
     const db = openTempDb(root);
-    expect(db.schemaVersion()).toBe(3);
+    expect(db.schemaVersion()).toBe(4);
     db.migrate();
-    expect(db.schemaVersion()).toBe(3);
+    expect(db.schemaVersion()).toBe(4);
     const migrations = db.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as {
       count: number;
     };
-    expect(migrations.count).toBe(3);
+    expect(migrations.count).toBe(4);
     db.close();
 
     const reopened = openTempDb(root);
-    expect(reopened.schemaVersion()).toBe(3);
+    expect(reopened.schemaVersion()).toBe(4);
     expect(reopened.inspect().counts.audit_log).toBe(0);
   });
 
@@ -215,6 +217,9 @@ describe("local runtime kernel database", () => {
         subjectId: "main",
       }),
     ]);
+    expect(db.summarizeArtifactRetention()).toEqual([
+      { retentionPolicy: "session", count: 1, sizeBytes: 5 },
+    ]);
   });
 
   it("allows, denies, revokes, and audits capabilities", () => {
@@ -287,6 +292,13 @@ describe("local runtime kernel database", () => {
     expect(() =>
       broker.acquireContext({ agentId: "main", trustZoneId: "public_web", maxContexts: 1 }),
     ).toThrow(/no available contexts/);
+    expect(db.listBrowserPools({ trustZoneId: "public_web" })).toEqual([
+      expect.objectContaining({
+        trustZoneId: "public_web",
+        maxContexts: 1,
+        activeContexts: 1,
+      }),
+    ]);
     expect(broker.releaseContext(context.id)).toBe(true);
   });
 
@@ -409,6 +421,35 @@ describe("local runtime kernel database", () => {
     ).toMatchObject({ allowed: false, reason: "denied cidr" });
   });
 
+  it("can resolve DNS before allowing brokered network destinations", async () => {
+    const db = openTempDb();
+    await expect(
+      checkTrustZoneNetworkUrlWithDns({
+        db,
+        trustZoneId: "public_web",
+        url: "https://internal.example.test/dashboard",
+        lookup: async () => [{ address: "127.0.0.1", family: 4 }],
+      }),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: "resolved private network denied",
+    });
+    db.db
+      .prepare("UPDATE network_policies SET denied_cidrs_json = ? WHERE id = 'public_web_default'")
+      .run(JSON.stringify(["203.0.113.0/24"]));
+    await expect(
+      checkTrustZoneNetworkUrlWithDns({
+        db,
+        trustZoneId: "public_web",
+        url: "https://example.test/resource",
+        lookup: async () => [{ address: "203.0.113.8", family: 4 }],
+      }),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: "resolved denied cidr",
+    });
+  });
+
   it("records trust-zone budgets and usage summaries", () => {
     const db = openTempDb();
     expect(
@@ -427,6 +468,11 @@ describe("local runtime kernel database", () => {
     db.recordUsage({ resourceType: "tokens", amount: 10, unit: "token" });
     db.recordUsage({ resourceType: "tokens", amount: 15, unit: "token" });
     expect(db.summarizeUsage()).toEqual([{ resourceType: "tokens", amount: 25, unit: "token" }]);
+    db.setRuntimeInfo("maintenance.schedule_every_ms", "3600000");
+    expect(db.getRuntimeInfo("maintenance.schedule_every_ms")).toMatchObject({
+      key: "maintenance.schedule_every_ms",
+      value: "3600000",
+    });
   });
 
   it("brokers local/no-isolation sandbox allocations without pretending isolation", () => {
@@ -484,6 +530,38 @@ describe("local runtime kernel database", () => {
     ).rejects.toThrow(/not active/);
   });
 
+  it("persists sandbox backend metadata across broker instances", async () => {
+    const db = openTempDb();
+    db.ensureAgent({ id: "main" });
+    db.enqueueTask({ id: "task-a", kind: "demo" });
+    db.grantCapability({
+      subjectType: "agent",
+      subjectId: "main",
+      resourceType: "sandbox",
+      resourceId: "code_execution",
+      action: "allocate",
+    });
+    const allocation = new LocalSandboxBroker(db).allocateSandbox({
+      taskId: "task-a",
+      agentId: "main",
+      trustZoneId: "code_execution",
+      requirements: { backend: "local/no_isolation", maxRuntimeMs: 5_000 },
+    });
+    expect(db.getResourceLease(allocation.id)).toMatchObject({
+      metadata: expect.objectContaining({ backend: "local/no_isolation" }),
+    });
+    await expect(
+      new LocalSandboxBroker(db).runCommand({
+        allocationId: allocation.id,
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('persisted')"],
+      }),
+    ).resolves.toMatchObject({ exitCode: 0, stdout: "persisted" });
+    expect(db.listResourceLeases({ resourceType: "sandbox", status: "active" })).toEqual([
+      expect.objectContaining({ id: allocation.id }),
+    ]);
+  });
+
   it("does not execute sandbox commands when allocation backend state is missing", async () => {
     const db = openTempDb();
     db.createResourceLease({
@@ -530,6 +608,45 @@ describe("local runtime kernel database", () => {
       .prepare("SELECT action FROM audit_log WHERE action = 'sandbox.command_failed'")
       .get() as { action: string } | undefined;
     expect(audit?.action).toBe("sandbox.command_failed");
+  });
+
+  it("builds explicit Docker sandbox command plans without host fallback", () => {
+    expect(() =>
+      buildSandboxSpawnPlan({
+        backend: "docker",
+        command: "node",
+        args: ["-v"],
+        resolveCommand: () => "docker",
+      }),
+    ).toThrow(/dockerImage/);
+    expect(
+      buildSandboxSpawnPlan({
+        backend: "docker",
+        command: "node",
+        args: ["-v"],
+        cwd: "/work",
+        dockerImage: "openclaw-runtime:local",
+        env: { SAFE_ENV: "1", "BAD-NAME": "skip" },
+        resolveCommand: () => "docker",
+      }),
+    ).toMatchObject({
+      command: "docker",
+      args: expect.arrayContaining([
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        "none",
+        "--env",
+        "SAFE_ENV=1",
+        "-v",
+        "/work:/workspace:rw",
+        "openclaw-runtime:local",
+        "node",
+        "-v",
+      ]),
+    });
   });
 
   it("accounts sandboxed runs without requiring a queued task row", () => {

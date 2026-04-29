@@ -7,6 +7,9 @@ import { LocalKernelDatabase } from "../local-kernel/database.js";
 import type { OutputRuntimeEnv } from "../runtime.js";
 import {
   runtimeArtifactAccessCommand,
+  runtimeArtifactSummaryCommand,
+  runtimeBrowserPoolsCommand,
+  runtimeLeasesCommand,
   runtimeMaintainCommand,
   runtimeRecoverCommand,
   runtimeSessionsCommand,
@@ -140,6 +143,21 @@ describe("SparseKernel runtime commands", () => {
         db.db
           .prepare("UPDATE artifacts SET created_at = ? WHERE id = ?")
           .run("2026-01-01T00:00:00.000Z", artifact.id);
+        db.ensureBrowserPool({
+          id: "browser_pool_public_web",
+          trustZoneId: "public_web",
+          maxContexts: 2,
+          cdpEndpoint: "http://127.0.0.1:9222",
+        });
+        db.ensureAgent({ id: "main" });
+        db.createResourceLease({
+          id: "lease-browser-a",
+          resourceType: "browser_context",
+          resourceId: "browser_context_a",
+          trustZoneId: "public_web",
+          ownerAgentId: "main",
+          metadata: { poolId: "browser_pool_public_web" },
+        });
       } finally {
         db.close();
       }
@@ -163,12 +181,62 @@ describe("SparseKernel runtime commands", () => {
         2,
       );
 
+      const poolsRuntime = makeRuntime();
+      await runtimeBrowserPoolsCommand({ trustZone: "public_web", json: true }, poolsRuntime);
+      expect(poolsRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ledgerPools: [
+            expect.objectContaining({
+              id: "browser_pool_public_web",
+              trustZoneId: "public_web",
+              maxContexts: 2,
+            }),
+          ],
+        }),
+        2,
+      );
+
+      const leasesRuntime = makeRuntime();
+      await runtimeLeasesCommand(
+        { resourceType: "browser_context", status: "active", json: true },
+        leasesRuntime,
+      );
+      expect(leasesRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          leases: [expect.objectContaining({ id: "lease-browser-a" })],
+        }),
+        2,
+      );
+
+      const artifactSummaryRuntime = makeRuntime();
+      await runtimeArtifactSummaryCommand({ json: true }, artifactSummaryRuntime);
+      expect(artifactSummaryRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          artifacts: [expect.objectContaining({ retentionPolicy: "debug", count: 1 })],
+        }),
+        2,
+      );
+
       const maintainRuntime = makeRuntime();
-      await runtimeMaintainCommand({ olderThan: "1d", json: true }, maintainRuntime);
+      await runtimeMaintainCommand(
+        { olderThan: "1d", scheduleEvery: "1h", json: true },
+        maintainRuntime,
+      );
       expect(maintainRuntime.writeJson).toHaveBeenCalledWith(
         expect.objectContaining({
           prunedArtifacts: 1,
           deletedFiles: 1,
+          scheduleEveryMs: 3_600_000,
+        }),
+        2,
+      );
+
+      const skippedRuntime = makeRuntime();
+      await runtimeMaintainCommand({ runDue: true, json: true }, skippedRuntime);
+      expect(skippedRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          skipped: true,
+          reason: "not due",
         }),
         2,
       );

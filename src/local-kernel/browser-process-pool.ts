@@ -35,6 +35,10 @@ type NativeBrowserPool = {
   userDataDir: string;
   proc: ChildProcess;
   refs: number;
+  maxContexts: number;
+  idleTimeoutMs: number;
+  startedAt: string;
+  lastActivityAt: string;
   idleTimer?: NodeJS.Timeout;
   exited: boolean;
 };
@@ -45,9 +49,13 @@ export type NativeBrowserPoolSnapshot = {
   profile: string;
   cdpEndpoint: string;
   refs: number;
+  maxContexts: number;
+  idleTimeoutMs: number;
   exited: boolean;
   pid?: number;
   userDataDir: string;
+  startedAt: string;
+  lastActivityAt: string;
 };
 
 const pools = new Map<string, NativeBrowserPool>();
@@ -76,6 +84,8 @@ export async function acquireNativeBrowserProcess(
     }
     clearIdleTimer(existing);
     existing.refs += 1;
+    existing.maxContexts = maxContexts;
+    existing.lastActivityAt = new Date().toISOString();
     return leaseFor(existing, idleTimeoutMs);
   }
   if (existing) {
@@ -107,6 +117,7 @@ export async function acquireNativeBrowserProcess(
     env: sanitizeBrowserEnv(env),
   });
   proc.unref?.();
+  const now = new Date().toISOString();
   const pool: NativeBrowserPool = {
     key,
     trustZoneId,
@@ -116,6 +127,10 @@ export async function acquireNativeBrowserProcess(
     userDataDir,
     proc,
     refs: 1,
+    maxContexts,
+    idleTimeoutMs,
+    startedAt: now,
+    lastActivityAt: now,
     exited: false,
   };
   proc.once("exit", () => {
@@ -160,9 +175,13 @@ export function inspectNativeBrowserPools(): NativeBrowserPoolSnapshot[] {
       profile: pool.profile,
       cdpEndpoint: pool.cdpEndpoint,
       refs: pool.refs,
+      maxContexts: pool.maxContexts,
+      idleTimeoutMs: pool.idleTimeoutMs,
       exited: pool.exited,
       ...(pool.proc.pid ? { pid: pool.proc.pid } : {}),
       userDataDir: pool.userDataDir,
+      startedAt: pool.startedAt,
+      lastActivityAt: pool.lastActivityAt,
     }))
     .toSorted((left, right) => left.key.localeCompare(right.key));
 }
@@ -222,6 +241,7 @@ function leaseFor(pool: NativeBrowserPool, idleTimeoutMs?: number): NativeBrowse
       }
       released = true;
       pool.refs = Math.max(0, pool.refs - 1);
+      pool.lastActivityAt = new Date().toISOString();
       if (pool.refs === 0) {
         scheduleIdleStop(pool, idleTimeoutMs);
       }

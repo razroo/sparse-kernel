@@ -10,9 +10,11 @@ import type {
   ArtifactRecord,
   ArtifactRecordInput,
   ArtifactAccessRecord,
+  ArtifactRetentionSummaryRecord,
   BrowserContextRecord,
   BrowserObservationInput,
   BrowserObservationRecord,
+  BrowserPoolRecord,
   BrowserTargetInput,
   BrowserTargetRecord,
   ClaimTaskByIdInput,
@@ -26,6 +28,9 @@ import type {
   KernelSessionRecord,
   KernelTaskRecord,
   NetworkPolicyRecord,
+  ResourceLeaseRecord,
+  RuntimeRetentionPolicy,
+  RuntimeInfoRecord,
   TranscriptEventInput,
   TranscriptEventRecord,
   TrustZoneRecord,
@@ -129,6 +134,18 @@ type BrowserContextRow = {
   expires_at: string | null;
 };
 
+type BrowserPoolRow = {
+  id: string;
+  trust_zone_id: string;
+  browser_kind: string;
+  status: string;
+  max_contexts: number | bigint;
+  active_contexts?: number | bigint | null;
+  cdp_endpoint: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 type BrowserTargetRow = {
   id: string;
   context_id: string;
@@ -191,6 +208,35 @@ type NetworkPolicyRow = {
   denied_cidrs_json: string | null;
   proxy_ref: string | null;
   created_at: string;
+};
+
+type ResourceLeaseRow = {
+  id: string;
+  resource_type: string;
+  resource_id: string;
+  owner_task_id: string | null;
+  owner_agent_id: string | null;
+  trust_zone_id: string | null;
+  status: string;
+  lease_until: string | null;
+  max_runtime_ms: number | bigint | null;
+  max_bytes_out: number | bigint | null;
+  max_tokens: number | bigint | null;
+  metadata_json: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ArtifactRetentionSummaryRow = {
+  retention_policy: string | null;
+  count: number | bigint;
+  size_bytes: number | bigint | null;
+};
+
+type RuntimeInfoRow = {
+  key: string;
+  value: string;
+  updated_at: string;
 };
 
 export type OpenLocalKernelDatabaseOptions = {
@@ -366,6 +412,20 @@ function toBrowserContext(row: BrowserContextRow): BrowserContextRecord {
   };
 }
 
+function toBrowserPool(row: BrowserPoolRow): BrowserPoolRecord {
+  return {
+    id: row.id,
+    trustZoneId: row.trust_zone_id,
+    browserKind: row.browser_kind,
+    status: row.status,
+    maxContexts: numberFromSql(row.max_contexts) ?? 0,
+    activeContexts: numberFromSql(row.active_contexts) ?? 0,
+    ...(optionalText(row.cdp_endpoint) ? { cdpEndpoint: row.cdp_endpoint! } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function toBrowserTarget(row: BrowserTargetRow): BrowserTargetRecord {
   return {
     id: row.id,
@@ -393,6 +453,31 @@ function toBrowserObservation(row: BrowserObservationRow): BrowserObservationRec
     observationType: row.observation_type,
     ...(row.payload_json ? { payload: parseJsonText(row.payload_json) } : {}),
     createdAt: row.created_at,
+  };
+}
+
+function toResourceLease(row: ResourceLeaseRow): ResourceLeaseRecord {
+  return {
+    id: row.id,
+    resourceType: row.resource_type,
+    resourceId: row.resource_id,
+    ...(optionalText(row.owner_task_id) ? { ownerTaskId: row.owner_task_id! } : {}),
+    ...(optionalText(row.owner_agent_id) ? { ownerAgentId: row.owner_agent_id! } : {}),
+    ...(optionalText(row.trust_zone_id) ? { trustZoneId: row.trust_zone_id! } : {}),
+    status: row.status,
+    ...(optionalText(row.lease_until) ? { leaseUntil: row.lease_until! } : {}),
+    ...(numberFromSql(row.max_runtime_ms) !== undefined
+      ? { maxRuntimeMs: numberFromSql(row.max_runtime_ms) }
+      : {}),
+    ...(numberFromSql(row.max_bytes_out) !== undefined
+      ? { maxBytesOut: numberFromSql(row.max_bytes_out) }
+      : {}),
+    ...(numberFromSql(row.max_tokens) !== undefined
+      ? { maxTokens: numberFromSql(row.max_tokens) }
+      : {}),
+    ...(row.metadata_json ? { metadata: parseJsonText(row.metadata_json) } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -503,18 +588,22 @@ export class LocalKernelDatabase {
 
   inspect(): { path: string; schemaVersion: number; counts: Record<string, number> } {
     const tables = [
+      "runtime_info",
       "agents",
       "sessions",
       "transcript_events",
       "tasks",
       "tool_calls",
       "resource_leases",
+      "browser_pools",
       "browser_contexts",
       "browser_targets",
       "browser_observations",
       "artifacts",
+      "artifact_access",
       "capabilities",
       "audit_log",
+      "usage_records",
     ];
     const countsOut: Record<string, number> = {};
     for (const table of tables) {
@@ -526,6 +615,35 @@ export class LocalKernelDatabase {
 
   vacuum(): void {
     this.db.exec("VACUUM;");
+  }
+
+  setRuntimeInfo(key: string, value: string, updatedAt = nowIso()): RuntimeInfoRecord {
+    this.db
+      .prepare(
+        `INSERT INTO runtime_info(key, value, updated_at)
+         VALUES(?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value=excluded.value,
+           updated_at=excluded.updated_at`,
+      )
+      .run(key, value, updatedAt);
+    return { key, value, updatedAt };
+  }
+
+  getRuntimeInfo(key: string): RuntimeInfoRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM runtime_info WHERE key = ?").get(key) as
+      | RuntimeInfoRow
+      | undefined;
+    return row ? { key: row.key, value: row.value, updatedAt: row.updated_at } : undefined;
+  }
+
+  listRuntimeInfo(prefix?: string): RuntimeInfoRecord[] {
+    const rows = prefix
+      ? (this.db
+          .prepare("SELECT * FROM runtime_info WHERE key LIKE ? ORDER BY key ASC")
+          .all(`${prefix}%`) as RuntimeInfoRow[])
+      : (this.db.prepare("SELECT * FROM runtime_info ORDER BY key ASC").all() as RuntimeInfoRow[]);
+    return rows.map((row) => ({ key: row.key, value: row.value, updatedAt: row.updated_at }));
   }
 
   listTrustZones(): TrustZoneRecord[] {
@@ -1487,6 +1605,32 @@ export class LocalKernelDatabase {
     return id;
   }
 
+  listBrowserPools(input: { trustZoneId?: string; status?: string } = {}): BrowserPoolRecord[] {
+    const conditions: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.trustZoneId) {
+      conditions.push("bp.trust_zone_id = ?");
+      params.push(input.trustZoneId);
+    }
+    if (input.status) {
+      conditions.push("bp.status = ?");
+      params.push(input.status);
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT bp.*,
+                COALESCE(SUM(CASE WHEN bc.status = 'active' THEN 1 ELSE 0 END), 0) AS active_contexts
+         FROM browser_pools bp
+         LEFT JOIN browser_contexts bc ON bc.pool_id = bp.id
+         ${where}
+         GROUP BY bp.id
+         ORDER BY bp.trust_zone_id ASC, bp.browser_kind ASC, bp.id ASC`,
+      )
+      .all(...params) as BrowserPoolRow[];
+    return rows.map(toBrowserPool);
+  }
+
   countActiveBrowserContexts(poolId: string): number {
     const row = this.db
       .prepare(
@@ -1845,6 +1989,7 @@ export class LocalKernelDatabase {
     maxRuntimeMs?: number;
     maxBytesOut?: number;
     maxTokens?: number;
+    metadata?: unknown;
     now?: string;
   }): string {
     const id = input.id ?? `lease_${crypto.randomUUID()}`;
@@ -1853,8 +1998,8 @@ export class LocalKernelDatabase {
       .prepare(
         `INSERT INTO resource_leases(
           id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id,
-          status, lease_until, max_runtime_ms, max_bytes_out, max_tokens, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`,
+          status, lease_until, max_runtime_ms, max_bytes_out, max_tokens, metadata_json, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1867,6 +2012,7 @@ export class LocalKernelDatabase {
         input.maxRuntimeMs ?? null,
         input.maxBytesOut ?? null,
         input.maxTokens ?? null,
+        jsonToText(input.metadata),
         now,
         now,
       );
@@ -1879,6 +2025,54 @@ export class LocalKernelDatabase {
       createdAt: now,
     });
     return id;
+  }
+
+  getResourceLease(id: string): ResourceLeaseRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM resource_leases WHERE id = ?").get(id) as
+      | ResourceLeaseRow
+      | undefined;
+    return row ? toResourceLease(row) : undefined;
+  }
+
+  listResourceLeases(
+    input: {
+      resourceType?: string;
+      status?: string;
+      trustZoneId?: string;
+      ownerAgentId?: string;
+      limit?: number;
+    } = {},
+  ): ResourceLeaseRecord[] {
+    const conditions: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.resourceType) {
+      conditions.push("resource_type = ?");
+      params.push(input.resourceType);
+    }
+    if (input.status) {
+      conditions.push("status = ?");
+      params.push(input.status);
+    }
+    if (input.trustZoneId) {
+      conditions.push("trust_zone_id = ?");
+      params.push(input.trustZoneId);
+    }
+    if (input.ownerAgentId) {
+      conditions.push("owner_agent_id = ?");
+      params.push(input.ownerAgentId);
+    }
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 100)));
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM resource_leases
+         ${where}
+         ORDER BY updated_at DESC, id ASC
+         LIMIT ?`,
+      )
+      .all(...params, limit) as ResourceLeaseRow[];
+    return rows.map(toResourceLease);
   }
 
   releaseResourceLease(id: string, now = nowIso()): boolean {
@@ -2007,6 +2201,24 @@ export class LocalKernelDatabase {
       payload: { error: message },
       createdAt: now,
     });
+  }
+
+  summarizeArtifactRetention(): ArtifactRetentionSummaryRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT COALESCE(retention_policy, 'unknown') AS retention_policy,
+                COUNT(*) AS count,
+                COALESCE(SUM(size_bytes), 0) AS size_bytes
+         FROM artifacts
+         GROUP BY COALESCE(retention_policy, 'unknown')
+         ORDER BY retention_policy ASC`,
+      )
+      .all() as ArtifactRetentionSummaryRow[];
+    return rows.map((row) => ({
+      retentionPolicy: (row.retention_policy ?? "unknown") as RuntimeRetentionPolicy | "unknown",
+      count: numberFromSql(row.count) ?? 0,
+      sizeBytes: numberFromSql(row.size_bytes) ?? 0,
+    }));
   }
 
   pruneArtifacts(params: { olderThan: string; retentionPolicies?: string[] }): ArtifactRecord[] {

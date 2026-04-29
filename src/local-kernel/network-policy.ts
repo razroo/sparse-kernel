@@ -1,3 +1,4 @@
+import { lookup as defaultDnsLookup } from "node:dns/promises";
 import net from "node:net";
 import type { LocalKernelDatabase } from "./database.js";
 
@@ -6,6 +7,11 @@ export type NetworkPolicyDecision = {
   reason: string;
   proxyRef?: string;
 };
+
+export type NetworkPolicyDnsLookup = (
+  hostname: string,
+  options: { all: true },
+) => Promise<Array<{ address: string; family: number }>>;
 
 function hostMatchesPattern(host: string, pattern: string): boolean {
   const normalizedHost = host.toLowerCase();
@@ -230,4 +236,97 @@ export function checkTrustZoneNetworkUrl(params: {
     reason: allowed ? "default allow" : "default deny",
     proxyRef: policy.proxyRef,
   };
+}
+
+export async function checkTrustZoneNetworkUrlWithDns(params: {
+  db: LocalKernelDatabase;
+  trustZoneId: string;
+  url: string;
+  actor?: { type: string; id?: string };
+  lookup?: NetworkPolicyDnsLookup;
+}): Promise<NetworkPolicyDecision> {
+  const baseDecision = checkTrustZoneNetworkUrl(params);
+  if (!baseDecision.allowed) {
+    return baseDecision;
+  }
+
+  const policy = params.db.getNetworkPolicyForTrustZone(params.trustZoneId);
+  if (!policy) {
+    return baseDecision;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(params.url);
+  } catch {
+    return baseDecision;
+  }
+  const host = normalizeUrlHostname(parsed.hostname);
+  if (net.isIP(host) !== 0 || host.toLowerCase() === "localhost" || host.endsWith(".localhost")) {
+    return baseDecision;
+  }
+
+  let results: Array<{ address: string; family: number }>;
+  try {
+    const lookup: NetworkPolicyDnsLookup =
+      params.lookup ??
+      (async (hostname, options) =>
+        (await defaultDnsLookup(hostname, options)) as Array<{ address: string; family: number }>);
+    results = await lookup(host, { all: true });
+  } catch (error) {
+    params.db.recordAudit({
+      actor: params.actor ?? { type: "runtime" },
+      action: "network_policy.denied_dns_lookup_failed",
+      objectType: "network_policy",
+      objectId: policy.id,
+      payload: {
+        trustZoneId: params.trustZoneId,
+        host,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    return { allowed: false, reason: "dns lookup failed", proxyRef: policy.proxyRef };
+  }
+
+  for (const result of results) {
+    const address = normalizeUrlHostname(result.address);
+    const deniedCidr = policy.deniedCidrs?.find((cidr) => cidrContainsHost(cidr, address));
+    if (deniedCidr) {
+      params.db.recordAudit({
+        actor: params.actor ?? { type: "runtime" },
+        action: "network_policy.denied_resolved_cidr",
+        objectType: "network_policy",
+        objectId: policy.id,
+        payload: {
+          trustZoneId: params.trustZoneId,
+          host,
+          address,
+          family: result.family,
+          cidr: deniedCidr,
+        },
+      });
+      return { allowed: false, reason: "resolved denied cidr", proxyRef: policy.proxyRef };
+    }
+    if (!policy.allowPrivateNetwork && isLocalHost(address)) {
+      params.db.recordAudit({
+        actor: params.actor ?? { type: "runtime" },
+        action: "network_policy.denied_resolved_private_network",
+        objectType: "network_policy",
+        objectId: policy.id,
+        payload: {
+          trustZoneId: params.trustZoneId,
+          host,
+          address,
+          family: result.family,
+        },
+      });
+      return {
+        allowed: false,
+        reason: "resolved private network denied",
+        proxyRef: policy.proxyRef,
+      };
+    }
+  }
+
+  return baseDecision;
 }

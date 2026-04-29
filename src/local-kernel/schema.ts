@@ -3,7 +3,7 @@ export type KernelMigration = {
   statements: readonly string[];
 };
 
-export const LOCAL_KERNEL_SCHEMA_VERSION = 3;
+export const LOCAL_KERNEL_SCHEMA_VERSION = 4;
 
 const createBaseSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -343,6 +343,19 @@ CREATE INDEX IF NOT EXISTS browser_observations_target_created_idx ON browser_ob
 CREATE INDEX IF NOT EXISTS browser_observations_type_created_idx ON browser_observations(observation_type, created_at);
 `;
 
+const createRuntimeInfoAndLeaseMetadata = `
+CREATE TABLE IF NOT EXISTS runtime_info(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+ALTER TABLE resource_leases ADD COLUMN metadata_json TEXT;
+
+CREATE INDEX IF NOT EXISTS resource_leases_owner_status_updated_idx ON resource_leases(owner_agent_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS runtime_info_updated_idx ON runtime_info(updated_at);
+`;
+
 export const LOCAL_KERNEL_MIGRATIONS: readonly KernelMigration[] = [
   {
     version: 1,
@@ -355,5 +368,9 @@ export const LOCAL_KERNEL_MIGRATIONS: readonly KernelMigration[] = [
   {
     version: 3,
     statements: [createBrowserTargetLedger],
+  },
+  {
+    version: 4,
+    statements: [createRuntimeInfoAndLeaseMetadata],
   },
 ];

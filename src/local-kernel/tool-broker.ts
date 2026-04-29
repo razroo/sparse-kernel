@@ -8,7 +8,7 @@ import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
 import { attachSparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 import type { LocalKernelDatabase } from "./database.js";
-import { checkTrustZoneNetworkUrl } from "./network-policy.js";
+import { checkTrustZoneNetworkUrl, checkTrustZoneNetworkUrlWithDns } from "./network-policy.js";
 import { LocalSandboxBroker, type SandboxBackendKind } from "./sandbox-broker.js";
 
 const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
@@ -81,6 +81,16 @@ function isTruthyToolFlag(raw: string | undefined): boolean {
   return normalized === "on" || normalized === "1" || normalized === "true";
 }
 
+function requiresPluginSubprocess(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return (
+    normalized === "subprocess" ||
+    normalized === "out-of-process" ||
+    normalized === "out_of_process" ||
+    normalized === "strict"
+  );
+}
+
 export function isSandboxCommandToolName(name: string): boolean {
   const normalized = name.trim().toLowerCase();
   return normalized === "exec" || normalized === "bash" || normalized === "shell";
@@ -148,6 +158,29 @@ export class CapabilityToolBroker {
         });
         if (!allowed) {
           const err = new Error(`Tool invocation denied: ${tool.name}`);
+          this.db.failToolCall(toolCallDbId, err);
+          throw err;
+        }
+        const env = this.options.env ?? process.env;
+        if (
+          pluginMeta &&
+          (requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
+            requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS))
+        ) {
+          const err = new Error(
+            `Plugin tool ${tool.name} from ${pluginMeta.pluginId} requires out-of-process execution, which is not implemented in v0.`,
+          );
+          this.db.recordAudit({
+            actor: { type: context.subject.subjectType, id: context.subject.subjectId },
+            action: "plugin_tool.subprocess_required",
+            objectType: "tool",
+            objectId: tool.name,
+            payload: {
+              pluginId: pluginMeta.pluginId,
+              taskId: context.taskId,
+              sessionId: context.sessionId,
+            },
+          });
           this.db.failToolCall(toolCallDbId, err);
           throw err;
         }
@@ -286,17 +319,30 @@ export class CapabilityToolBroker {
     const shouldEnforceNetwork =
       env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "1" ||
       env.OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE === "true";
+    const dnsPolicyMode = env.OPENCLAW_RUNTIME_BROWSER_POLICY_DNS?.trim().toLowerCase();
+    const shouldResolveNetworkDns =
+      shouldEnforceNetwork &&
+      dnsPolicyMode !== "0" &&
+      dnsPolicyMode !== "false" &&
+      dnsPolicyMode !== "off";
     const allowedOrigins =
       shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")
         ? [urlCandidate]
         : undefined;
     if (shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")) {
-      const decision = checkTrustZoneNetworkUrl({
-        db: this.db,
-        trustZoneId,
-        url: urlCandidate,
-        actor: { type: "agent", id: context.agentId },
-      });
+      const decision = shouldResolveNetworkDns
+        ? await checkTrustZoneNetworkUrlWithDns({
+            db: this.db,
+            trustZoneId,
+            url: urlCandidate,
+            actor: { type: "agent", id: context.agentId },
+          })
+        : checkTrustZoneNetworkUrl({
+            db: this.db,
+            trustZoneId,
+            url: urlCandidate,
+            actor: { type: "agent", id: context.agentId },
+          });
       if (!decision.allowed) {
         throw new Error(
           `Browser tool navigation denied by SparseKernel network policy: ${decision.reason}`,
@@ -471,6 +517,7 @@ export class CapabilityToolBroker {
       trustZoneId: "code_execution",
       requirements: {
         backend,
+        dockerImage: typeof record.dockerImage === "string" ? record.dockerImage : undefined,
         maxRuntimeMs:
           typeof record.timeoutMs === "number" && Number.isFinite(record.timeoutMs)
             ? record.timeoutMs
@@ -485,6 +532,7 @@ export class CapabilityToolBroker {
       const result = await broker.runCommand({
         allocationId: allocation.id,
         backend,
+        dockerImage: typeof record.dockerImage === "string" ? record.dockerImage : undefined,
         command,
         args,
         cwd: typeof record.cwd === "string" ? record.cwd : undefined,

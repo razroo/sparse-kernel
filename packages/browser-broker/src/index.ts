@@ -2404,7 +2404,7 @@ function buildActionExpression(
       normalizeMouseButton(request.kind === "click" ? request.button : undefined),
     );
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   if (${JSON.stringify(request.kind)} === "scrollIntoView") return { ok: true };
@@ -2426,7 +2426,7 @@ function buildActionExpression(
     const submit = request.submit === true;
     const slowly = request.slowly === true;
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   node.focus?.();
@@ -2460,7 +2460,7 @@ function buildActionExpression(
   if (request.kind === "select") {
     const values = JSON.stringify(request.values);
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   const values = ${values};
@@ -2574,24 +2574,68 @@ function buildEvaluateExpression(
 })()`;
 }
 
-function buildActionTargetHelpers(selectorJson: string, timeoutJson: string): string {
+function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kind: string): string {
   return `const selector = ${selectorJson};
   const timeoutMs = ${timeoutJson};
+  const actionKind = ${JSON.stringify(kind)};
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const rectSnapshot = (node) => {
+    const rect = node.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  };
   const isVisible = (node) => {
     if (!node?.isConnected) return false;
     const style = getComputedStyle(node);
-    if (style.visibility === "hidden" || style.display === "none") return false;
-    return node.getClientRects().length > 0;
+    if (style.visibility === "hidden" || style.display === "none" || style.pointerEvents === "none") return false;
+    const rect = rectSnapshot(node);
+    return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
+  };
+  const isEnabled = (node) => {
+    if (node.disabled === true) return false;
+    if (node.getAttribute?.("aria-disabled") === "true") return false;
+    return true;
+  };
+  const isEditable = (node) => {
+    if (node.isContentEditable) return true;
+    if (node instanceof HTMLTextAreaElement) return !node.readOnly && !node.disabled;
+    if (node instanceof HTMLInputElement) {
+      const type = String(node.type || "text").toLowerCase();
+      return !node.readOnly && !node.disabled && !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(type);
+    }
+    return false;
+  };
+  const receivesCenterHit = (node) => {
+    const rect = node.getBoundingClientRect();
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(window.innerWidth - 1, 0));
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(window.innerHeight - 1, 0));
+    const hit = document.elementFromPoint(x, y);
+    return !hit || hit === node || node.contains(hit);
+  };
+  const isStable = async (node) => {
+    const first = rectSnapshot(node);
+    await delay(50);
+    const second = rectSnapshot(node);
+    return Math.abs(first.x - second.x) < 0.5 &&
+      Math.abs(first.y - second.y) < 0.5 &&
+      Math.abs(first.width - second.width) < 0.5 &&
+      Math.abs(first.height - second.height) < 0.5;
+  };
+  const isActionable = async (node) => {
+    if (!isVisible(node)) return false;
+    if ((actionKind === "click" || actionKind === "type" || actionKind === "select") && !isEnabled(node)) return false;
+    if (actionKind === "type" && !isEditable(node)) return false;
+    if (!(await isStable(node))) return false;
+    if (actionKind !== "scrollIntoView" && !receivesCenterHit(node)) return false;
+    return true;
   };
   const waitForActionTarget = async () => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() <= deadline) {
       const node = document.querySelector(selector);
-      if (node && isVisible(node)) return node;
+      if (node && await isActionable(node)) return node;
       await delay(100);
     }
-    throw new Error("SparseKernel browser action target not found");
+    throw new Error("SparseKernel browser action target not actionable");
   };`;
 }
 

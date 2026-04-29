@@ -1234,6 +1234,9 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     expect(actionExpression).toContain("waitForActionTarget");
     expect(actionExpression).toContain("const timeoutMs = 1234");
     expect(actionExpression).toContain("document.querySelector(selector)");
+    expect(actionExpression).toContain("getBoundingClientRect");
+    expect(actionExpression).toContain("aria-disabled");
+    expect(actionExpression).toContain("elementFromPoint");
   });
 
   it("waits for CDP network idle instead of treating document load as enough", async () => {

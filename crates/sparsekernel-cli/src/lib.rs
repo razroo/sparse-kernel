@@ -431,6 +431,42 @@ fn base64_artifact_compat_disabled() -> bool {
     )
 }
 
+fn base64_artifact_compat_max_bytes() -> Option<usize> {
+    let raw = env::var("SPARSEKERNEL_ARTIFACT_BASE64_MAX_BYTES").ok();
+    let Some(value) = raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(1024 * 1024);
+    };
+    let normalized = value.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "unlimited" | "none" | "off") {
+        return None;
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .map(Some)
+        .unwrap_or(Some(1024 * 1024))
+}
+
+fn enforce_base64_artifact_compat_size(
+    bytes_len: usize,
+    operation: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(max_bytes) = base64_artifact_compat_max_bytes() else {
+        return Ok(());
+    };
+    if bytes_len <= max_bytes {
+        return Ok(());
+    }
+    Err(format!(
+        "base64 artifact {operation} is limited to {max_bytes} bytes; use /artifacts/import-file or /artifacts/export-file"
+    )
+    .into())
+}
+
 fn canonical_child_path(root: &Path, raw_path: &str) -> Result<PathBuf, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let canonical_root = root.canonicalize()?;
@@ -856,6 +892,9 @@ pub fn handle_api_request_with_artifact_root(
                 );
             }
             let bytes = decode_artifact_content(&input)?;
+            if input.content_base64.is_some() {
+                enforce_base64_artifact_compat_size(bytes.len(), "create")?;
+            }
             if let Some(subject) = &input.subject {
                 require_artifact_capability(db, subject, None, "write")?;
             }
@@ -928,11 +967,13 @@ pub fn handle_api_request_with_artifact_root(
                     subject.permission.as_deref().unwrap_or("read"),
                 )
             });
+            let artifact = db.get_artifact(&input.id)?;
+            enforce_base64_artifact_compat_size(artifact.size_bytes as usize, "read")?;
             let bytes = store.read(&input.id, subject)?;
             ApiReply {
                 status_code: 200,
                 body: json!({
-                    "artifact": db.get_artifact(&input.id)?,
+                    "artifact": artifact,
                     "content_base64": BASE64_STANDARD.encode(bytes),
                 }),
             }
@@ -1743,5 +1784,72 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("base64 artifact read is disabled"));
+    }
+
+    #[test]
+    fn artifact_api_limits_base64_compatibility_size() {
+        let _guard = env_lock();
+        let previous_limit = env::var("SPARSEKERNEL_ARTIFACT_BASE64_MAX_BYTES").ok();
+        let previous_disable = env::var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS").ok();
+        let previous_mode = env::var("SPARSEKERNEL_ARTIFACT_BASE64").ok();
+        env::set_var("SPARSEKERNEL_ARTIFACT_BASE64_MAX_BYTES", "4");
+        env::remove_var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS");
+        env::remove_var("SPARSEKERNEL_ARTIFACT_BASE64");
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let create = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/create",
+            serde_json::to_string(&json!({
+                "content_base64": BASE64_STANDARD.encode(b"too large"),
+            }))
+            .unwrap()
+            .as_bytes(),
+            Some(root.path()),
+        );
+        let text = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/create",
+            serde_json::to_string(&json!({
+                "content_text": "too large for base64",
+                "mime_type": "text/plain",
+            }))
+            .unwrap()
+            .as_bytes(),
+            Some(root.path()),
+        )
+        .unwrap()
+        .body;
+        let read = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/read",
+            serde_json::to_string(&json!({ "id": text["id"] }))
+                .unwrap()
+                .as_bytes(),
+            Some(root.path()),
+        );
+        match previous_limit {
+            Some(value) => env::set_var("SPARSEKERNEL_ARTIFACT_BASE64_MAX_BYTES", value),
+            None => env::remove_var("SPARSEKERNEL_ARTIFACT_BASE64_MAX_BYTES"),
+        }
+        match previous_disable {
+            Some(value) => env::set_var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS", value),
+            None => env::remove_var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS"),
+        }
+        match previous_mode {
+            Some(value) => env::set_var("SPARSEKERNEL_ARTIFACT_BASE64", value),
+            None => env::remove_var("SPARSEKERNEL_ARTIFACT_BASE64"),
+        }
+        assert!(create
+            .unwrap_err()
+            .to_string()
+            .contains("base64 artifact create is limited"));
+        assert!(read
+            .unwrap_err()
+            .to_string()
+            .contains("base64 artifact read is limited"));
     }
 }

@@ -448,6 +448,7 @@ describe("browser control server", () => {
     const press = await postJson<{ ok: boolean }>(`${base}/act`, {
       kind: "press",
       key: "Enter",
+      modifiers: ["Alt"],
     });
     expect(press.ok).toBe(true);
     expect(pwMocks.pressKeyViaPlaywright).toHaveBeenCalledWith(
@@ -455,6 +456,7 @@ describe("browser control server", () => {
         cdpUrl: state.cdpBaseUrl,
         targetId: "abcd1234",
         key: "Enter",
+        modifiers: ["Alt"],
         ssrfPolicy: {
           dangerouslyAllowPrivateNetwork: true,
         },

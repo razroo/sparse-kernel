@@ -728,6 +728,7 @@ export async function pressKeyViaPlaywright(opts: {
   targetId?: string;
   key: string;
   delayMs?: number;
+  modifiers?: Array<"Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift">;
   ssrfPolicy?: SsrFPolicy;
 }): Promise<void> {
   const key = normalizeOptionalString(opts.key) ?? "";
@@ -739,9 +740,19 @@ export async function pressKeyViaPlaywright(opts: {
   const previousUrl = page.url();
   await assertInteractionNavigationCompletedSafely({
     action: async () => {
-      await page.keyboard.press(key, {
-        delay: Math.max(0, Math.floor(opts.delayMs ?? 0)),
-      });
+      const modifiers = normalizeMouseKeyboardModifiers(opts.modifiers);
+      for (const modifier of modifiers) {
+        await page.keyboard.down(modifier);
+      }
+      try {
+        await page.keyboard.press(key, {
+          delay: Math.max(0, Math.floor(opts.delayMs ?? 0)),
+        });
+      } finally {
+        for (const modifier of [...modifiers].reverse()) {
+          await page.keyboard.up(modifier);
+        }
+      }
     },
     cdpUrl: opts.cdpUrl,
     page,
@@ -1333,6 +1344,9 @@ async function executeSingleAction(
         targetId: effectiveTargetId,
         key: action.key,
         delayMs: action.delayMs,
+        modifiers: action.modifiers as Array<
+          "Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift"
+        >,
         ssrfPolicy,
       });
       break;

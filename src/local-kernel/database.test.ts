@@ -14,6 +14,7 @@ import {
   checkTrustZoneNetworkUrl,
   checkTrustZoneNetworkUrlWithDns,
   ContentAddressedArtifactStore,
+  isSandboxBackendAvailable,
   LocalBrowserBroker,
   LocalKernelDatabase,
   LocalSandboxBroker,
@@ -796,6 +797,57 @@ describe("local runtime kernel database", () => {
           "sandbox.released",
         ]),
       );
+    } finally {
+      if (previousHard === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = previousHard;
+      }
+      if (previousHelper === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = previousHelper;
+      }
+      if (previousHelperArgs === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS = previousHelperArgs;
+      }
+    }
+  });
+
+  it("supports builtin hard egress only for backends that carry a real boundary", () => {
+    const previousHard = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
+    const previousHelper = process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+    const previousHelperArgs = process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = "builtin";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    try {
+      const db = openTempDb();
+      const broker = new LocalSandboxBroker(db);
+      expect(() =>
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "public_web",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toThrow(/builtin hard egress only supports/);
+
+      if (isSandboxBackendAvailable("bwrap")) {
+        const allocation = broker.allocateSandbox({
+          taskId: "task-b",
+          trustZoneId: "public_web",
+          requirements: { backend: "bwrap" },
+        });
+        expect(db.getResourceLease(allocation.id)?.metadata).toMatchObject({
+          hardEgress: {
+            helper: "builtin",
+            boundary: "platform_enforcer",
+          },
+        });
+        expect(broker.releaseSandbox(allocation.id)).toBe(true);
+      }
     } finally {
       if (previousHard === undefined) {
         delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;

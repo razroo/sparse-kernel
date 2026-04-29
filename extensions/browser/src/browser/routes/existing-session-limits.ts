@@ -7,6 +7,7 @@ export const EXISTING_SESSION_LIMITS = {
     typeSlowly: "existing-session type does not support slowly=true; use fill/press instead.",
     typeTimeout: "existing-session type does not support timeoutMs overrides.",
     pressDelay: "existing-session press does not support delayMs.",
+    pressModifiers: "existing-session press does not support modifiers.",
     hoverSelector: "existing-session hover does not support selector targeting yet; use ref.",
     hoverTimeout: "existing-session hover does not support timeoutMs overrides.",
     scrollSelector:

@@ -198,7 +198,7 @@ export type SparseKernelBrowserActRequest =
       slowly?: boolean;
       timeoutMs?: number;
     }
-  | { kind: "press"; key: string; targetId?: string; delayMs?: number }
+  | { kind: "press"; key: string; targetId?: string; delayMs?: number; modifiers?: string[] }
   | { kind: "hover"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
   | {
       kind: "scrollIntoView";
@@ -912,9 +912,14 @@ export class SparseKernelCdpBrowserBroker {
       }
       case "press": {
         return await this.withPostActionNavigationGuard(context, undefined, async () => {
+          const modifiers = resolveCdpInputModifiers(request.modifiers);
           await context.connection.command(
             "Input.dispatchKeyEvent",
-            { type: "keyDown", key: request.key },
+            {
+              type: "keyDown",
+              key: request.key,
+              ...(modifiers ? { modifiers } : {}),
+            },
             context.page_session_id,
           );
           if (request.delayMs && request.delayMs > 0) {
@@ -922,7 +927,11 @@ export class SparseKernelCdpBrowserBroker {
           }
           await context.connection.command(
             "Input.dispatchKeyEvent",
-            { type: "keyUp", key: request.key },
+            {
+              type: "keyUp",
+              key: request.key,
+              ...(modifiers ? { modifiers } : {}),
+            },
             context.page_session_id,
           );
           return { ok: true, targetId: context.target_id, kind: request.kind };

@@ -426,6 +426,7 @@ function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActR
         kind,
         key: readString(value.key) ?? "Enter",
         targetId: readString(value.targetId),
+        modifiers: readStringArray(value.modifiers),
         delayMs: readNumber(value.delayMs),
       } as const;
     case "hover":

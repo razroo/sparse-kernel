@@ -848,6 +848,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     const pressed = await broker.actContext(context.ledger_context.id, {
       kind: "press",
       key: "Enter",
+      modifiers: ["ControlOrMeta"],
     });
 
     expect(clicked).toMatchObject({ ok: true, targetId: "target-1", kind: "click" });
@@ -858,7 +859,13 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
           method: "Input.dispatchMouseEvent",
           params: expect.objectContaining({ type: "mousePressed", modifiers: 8 }),
         }),
-        expect.objectContaining({ method: "Input.dispatchKeyEvent" }),
+        expect.objectContaining({
+          method: "Input.dispatchKeyEvent",
+          params: expect.objectContaining({
+            type: "keyDown",
+            modifiers: process.platform === "darwin" ? 4 : 2,
+          }),
+        }),
       ]),
     );
   });

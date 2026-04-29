@@ -303,6 +303,9 @@ function getExistingSessionUnsupportedMessage(action: BrowserActRequest): string
       }
       return action.timeoutMs ? EXISTING_SESSION_LIMITS.act.typeTimeout : null;
     case "press":
+      if (Array.isArray(action.modifiers) && action.modifiers.length > 0) {
+        return EXISTING_SESSION_LIMITS.act.pressModifiers;
+      }
       return action.delayMs ? EXISTING_SESSION_LIMITS.act.pressDelay : null;
     case "hover":
       if (action.selector) {

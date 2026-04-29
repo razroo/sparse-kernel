@@ -37,7 +37,7 @@ export type BrowserActRequest =
       slowly?: boolean;
       timeoutMs?: number;
     }
-  | { kind: "press"; key: string; targetId?: string; delayMs?: number }
+  | { kind: "press"; key: string; targetId?: string; delayMs?: number; modifiers?: string[] }
   | {
       kind: "hover";
       ref?: string;

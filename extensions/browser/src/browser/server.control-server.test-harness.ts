@@ -216,7 +216,7 @@ const passThroughActDispatch: Record<string, PassThroughActDispatch> = {
   },
   clickCoords: {
     mock: pwMocks.clickCoordsViaPlaywright,
-    fields: ["x", "y", "doubleClick", "button", "delayMs", "timeoutMs"],
+    fields: ["x", "y", "doubleClick", "button", "modifiers", "delayMs", "timeoutMs"],
     includeSsrf: true,
   },
   type: {
@@ -226,7 +226,7 @@ const passThroughActDispatch: Record<string, PassThroughActDispatch> = {
   },
   press: {
     mock: pwMocks.pressKeyViaPlaywright,
-    fields: ["key", "delayMs"],
+    fields: ["key", "modifiers", "delayMs"],
     includeSsrf: true,
   },
   hover: {

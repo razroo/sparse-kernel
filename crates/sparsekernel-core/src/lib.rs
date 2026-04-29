@@ -2398,7 +2398,18 @@ fn run_hard_egress_helper(
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            enforcement
+                .and_then(|value| value.get("helper"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| SparseKernelError::Denied("missing hard egress helper".to_string()))?;
+    if is_builtin_hard_egress_helper(&helper) {
+        return run_builtin_hard_egress_helper(action, allocation_id, backend);
+    }
     let payload = json!({
         "protocol": "openclaw.sparsekernel.sandbox-egress.v1",
         "action": action,
@@ -2472,6 +2483,37 @@ fn run_hard_egress_helper(
         "enforcementId": enforcement_id,
         "boundary": boundary,
         "description": response.get("description").and_then(Value::as_str),
+    })))
+}
+
+fn is_builtin_hard_egress_helper(helper: &str) -> bool {
+    matches!(
+        helper.trim().to_ascii_lowercase().as_str(),
+        "builtin" | "sparsekernel:builtin" | "openclaw:sparsekernel:builtin"
+    )
+}
+
+fn run_builtin_hard_egress_helper(
+    action: &str,
+    allocation_id: &str,
+    backend: &str,
+) -> Result<Option<Value>> {
+    if action == "release" {
+        return Ok(None);
+    }
+    let description = match backend {
+        "bwrap" => "bubblewrap --unshare-all selected by the SparseKernel sandbox backend",
+        _ => {
+            return Err(SparseKernelError::Denied(format!(
+                "builtin hard egress only supports daemon-owned bwrap allocations, got {backend}"
+            )));
+        }
+    };
+    Ok(Some(json!({
+        "helper": "builtin",
+        "enforcementId": format!("builtin:{backend}:{allocation_id}"),
+        "boundary": "platform_enforcer",
+        "description": description,
     })))
 }
 
@@ -3122,6 +3164,51 @@ mod tests {
         assert!(audit
             .iter()
             .any(|entry| entry.action == "network_policy.hard_egress_enforced"));
+        assert!(release_result.unwrap().unwrap());
+    }
+
+    #[test]
+    fn sandbox_builtin_hard_egress_allows_backend_enforced_allocations() {
+        let _guard = env_lock();
+        let (_dir, db) = temp_db();
+        let previous = env::var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS").ok();
+        let previous_helper = env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER").ok();
+        let previous_helper_args =
+            env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS").ok();
+        env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", "1");
+        env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", "builtin");
+        env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS");
+        let sandbox = LocalSandboxBroker { db: &db };
+        let allocation = sandbox.allocate_sandbox(None, None, "public_web", Some("bwrap"));
+        let release_result = allocation
+            .as_ref()
+            .ok()
+            .map(|allocation| sandbox.release_sandbox(&allocation.id));
+        let audit = db.list_audit(5).unwrap();
+        match previous {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
+        }
+        match previous_helper {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER"),
+        }
+        match previous_helper_args {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS"),
+        }
+        let allocation = allocation.unwrap();
+        assert_eq!(allocation.backend, "bwrap");
+        assert!(audit.iter().any(|entry| {
+            entry.action == "network_policy.hard_egress_enforced"
+                && entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("enforcement"))
+                    .and_then(|enforcement| enforcement.get("boundary"))
+                    .and_then(Value::as_str)
+                    == Some("platform_enforcer")
+        }));
         assert!(release_result.unwrap().unwrap());
     }
 }

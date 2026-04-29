@@ -290,8 +290,12 @@ function readPositiveIntegerEnv(raw: string | undefined, fallback: number): numb
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function resolveHardEgressHelper(env: NodeJS.ProcessEnv): { command: string; args: string[] } {
-  const command = env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER?.trim();
+function resolveHardEgressHelper(
+  env: NodeJS.ProcessEnv,
+  enforcement?: HardEgressEnforcementSnapshot,
+): { command: string; args: string[] } {
+  const command =
+    env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER?.trim() || enforcement?.helper?.trim();
   if (!command) {
     throw new Error("missing hard egress helper");
   }
@@ -301,6 +305,47 @@ function resolveHardEgressHelper(env: NodeJS.ProcessEnv): { command: string; arg
       env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS,
       "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
     ),
+  };
+}
+
+function isBuiltinHardEgressHelper(command: string): boolean {
+  const normalized = command.trim().toLowerCase();
+  return (
+    normalized === "builtin" ||
+    normalized === "sparsekernel:builtin" ||
+    normalized === "openclaw:sparsekernel:builtin"
+  );
+}
+
+function builtinHardEgressDescription(params: {
+  backend: SandboxBackendKind;
+  policy?: SandboxPolicySnapshot;
+}): string {
+  if (params.backend === "docker" && params.policy?.docker?.networkMode === "none") {
+    return "Docker --network none selected by the SparseKernel sandbox policy";
+  }
+  if (params.backend === "bwrap") {
+    return "bubblewrap --unshare-all selected by the SparseKernel sandbox backend";
+  }
+  throw new Error(
+    `builtin hard egress only supports bwrap or Docker with networkMode=none, got ${params.backend}`,
+  );
+}
+
+function runBuiltinHardEgressHelper(params: {
+  action: "allocate" | "release";
+  allocationId: string;
+  backend: SandboxBackendKind;
+  policy?: SandboxPolicySnapshot;
+}): HardEgressEnforcementSnapshot | undefined {
+  if (params.action === "release") {
+    return undefined;
+  }
+  return {
+    helper: "builtin",
+    enforcementId: `builtin:${params.backend}:${params.allocationId}`,
+    boundary: "platform_enforcer",
+    description: builtinHardEgressDescription(params),
   };
 }
 
@@ -332,7 +377,15 @@ function runHardEgressHelper(params: {
   enforcement?: HardEgressEnforcementSnapshot;
   env: NodeJS.ProcessEnv;
 }): HardEgressEnforcementSnapshot | undefined {
-  const helper = resolveHardEgressHelper(params.env);
+  const helper = resolveHardEgressHelper(params.env, params.enforcement);
+  if (isBuiltinHardEgressHelper(helper.command)) {
+    return runBuiltinHardEgressHelper({
+      action: params.action,
+      allocationId: params.allocationId,
+      backend: params.backend,
+      policy: params.policy,
+    });
+  }
   const result = spawnSync(helper.command, helper.args, {
     input: JSON.stringify({
       protocol: "openclaw.sparsekernel.sandbox-egress.v1",

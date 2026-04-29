@@ -146,7 +146,7 @@ export function pluginToolRequiresSubprocess(
   if (meta.processBoundary === "in_process") {
     return false;
   }
-  if (meta.origin !== "bundled" && hasDefaultPluginSubprocessWorker(env)) {
+  if (hasDefaultPluginSubprocessWorker(env)) {
     return true;
   }
   return (

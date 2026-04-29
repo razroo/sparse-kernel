@@ -180,12 +180,18 @@ export function normalizeActRequest(
       if (!key) {
         throw new Error("press requires key");
       }
+      const modifiersRaw = toStringArray(body.modifiers) ?? [];
+      const parsedModifiers = parseClickModifiers(modifiersRaw);
+      if (parsedModifiers.error) {
+        throw new Error(parsedModifiers.error);
+      }
       const targetId = toStringOrEmpty(body.targetId) || undefined;
       const delayMs = toNumber(body.delayMs);
       return {
         kind,
         key,
         ...(targetId ? { targetId } : {}),
+        ...(parsedModifiers.modifiers ? { modifiers: parsedModifiers.modifiers } : {}),
         ...(delayMs !== undefined ? { delayMs } : {}),
       };
     }

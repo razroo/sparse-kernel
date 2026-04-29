@@ -21,6 +21,22 @@ export type PluginToolMeta = {
     args?: string[];
     cwd?: string;
     timeoutMs?: number;
+    sandbox?: {
+      trustZoneId?: string;
+      backend?:
+        | "local/no_isolation"
+        | "docker"
+        | "bwrap"
+        | "minijail"
+        | "ssh"
+        | "openshell"
+        | "vm"
+        | "other";
+      dockerImage?: string;
+      requireIsolated?: boolean;
+      maxRuntimeMs?: number;
+      maxBytesOut?: number;
+    };
   };
 };
 

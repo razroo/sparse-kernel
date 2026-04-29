@@ -530,6 +530,34 @@ describe("local runtime kernel database", () => {
     ).rejects.toThrow(/not active/);
   });
 
+  it("passes stdin through sandbox command leases", async () => {
+    const db = openTempDb();
+    db.ensureAgent({ id: "main" });
+    db.enqueueTask({ id: "task-a", kind: "demo" });
+    db.grantCapability({
+      subjectType: "agent",
+      subjectId: "main",
+      resourceType: "sandbox",
+      resourceId: "code_execution",
+      action: "allocate",
+    });
+    const broker = new LocalSandboxBroker(db);
+    const allocation = broker.allocateSandbox({
+      taskId: "task-a",
+      agentId: "main",
+      trustZoneId: "code_execution",
+      requirements: { maxRuntimeMs: 5_000, maxBytesOut: 1024 },
+    });
+    await expect(
+      broker.runCommand({
+        allocationId: allocation.id,
+        command: process.execPath,
+        args: ["-e", "process.stdin.pipe(process.stdout)"],
+        stdin: "worker-input",
+      }),
+    ).resolves.toMatchObject({ exitCode: 0, stdout: "worker-input", timedOut: false });
+  });
+
   it("persists sandbox backend metadata across broker instances", async () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });
@@ -671,6 +699,16 @@ describe("local runtime kernel database", () => {
         "-v",
       ]),
     });
+    expect(
+      buildSandboxSpawnPlan({
+        backend: "docker",
+        command: "node",
+        args: ["worker.mjs"],
+        dockerImage: "openclaw-runtime:local",
+        stdin: true,
+        resolveCommand: () => "docker",
+      }).args.slice(0, 4),
+    ).toEqual(["run", "--rm", "-i", "--pull"]);
   });
 
   it("accounts sandboxed runs without requiring a queued task row", () => {

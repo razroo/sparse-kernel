@@ -5,6 +5,7 @@ import {
   type OpenClawSparseKernelToolBrokerClient,
 } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import { getPluginToolMeta } from "../plugins/tools.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
 import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import { openLocalKernelDatabase, type LocalKernelDatabase } from "./database.js";
@@ -200,6 +201,26 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
             sessionKey: input.sessionKey,
             runId: input.runId,
             reason: "exec-shaped tool available for brokered run",
+          },
+          expiresAt: capabilityExpiresAt,
+        });
+      }
+      const pluginMeta = getPluginToolMeta(tool);
+      if (pluginMeta?.subprocess) {
+        const trustZoneId =
+          pluginMeta.subprocess.sandbox?.trustZoneId?.trim() || "plugin_untrusted";
+        db.grantCapability({
+          subjectType: "agent",
+          subjectId: input.agentId,
+          resourceType: "sandbox",
+          resourceId: trustZoneId,
+          action: "allocate",
+          constraints: {
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+            runId: input.runId,
+            pluginId: pluginMeta.pluginId,
+            reason: "plugin subprocess worker available for brokered run",
           },
           expiresAt: capabilityExpiresAt,
         });

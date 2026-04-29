@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { copyPluginToolMeta, getPluginToolMeta, type PluginToolMeta } from "../plugins/tools.js";
@@ -17,6 +16,7 @@ import {
 import { LocalSandboxBroker, type SandboxBackendKind } from "./sandbox-broker.js";
 
 const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
+const DEFAULT_PLUGIN_SANDBOX_TRUST_ZONE_ID = "plugin_untrusted";
 
 export type ToolBrokerSubject = {
   subjectType: string;
@@ -96,12 +96,15 @@ function requiresPluginSubprocess(raw: string | undefined): boolean {
   );
 }
 
+type PluginSubprocessPlan = NonNullable<PluginToolMeta["subprocess"]>;
+
 function resolvePluginSubprocessPlan(
   meta: PluginToolMeta | undefined,
 ): PluginToolMeta["subprocess"] {
   if (!meta?.subprocess?.command?.trim()) {
     return undefined;
   }
+  const sandbox = meta.subprocess.sandbox;
   return {
     command: meta.subprocess.command.trim(),
     args: meta.subprocess.args?.map(String) ?? [],
@@ -109,6 +112,63 @@ function resolvePluginSubprocessPlan(
     ...(typeof meta.subprocess.timeoutMs === "number" && Number.isFinite(meta.subprocess.timeoutMs)
       ? { timeoutMs: Math.max(1, Math.trunc(meta.subprocess.timeoutMs)) }
       : {}),
+    ...(sandbox
+      ? {
+          sandbox: {
+            ...(sandbox.trustZoneId?.trim() ? { trustZoneId: sandbox.trustZoneId.trim() } : {}),
+            ...(sandbox.backend?.trim()
+              ? { backend: sandbox.backend.trim() as SandboxBackendKind }
+              : {}),
+            ...(sandbox.dockerImage?.trim() ? { dockerImage: sandbox.dockerImage.trim() } : {}),
+            ...(typeof sandbox.requireIsolated === "boolean"
+              ? { requireIsolated: sandbox.requireIsolated }
+              : {}),
+            ...(typeof sandbox.maxRuntimeMs === "number" && Number.isFinite(sandbox.maxRuntimeMs)
+              ? { maxRuntimeMs: Math.max(1, Math.trunc(sandbox.maxRuntimeMs)) }
+              : {}),
+            ...(typeof sandbox.maxBytesOut === "number" && Number.isFinite(sandbox.maxBytesOut)
+              ? { maxBytesOut: Math.max(1, Math.trunc(sandbox.maxBytesOut)) }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function resolvePluginSandboxConfig(params: {
+  plan: PluginSubprocessPlan;
+  env: NodeJS.ProcessEnv;
+}): {
+  trustZoneId: string;
+  backend: SandboxBackendKind;
+  dockerImage?: string;
+  requireIsolated: boolean;
+  maxRuntimeMs?: number;
+  maxBytesOut: number;
+} {
+  const sandbox = params.plan.sandbox;
+  const rawBackend =
+    sandbox?.backend ??
+    params.env.OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKEND ??
+    params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_SANDBOX_BACKEND;
+  const backend = (rawBackend?.trim() || "local/no_isolation") as SandboxBackendKind;
+  const dockerImage =
+    sandbox?.dockerImage ??
+    params.env.OPENCLAW_RUNTIME_PLUGIN_DOCKER_IMAGE ??
+    params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_DOCKER_IMAGE ??
+    params.env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE;
+  const maxRuntimeMs = sandbox?.maxRuntimeMs;
+  return {
+    trustZoneId: sandbox?.trustZoneId?.trim() || DEFAULT_PLUGIN_SANDBOX_TRUST_ZONE_ID,
+    backend,
+    ...(dockerImage?.trim() ? { dockerImage: dockerImage.trim() } : {}),
+    requireIsolated:
+      sandbox?.requireIsolated === false ||
+      isTruthyToolFlag(params.env.OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION)
+        ? false
+        : true,
+    ...(maxRuntimeMs !== undefined ? { maxRuntimeMs } : {}),
+    maxBytesOut: sandbox?.maxBytesOut ?? 256 * 1024,
   };
 }
 
@@ -272,7 +332,7 @@ export class CapabilityToolBroker {
   }
 
   private async runPluginToolSubprocess(input: {
-    plan: NonNullable<PluginToolMeta["subprocess"]>;
+    plan: PluginSubprocessPlan;
     pluginMeta: PluginToolMeta;
     tool: AnyAgentTool;
     toolCallId: string;
@@ -280,7 +340,29 @@ export class CapabilityToolBroker {
     context: ToolBrokerContext;
     signal?: AbortSignal;
   }): Promise<AgentToolResult<unknown>> {
-    const timeoutMs = Math.max(1, input.plan.timeoutMs ?? 30_000);
+    if (!input.context.agentId) {
+      throw new Error("Plugin subprocess sandbox allocation requires an agent id.");
+    }
+    const env = this.options.env ?? process.env;
+    const sandboxConfig = resolvePluginSandboxConfig({ plan: input.plan, env });
+    const timeoutMs = Math.max(1, sandboxConfig.maxRuntimeMs ?? input.plan.timeoutMs ?? 30_000);
+    if (sandboxConfig.backend === "local/no_isolation" && sandboxConfig.requireIsolated) {
+      this.db.recordAudit({
+        actor: { type: input.context.subject.subjectType, id: input.context.subject.subjectId },
+        action: "plugin_tool.sandbox_required",
+        objectType: "tool",
+        objectId: input.tool.name,
+        payload: {
+          pluginId: input.pluginMeta.pluginId,
+          trustZoneId: sandboxConfig.trustZoneId,
+          backend: sandboxConfig.backend,
+          reason: "isolated backend required",
+        },
+      });
+      throw new Error(
+        `Plugin subprocess for ${input.tool.name} requires an isolated sandbox backend; configure subprocess.sandbox.backend or set OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION=1 only for trusted local workers.`,
+      );
+    }
     const payload = JSON.stringify({
       protocol: "openclaw.sparsekernel.plugin_tool.v1",
       pluginId: input.pluginMeta.pluginId,
@@ -295,6 +377,22 @@ export class CapabilityToolBroker {
         subject: input.context.subject,
       },
     });
+    const broker = new LocalSandboxBroker(this.db);
+    const allocation = broker.allocateSandbox({
+      taskId:
+        input.context.taskId ??
+        input.context.runId ??
+        input.context.sessionId ??
+        `plugin:${input.tool.name}`,
+      agentId: input.context.agentId,
+      trustZoneId: sandboxConfig.trustZoneId,
+      requirements: {
+        backend: sandboxConfig.backend,
+        dockerImage: sandboxConfig.dockerImage,
+        maxRuntimeMs: timeoutMs,
+        maxBytesOut: sandboxConfig.maxBytesOut,
+      },
+    });
     this.db.recordAudit({
       actor: { type: input.context.subject.subjectType, id: input.context.subject.subjectId },
       action: "plugin_tool.subprocess_started",
@@ -305,85 +403,63 @@ export class CapabilityToolBroker {
         command: input.plan.command,
         args: input.plan.args ?? [],
         timeoutMs,
+        allocationId: allocation.id,
+        trustZoneId: sandboxConfig.trustZoneId,
+        backend: sandboxConfig.backend,
       },
     });
-
-    return await new Promise<AgentToolResult<unknown>>((resolve, reject) => {
-      const child = spawn(input.plan.command, input.plan.args ?? [], {
+    try {
+      const result = await broker.runCommand({
+        allocationId: allocation.id,
+        backend: sandboxConfig.backend,
+        dockerImage: sandboxConfig.dockerImage,
+        command: input.plan.command,
+        args: input.plan.args ?? [],
         cwd: input.plan.cwd,
-        env: process.env,
-        stdio: ["pipe", "pipe", "pipe"],
+        stdin: payload,
+        signal: input.signal,
+        timeoutMs,
+        maxOutputBytes: sandboxConfig.maxBytesOut,
       });
-      let stdout = "";
-      let stderr = "";
-      let settled = false;
-      const finish = (fn: () => void) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        input.signal?.removeEventListener("abort", abort);
-        fn();
-      };
-      const abort = () => {
-        try {
-          child.kill("SIGTERM");
-        } catch {}
-        finish(() => reject(new Error("Plugin subprocess aborted.")));
-      };
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGTERM");
-        } catch {}
-        finish(() => reject(new Error(`Plugin subprocess timed out after ${timeoutMs}ms.`)));
-      }, timeoutMs);
-      timer.unref?.();
-      input.signal?.addEventListener("abort", abort, { once: true });
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
+      if (result.exitCode !== 0 || result.timedOut) {
+        throw new Error(
+          `Plugin subprocess failed: exit=${
+            result.exitCode ?? result.signal ?? "unknown"
+          } stderr=${result.stderr.trim()}`,
+        );
+      }
+      try {
+        return JSON.parse(result.stdout) as AgentToolResult<unknown>;
+      } catch (error) {
+        throw new Error(
+          `Plugin subprocess returned invalid JSON: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    } catch (error) {
+      this.db.recordAudit({
+        actor: { type: input.context.subject.subjectType, id: input.context.subject.subjectId },
+        action: "plugin_tool.subprocess_failed",
+        objectType: "tool",
+        objectId: input.tool.name,
+        payload: {
+          pluginId: input.pluginMeta.pluginId,
+          allocationId: allocation.id,
+          error: error instanceof Error ? error.message : String(error),
+        },
       });
-      child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
-      child.on("error", (error) => {
-        finish(() => reject(error));
-      });
-      child.on("close", (exitCode, signal) => {
-        finish(() => {
-          if (exitCode !== 0) {
-            reject(
-              new Error(
-                `Plugin subprocess failed: exit=${exitCode ?? signal ?? "unknown"} stderr=${stderr.trim()}`,
-              ),
-            );
-            return;
-          }
-          try {
-            resolve(JSON.parse(stdout) as AgentToolResult<unknown>);
-          } catch (error) {
-            reject(
-              new Error(
-                `Plugin subprocess returned invalid JSON: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              ),
-            );
-          }
-        });
-      });
-      child.stdin.end(payload);
-    }).finally(() => {
+      throw error;
+    } finally {
       this.db.recordAudit({
         actor: { type: input.context.subject.subjectType, id: input.context.subject.subjectId },
         action: "plugin_tool.subprocess_finished",
         objectType: "tool",
         objectId: input.tool.name,
-        payload: { pluginId: input.pluginMeta.pluginId },
+        payload: { pluginId: input.pluginMeta.pluginId, allocationId: allocation.id },
       });
-    });
+      broker.releaseSandbox(allocation.id);
+    }
   }
 
   private async prepareToolOutputForLedger(

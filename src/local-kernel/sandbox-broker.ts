@@ -37,6 +37,8 @@ export type SandboxCommandRequest = {
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  stdin?: string | Buffer | Uint8Array;
+  signal?: AbortSignal;
   timeoutMs?: number;
   maxOutputBytes?: number;
 };
@@ -224,6 +226,7 @@ export function buildSandboxSpawnPlan(params: {
   args: string[];
   cwd?: string;
   env?: Record<string, string>;
+  stdin?: boolean;
   dockerImage?: string;
   dockerPolicy?: DockerSandboxPolicy;
   resolveCommand?: CommandResolver;
@@ -293,6 +296,7 @@ export function buildSandboxSpawnPlan(params: {
       const args = [
         "run",
         "--rm",
+        ...(params.stdin ? ["-i"] : []),
         "--pull",
         "never",
         "--network",
@@ -480,6 +484,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         args: request.args ?? [],
         cwd: request.cwd,
         env: request.env,
+        stdin: request.stdin !== undefined,
         dockerImage:
           request.dockerImage ??
           metadata.dockerImage ??
@@ -526,25 +531,38 @@ export class LocalSandboxBroker implements SandboxBroker {
       const child = spawn(spawnPlan.command, spawnPlan.args, {
         cwd: backend === "local/no_isolation" ? request.cwd : undefined,
         env: request.env ? { ...process.env, ...request.env } : process.env,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [request.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
       let timedOut = false;
       let stdout = Buffer.alloc(0);
       let stderr = Buffer.alloc(0);
+      const abort = () => {
+        child.kill("SIGTERM");
+      };
       const append = (current: Buffer, chunk: Buffer) =>
         Buffer.concat([current, chunk]).subarray(0, maxOutputBytes);
       const timer = setTimeout(() => {
         timedOut = true;
         child.kill("SIGTERM");
       }, timeoutMs);
-      child.stdout.on("data", (chunk: Buffer) => {
+      timer.unref?.();
+      if (request.signal?.aborted) {
+        abort();
+      } else {
+        request.signal?.addEventListener("abort", abort, { once: true });
+      }
+      if (request.stdin !== undefined) {
+        child.stdin?.end(request.stdin);
+      }
+      child.stdout?.on("data", (chunk: Buffer) => {
         stdout = append(stdout, chunk);
       });
-      child.stderr.on("data", (chunk: Buffer) => {
+      child.stderr?.on("data", (chunk: Buffer) => {
         stderr = append(stderr, chunk);
       });
       child.on("error", (error) => {
         clearTimeout(timer);
+        request.signal?.removeEventListener("abort", abort);
         this.db.recordAudit({
           actor: { type: "runtime" },
           action: "sandbox.command_failed",
@@ -556,6 +574,7 @@ export class LocalSandboxBroker implements SandboxBroker {
       });
       child.on("close", (exitCode, signal) => {
         clearTimeout(timer);
+        request.signal?.removeEventListener("abort", abort);
         const durationMs = Date.now() - started;
         const result: SandboxCommandResult = {
           allocationId: request.allocationId,

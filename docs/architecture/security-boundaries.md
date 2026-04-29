@@ -23,7 +23,7 @@ SparseKernel security claims must be precise.
 - Docker command execution requires an explicit image and disables container networking by default, but its isolation is only the host Docker daemon's isolation; it is not a per-agent security model.
 - Persisted lease metadata records the selected backend and policy intent; it is audit/accounting state, not isolation by itself.
 - Untrusted plugins must not get ambient host authority.
-- The subprocess-required plugin mode can run plugin tools with explicit subprocess metadata through a JSON worker protocol; that worker still needs an appropriate sandbox backend before it should be treated as safe for untrusted code.
+- The subprocess-required plugin mode runs explicit JSON workers through the sandbox broker. It still only becomes suitable for untrusted code when the selected backend is a real isolation backend; `local/no_isolation` is blocked by default for plugin subprocess workers and should only be enabled for trusted local workers.
 - Secrets should be referenced, not stored as plaintext in SQLite.
 
 Capabilities are the v0 policy primitive. They are intentionally simple: subject, resource, action, optional constraints, optional expiry. Denied sensitive checks are audit-logged.

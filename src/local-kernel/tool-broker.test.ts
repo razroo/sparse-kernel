@@ -358,6 +358,13 @@ describe("CapabilityToolBroker", () => {
         resourceId: "plugin_tool",
         action: "invoke",
       });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "sandbox",
+        resourceId: "plugin_untrusted",
+        action: "allocate",
+      });
       const rawTool = makeTool("plugin_tool");
       setPluginToolMeta(rawTool, {
         pluginId: "community-plugin",
@@ -366,6 +373,11 @@ describe("CapabilityToolBroker", () => {
           command: process.execPath,
           args: [workerPath],
           timeoutMs: 5_000,
+          sandbox: {
+            backend: "local/no_isolation",
+            requireIsolated: false,
+            maxBytesOut: 16_384,
+          },
         },
       });
       const broker = new CapabilityToolBroker(db, {
@@ -383,12 +395,54 @@ describe("CapabilityToolBroker", () => {
         expect.arrayContaining([
           "plugin_tool.subprocess_started",
           "plugin_tool.subprocess_finished",
+          "sandbox.allocated",
+          "sandbox.command_started",
+          "sandbox.command_completed",
+          "sandbox.released",
           "tool_call.completed",
         ]),
       );
     } finally {
       db.close();
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for plugin subprocess workers without an isolated sandbox", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "plugin_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("plugin_tool");
+      setPluginToolMeta(rawTool, {
+        pluginId: "community-plugin",
+        optional: false,
+        subprocess: {
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('{}')"],
+        },
+      });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "subprocess" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-plugin-worker-unsafe", {})).rejects.toThrow(
+        /requires an isolated sandbox backend/,
+      );
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining(["plugin_tool.sandbox_required", "tool_call.failed"]),
+      );
+    } finally {
+      db.close();
     }
   });
 

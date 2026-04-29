@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import type { LocalKernelDatabase } from "./database.js";
 import type { SandboxAllocationRecord } from "./types.js";
 
@@ -28,6 +29,7 @@ export type SandboxAllocationRequest = {
 
 export type SandboxCommandRequest = {
   allocationId: string;
+  backend?: SandboxBackendKind;
   command: string;
   args?: string[];
   cwd?: string;
@@ -60,6 +62,10 @@ function commandAvailable(command: string): boolean {
   return result.status === 0 || result.status === 1;
 }
 
+function firstAvailableCommand(commands: string[]): string | undefined {
+  return commands.find((command) => commandAvailable(command));
+}
+
 export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean {
   switch (backend) {
     case "bwrap":
@@ -77,7 +83,81 @@ export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean 
   }
 }
 
+type SandboxSpawnPlan = {
+  command: string;
+  args: string[];
+  isolation: string;
+};
+
+function buildSandboxSpawnPlan(params: {
+  backend: SandboxBackendKind;
+  command: string;
+  args: string[];
+  cwd?: string;
+}): SandboxSpawnPlan {
+  switch (params.backend) {
+    case "local/no_isolation":
+      return {
+        command: params.command,
+        args: params.args,
+        isolation: "local/no_isolation command runner; trusted execution only",
+      };
+    case "bwrap": {
+      const binary = firstAvailableCommand(["bwrap", "bubblewrap"]);
+      if (!binary) {
+        throw new Error("Sandbox backend unavailable: bwrap");
+      }
+      const args = [
+        "--die-with-parent",
+        "--unshare-all",
+        "--new-session",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+      ];
+      for (const path of ["/usr", "/bin", "/lib", "/lib64", "/etc"]) {
+        if (fs.existsSync(path)) {
+          args.push("--ro-bind", path, path);
+        }
+      }
+      if (params.cwd) {
+        args.push("--bind", params.cwd, params.cwd, "--chdir", params.cwd);
+      }
+      args.push("--", params.command, ...params.args);
+      return {
+        command: binary,
+        args,
+        isolation: "bubblewrap process namespace with broker-selected binds",
+      };
+    }
+    case "minijail": {
+      const binary = firstAvailableCommand(["minijail0", "minijail"]);
+      if (!binary) {
+        throw new Error("Sandbox backend unavailable: minijail");
+      }
+      return {
+        command: binary,
+        args: ["-p", "-v", "--", params.command, ...params.args],
+        isolation: "minijail process jail with backend-defined limits",
+      };
+    }
+    case "docker":
+    case "ssh":
+    case "openshell":
+    case "vm":
+    case "other":
+      throw new Error(
+        `Sandbox backend does not support brokered command execution yet: ${params.backend}`,
+      );
+  }
+}
+
 export class LocalSandboxBroker implements SandboxBroker {
+  private readonly allocationBackends = new Map<string, SandboxBackendKind>();
+
   constructor(private readonly db: LocalKernelDatabase) {}
 
   allocateSandbox(request: SandboxAllocationRequest): SandboxAllocationRecord {
@@ -136,6 +216,7 @@ export class LocalSandboxBroker implements SandboxBroker {
             : "backend-defined",
       },
     });
+    this.allocationBackends.set(allocationId, backend);
     return {
       id: allocationId,
       taskId: request.taskId,
@@ -150,6 +231,7 @@ export class LocalSandboxBroker implements SandboxBroker {
   releaseSandbox(allocationId: string): boolean {
     const released = this.db.releaseResourceLease(allocationId);
     if (released) {
+      this.allocationBackends.delete(allocationId);
       this.db.recordAudit({
         actor: { type: "runtime" },
         action: "sandbox.released",
@@ -188,6 +270,40 @@ export class LocalSandboxBroker implements SandboxBroker {
     if (!command) {
       throw new Error("Sandbox command is required");
     }
+    const backend = request.backend ?? this.allocationBackends.get(request.allocationId);
+    if (!backend) {
+      this.db.recordAudit({
+        actor: { type: "runtime" },
+        action: "sandbox.command_failed",
+        objectType: "resource_lease",
+        objectId: request.allocationId,
+        payload: { error: "allocation backend unavailable" },
+      });
+      throw new Error(
+        `Sandbox allocation backend is not available for command execution: ${request.allocationId}`,
+      );
+    }
+    let spawnPlan: SandboxSpawnPlan;
+    try {
+      spawnPlan = buildSandboxSpawnPlan({
+        backend,
+        command,
+        args: request.args ?? [],
+        cwd: request.cwd,
+      });
+    } catch (error) {
+      this.db.recordAudit({
+        actor: { type: "runtime" },
+        action: "sandbox.command_failed",
+        objectType: "resource_lease",
+        objectId: request.allocationId,
+        payload: {
+          backend,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      throw error;
+    }
     const requestedTimeoutMs = request.timeoutMs ?? Number(lease.max_runtime_ms ?? 30_000);
     const leaseTimeoutMs = Number(lease.max_runtime_ms ?? requestedTimeoutMs);
     const timeoutMs = Math.max(1, Math.min(requestedTimeoutMs || 30_000, leaseTimeoutMs || 30_000));
@@ -208,12 +324,13 @@ export class LocalSandboxBroker implements SandboxBroker {
         command,
         args: request.args ?? [],
         trustZoneId: lease.trust_zone_id,
-        isolation: "local/no_isolation command runner; trusted execution only",
+        backend,
+        isolation: spawnPlan.isolation,
       },
     });
     return await new Promise<SandboxCommandResult>((resolve, reject) => {
-      const child = spawn(command, request.args ?? [], {
-        cwd: request.cwd,
+      const child = spawn(spawnPlan.command, spawnPlan.args, {
+        cwd: backend === "local/no_isolation" ? request.cwd : undefined,
         env: request.env ? { ...process.env, ...request.env } : process.env,
         stdio: ["ignore", "pipe", "pipe"],
       });

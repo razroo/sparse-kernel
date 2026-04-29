@@ -208,6 +208,13 @@ describe("local runtime kernel database", () => {
     await expect(
       store.read(first.id, { subjectType: "agent", subjectId: "other" }),
     ).rejects.toThrow(/denied/);
+    expect(db.listArtifactAccess({ subjectType: "agent", subjectId: "main" })).toEqual([
+      expect.objectContaining({
+        artifactId: first.id,
+        permission: "read",
+        subjectId: "main",
+      }),
+    ]);
   });
 
   it("allows, denies, revokes, and audits capabilities", () => {
@@ -366,6 +373,42 @@ describe("local runtime kernel database", () => {
     ).toThrow(/network policy/);
   });
 
+  it("denies unsupported schemes, private IPv6, and literal denied CIDRs", () => {
+    const db = openTempDb();
+    expect(
+      checkTrustZoneNetworkUrl({
+        db,
+        trustZoneId: "public_web",
+        url: "file:///tmp/secret",
+      }),
+    ).toMatchObject({ allowed: false, reason: "unsupported scheme" });
+    expect(
+      checkTrustZoneNetworkUrl({
+        db,
+        trustZoneId: "public_web",
+        url: "http://[::1]/",
+      }),
+    ).toMatchObject({ allowed: false, reason: "private network denied" });
+
+    db.db
+      .prepare("UPDATE network_policies SET denied_cidrs_json = ? WHERE id = 'public_web_default'")
+      .run(JSON.stringify(["203.0.113.0/24", "2001:db8::/32"]));
+    expect(
+      checkTrustZoneNetworkUrl({
+        db,
+        trustZoneId: "public_web",
+        url: "https://203.0.113.9/resource",
+      }),
+    ).toMatchObject({ allowed: false, reason: "denied cidr" });
+    expect(
+      checkTrustZoneNetworkUrl({
+        db,
+        trustZoneId: "public_web",
+        url: "https://[2001:db8::12]/resource",
+      }),
+    ).toMatchObject({ allowed: false, reason: "denied cidr" });
+  });
+
   it("records trust-zone budgets and usage summaries", () => {
     const db = openTempDb();
     expect(
@@ -439,6 +482,54 @@ describe("local runtime kernel database", () => {
     await expect(
       broker.runCommand({ allocationId: allocation.id, command: process.execPath }),
     ).rejects.toThrow(/not active/);
+  });
+
+  it("does not execute sandbox commands when allocation backend state is missing", async () => {
+    const db = openTempDb();
+    db.createResourceLease({
+      id: "sandbox-missing-backend",
+      resourceType: "sandbox",
+      resourceId: "sandbox-missing-backend",
+      trustZoneId: "code_execution",
+    });
+    const broker = new LocalSandboxBroker(db);
+    await expect(
+      broker.runCommand({
+        allocationId: "sandbox-missing-backend",
+        command: process.execPath,
+      }),
+    ).rejects.toThrow(/backend is not available/);
+  });
+
+  it("does not silently execute unsupported sandbox backends on the host", async () => {
+    const db = openTempDb();
+    db.ensureAgent({ id: "main" });
+    db.enqueueTask({ id: "task-a", kind: "demo" });
+    db.grantCapability({
+      subjectType: "agent",
+      subjectId: "main",
+      resourceType: "sandbox",
+      resourceId: "code_execution",
+      action: "allocate",
+    });
+    const broker = new LocalSandboxBroker(db);
+    const allocation = broker.allocateSandbox({
+      taskId: "task-a",
+      agentId: "main",
+      trustZoneId: "code_execution",
+      requirements: { backend: "other" },
+    });
+    await expect(
+      broker.runCommand({
+        allocationId: allocation.id,
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('should-not-run')"],
+      }),
+    ).rejects.toThrow(/does not support brokered command execution/);
+    const audit = db.db
+      .prepare("SELECT action FROM audit_log WHERE action = 'sandbox.command_failed'")
+      .get() as { action: string } | undefined;
+    expect(audit?.action).toBe("sandbox.command_failed");
   });
 
   it("accounts sandboxed runs without requiring a queued task row", () => {

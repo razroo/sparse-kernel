@@ -149,6 +149,15 @@ export type ArtifactRecord = Required<
   createdAt: string;
 };
 
+export type ArtifactAccessRecord = {
+  artifactId: string;
+  subjectType: string;
+  subjectId: string;
+  permission: string;
+  expiresAt?: string;
+  createdAt: string;
+};
+
 export type GrantCapabilityInput = KernelSubject &
   KernelResource & {
     id?: string;

@@ -1,10 +1,12 @@
 import type { Command } from "commander";
 import {
+  runtimeArtifactAccessCommand,
   runtimeBrowserObservationsCommand,
   runtimeBrowserTargetsCommand,
   runtimeBudgetCommand,
   runtimeBudgetSetCommand,
   runtimeInspectCommand,
+  runtimeMaintainCommand,
   runtimeMigrateCommand,
   runtimePruneCommand,
   runtimeRecoverCommand,
@@ -45,6 +47,10 @@ export function registerRuntimeCli(program: Command) {
           ["openclaw sparsekernel sessions --json", "List SparseKernel sessions."],
           ["openclaw sparsekernel tasks --kind openclaw.embedded_run", "List runtime tasks."],
           ["openclaw sparsekernel transcript --session <id>", "Show transcript events."],
+          [
+            "openclaw sparsekernel artifact-access --subject main --subject-type agent",
+            "List artifact access grants.",
+          ],
           ["openclaw sparsekernel browser-targets --json", "List brokered browser targets."],
           [
             "openclaw sparsekernel browser-observations --context <id>",
@@ -56,6 +62,7 @@ export function registerRuntimeCli(program: Command) {
             "openclaw runtime budget set --trust-zone code_execution --max-runtime-seconds 600",
             "Update a trust-zone budget.",
           ],
+          ["openclaw runtime maintain --older-than 7d", "Recover leases and prune old artifacts."],
           ["openclaw runtime prune --older-than 7d", "Prune ephemeral/debug artifacts."],
           ["openclaw runtime vacuum", "Vacuum the runtime DB."],
         ])}`,
@@ -208,6 +215,31 @@ export function registerRuntimeCli(program: Command) {
     );
 
   runtime
+    .command("artifact-access")
+    .description("List SparseKernel artifact access grants")
+    .option("--artifact <id>", "Filter by artifact id")
+    .option("--subject-type <type>", "Filter by subject type")
+    .option("--subject <id>", "Filter by subject id")
+    .option("--permission <permission>", "Filter by permission")
+    .option("--limit <n>", "Maximum access rows to return", "100")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeArtifactAccessCommand(
+          {
+            artifact: opts.artifact as string | undefined,
+            subjectType: opts.subjectType as string | undefined,
+            subject: opts.subject as string | undefined,
+            permission: opts.permission as string | undefined,
+            limit: opts.limit as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
     .command("recover")
     .description("Recover expired SparseKernel leases and dead embedded-run tasks")
     .option("--task <id>", "Only recover one embedded-run task")
@@ -216,6 +248,30 @@ export function registerRuntimeCli(program: Command) {
       createRunner((opts) =>
         runtimeRecoverCommand(
           {
+            task: opts.task as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("maintain")
+    .description("Recover expired leases and prune old runtime records")
+    .option("--older-than <duration>", "Artifact and observation age cutoff (default: 7d)", "7d")
+    .option(
+      "--retention <policies>",
+      "Comma-separated retention policies (default: ephemeral,debug)",
+    )
+    .option("--task <id>", "Only recover one embedded-run task")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeMaintainCommand(
+          {
+            olderThan: opts.olderThan as string | undefined,
+            retention: opts.retention as string | undefined,
             task: opts.task as string | undefined,
             json: Boolean(opts.json),
           },

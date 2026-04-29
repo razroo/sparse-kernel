@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acquireNativeBrowserProcess,
+  inspectNativeBrowserPools,
   stopAllNativeBrowserProcesses,
 } from "./browser-process-pool.js";
 
@@ -62,6 +63,9 @@ describe("native browser process pool", () => {
 
     expect(first.cdpEndpoint).toBe("http://127.0.0.1:19222");
     expect(second.poolKey).toBe(first.poolKey);
+    expect(inspectNativeBrowserPools()).toEqual([
+      expect.objectContaining({ key: "public_web:default", refs: 2, exited: false }),
+    ]);
     expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0]).toMatchObject({ command: fakeExecutable });
     expect(spawnCalls[0]?.args).toEqual(
@@ -77,10 +81,56 @@ describe("native browser process pool", () => {
     expect(fakeProcess.unref).toHaveBeenCalledTimes(1);
 
     await first.release();
+    expect(inspectNativeBrowserPools()).toEqual([
+      expect.objectContaining({ key: "public_web:default", refs: 1 }),
+    ]);
     expect(fakeProcess.kill).not.toHaveBeenCalled();
     await second.release();
     expect(fakeProcess.kill).toHaveBeenCalledTimes(1);
 
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("enforces a max context count per native pool", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-browser-pool-"));
+    const fakeExecutable = path.join(root, "chrome");
+    fs.writeFileSync(fakeExecutable, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(fakeExecutable, 0o700);
+
+    const fakeProcess = new FakeBrowserProcess();
+    const spawnImpl = vi.fn(
+      () => fakeProcess as unknown as ChildProcess,
+    ) as unknown as typeof spawn;
+    const fetchImpl = vi.fn(async () =>
+      Response.json({ Browser: "Chrome/123" }),
+    ) as unknown as typeof fetch;
+    const env = {
+      OPENCLAW_STATE_DIR: root,
+      OPENCLAW_SPARSEKERNEL_BROWSER_EXECUTABLE: fakeExecutable,
+    } as NodeJS.ProcessEnv;
+
+    const first = await acquireNativeBrowserProcess({
+      trustZoneId: "public_web",
+      env,
+      fetchImpl,
+      spawnImpl,
+      allocatePort: async () => 19223,
+      idleTimeoutMs: 0,
+      maxContexts: 1,
+    });
+
+    await expect(
+      acquireNativeBrowserProcess({
+        trustZoneId: "public_web",
+        env,
+        fetchImpl,
+        spawnImpl,
+        allocatePort: async () => 19223,
+        idleTimeoutMs: 0,
+        maxContexts: 1,
+      }),
+    ).rejects.toThrow(/no available context slots/);
+    await first.release();
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

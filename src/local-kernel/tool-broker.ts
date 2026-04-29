@@ -1,4 +1,4 @@
-import type { AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
 import { ContentAddressedArtifactStore } from "./artifact-store.js";
@@ -8,6 +8,8 @@ import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import type { SparseKernelBrowserToolCdpProxyInput } from "./browser-tool-cdp-proxy.js";
 import { attachSparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 import type { LocalKernelDatabase } from "./database.js";
+import { checkTrustZoneNetworkUrl } from "./network-policy.js";
+import { LocalSandboxBroker, type SandboxBackendKind } from "./sandbox-broker.js";
 
 const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
 
@@ -74,6 +76,16 @@ function isTruthyBrowserFlag(raw: string | undefined): boolean {
   return normalized === "on" || normalized === "1" || normalized === "true";
 }
 
+function isTruthyToolFlag(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "on" || normalized === "1" || normalized === "true";
+}
+
+export function isSandboxCommandToolName(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  return normalized === "exec" || normalized === "bash" || normalized === "shell";
+}
+
 function wrapBrowserProcessRelease(
   lease: BrowserToolLease,
   releaseBrowserProcess: () => Promise<void>,
@@ -115,7 +127,7 @@ export class CapabilityToolBroker {
         params: unknown,
         signal?: AbortSignal,
         onUpdate?: AgentToolUpdateCallback<unknown>,
-      ) => {
+      ): Promise<AgentToolResult<unknown>> => {
         const providerToolCallId = toolCallId.trim() || `tool_call:${Date.now()}`;
         const toolCallDbId = this.db.insertToolCall({
           id: context.runId ? `${context.runId}:${providerToolCallId}` : providerToolCallId,
@@ -140,8 +152,18 @@ export class CapabilityToolBroker {
           throw err;
         }
         this.db.startToolCall(toolCallDbId);
-        const browserContext = await this.maybeAcquireBrowserContext(tool, context, params);
         try {
+          const sandboxResult = await this.maybeRunBrokeredSandboxCommand(tool, context, params);
+          if (sandboxResult) {
+            const ledgerOutput = await this.prepareToolOutputForLedger(
+              toolCallDbId,
+              context,
+              sandboxResult,
+            );
+            this.db.finishToolCall(toolCallDbId, ledgerOutput);
+            return sandboxResult;
+          }
+          const browserContext = await this.maybeAcquireBrowserContext(tool, context, params);
           const executionParams = browserContext?.proxyRequest
             ? attachSparseKernelBrowserProxyRequest(params, browserContext.proxyRequest)
             : params;
@@ -268,6 +290,19 @@ export class CapabilityToolBroker {
       shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")
         ? [urlCandidate]
         : undefined;
+    if (shouldEnforceNetwork && urlCandidate && (action === "open" || action === "navigate")) {
+      const decision = checkTrustZoneNetworkUrl({
+        db: this.db,
+        trustZoneId,
+        url: urlCandidate,
+        actor: { type: "agent", id: context.agentId },
+      });
+      if (!decision.allowed) {
+        throw new Error(
+          `Browser tool navigation denied by SparseKernel network policy: ${decision.reason}`,
+        );
+      }
+    }
     const browserBrokerMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase();
     const cdpEligibleTarget = !target || target === "host";
     const cdpBrokerDisabled = isBrowserBrokerDisabled(browserBrokerMode);
@@ -385,6 +420,104 @@ export class CapabilityToolBroker {
         throw err;
       }
       return null;
+    }
+  }
+
+  private async maybeRunBrokeredSandboxCommand(
+    tool: AnyAgentTool,
+    context: ToolBrokerContext,
+    params: unknown,
+  ): Promise<AgentToolResult<unknown> | null> {
+    const env = this.options.env ?? process.env;
+    if (
+      !context.agentId ||
+      !isSandboxCommandToolName(tool.name) ||
+      !isTruthyToolFlag(env.OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC)
+    ) {
+      return null;
+    }
+    const record = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const argv = Array.isArray(record.argv) ? record.argv.map(String).filter(Boolean) : undefined;
+    const rawCommand =
+      argv?.[0] ??
+      (typeof record.command === "string"
+        ? record.command.trim()
+        : typeof record.cmd === "string"
+          ? record.cmd.trim()
+          : "");
+    if (!rawCommand) {
+      throw new Error(`SparseKernel sandboxed ${tool.name} tool requires command or argv`);
+    }
+    const args = argv
+      ? argv.slice(1)
+      : Array.isArray(record.args)
+        ? record.args.map(String)
+        : tool.name === "bash" || tool.name === "shell"
+          ? ["-lc", rawCommand]
+          : [];
+    const command = argv
+      ? rawCommand
+      : tool.name === "bash" || tool.name === "shell"
+        ? "bash"
+        : rawCommand;
+    const backend: SandboxBackendKind =
+      typeof record.backend === "string" && record.backend.trim()
+        ? (record.backend.trim() as SandboxBackendKind)
+        : "local/no_isolation";
+    const broker = new LocalSandboxBroker(this.db);
+    const allocation = broker.allocateSandbox({
+      taskId: context.taskId ?? context.runId ?? context.sessionId ?? `tool:${tool.name}`,
+      agentId: context.agentId,
+      trustZoneId: "code_execution",
+      requirements: {
+        backend,
+        maxRuntimeMs:
+          typeof record.timeoutMs === "number" && Number.isFinite(record.timeoutMs)
+            ? record.timeoutMs
+            : undefined,
+        maxBytesOut:
+          typeof record.maxOutputBytes === "number" && Number.isFinite(record.maxOutputBytes)
+            ? record.maxOutputBytes
+            : undefined,
+      },
+    });
+    try {
+      const result = await broker.runCommand({
+        allocationId: allocation.id,
+        backend,
+        command,
+        args,
+        cwd: typeof record.cwd === "string" ? record.cwd : undefined,
+        timeoutMs:
+          typeof record.timeoutMs === "number" && Number.isFinite(record.timeoutMs)
+            ? record.timeoutMs
+            : undefined,
+        maxOutputBytes:
+          typeof record.maxOutputBytes === "number" && Number.isFinite(record.maxOutputBytes)
+            ? record.maxOutputBytes
+            : undefined,
+      });
+      const output: AgentToolResult<unknown> = {
+        content: [
+          {
+            type: "text",
+            text: result.stdout || result.stderr || `exit ${result.exitCode ?? result.signal ?? 0}`,
+          },
+        ],
+        details: {
+          sparsekernelSandbox: true,
+          allocationId: result.allocationId,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          timedOut: result.timedOut,
+          durationMs: result.durationMs,
+        },
+      };
+      return output;
+    } finally {
+      broker.releaseSandbox(allocation.id);
     }
   }
 }

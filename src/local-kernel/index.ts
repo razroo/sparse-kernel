@@ -4,12 +4,14 @@ export { LocalBrowserBroker } from "./browser-broker.js";
 export type { BrowserBroker, BrowserContextLeaseRequest } from "./browser-broker.js";
 export {
   acquireNativeBrowserProcess,
+  inspectNativeBrowserPools,
   resolveNativeBrowserExecutable,
   stopAllNativeBrowserProcesses,
 } from "./browser-process-pool.js";
 export type {
   NativeBrowserProcessAcquireInput,
   NativeBrowserProcessLease,
+  NativeBrowserPoolSnapshot,
 } from "./browser-process-pool.js";
 export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
@@ -49,7 +51,7 @@ export type {
 export { isSandboxBackendAvailable } from "./sandbox-broker.js";
 export { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat.js";
 export type { SessionImportResult, SessionStoreImportTarget } from "./session-compat.js";
-export { CapabilityToolBroker } from "./tool-broker.js";
+export { CapabilityToolBroker, isSandboxCommandToolName } from "./tool-broker.js";
 export type { ToolBrokerContext, ToolBrokerSubject } from "./tool-broker.js";
 export {
   brokerEffectiveToolsForRun,

@@ -8,7 +8,7 @@ import type { AnyAgentTool } from "../agents/tools/common.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
 import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import { openLocalKernelDatabase, type LocalKernelDatabase } from "./database.js";
-import { CapabilityToolBroker } from "./tool-broker.js";
+import { CapabilityToolBroker, isSandboxCommandToolName } from "./tool-broker.js";
 
 export type RuntimeToolBrokerMode = "off" | "local" | "daemon";
 
@@ -187,6 +187,22 @@ export function brokerToolsForRun(input: BrokerToolsForRunInput): LocalBrokeredT
             expiresAt: capabilityExpiresAt,
           });
         }
+      }
+      if (isSandboxCommandToolName(tool.name)) {
+        db.grantCapability({
+          subjectType: "agent",
+          subjectId: input.agentId,
+          resourceType: "sandbox",
+          resourceId: "code_execution",
+          action: "allocate",
+          constraints: {
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+            runId: input.runId,
+            reason: "exec-shaped tool available for brokered run",
+          },
+          expiresAt: capabilityExpiresAt,
+        });
       }
     }
     broker = new CapabilityToolBroker(db, {

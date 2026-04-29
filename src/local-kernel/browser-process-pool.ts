@@ -23,6 +23,7 @@ export type NativeBrowserProcessAcquireInput = {
   readyTimeoutMs?: number;
   idleTimeoutMs?: number;
   executablePath?: string;
+  maxContexts?: number;
 };
 
 type NativeBrowserPool = {
@@ -38,6 +39,17 @@ type NativeBrowserPool = {
   exited: boolean;
 };
 
+export type NativeBrowserPoolSnapshot = {
+  key: string;
+  trustZoneId: string;
+  profile: string;
+  cdpEndpoint: string;
+  refs: number;
+  exited: boolean;
+  pid?: number;
+  userDataDir: string;
+};
+
 const pools = new Map<string, NativeBrowserPool>();
 let exitHookInstalled = false;
 
@@ -51,8 +63,17 @@ export async function acquireNativeBrowserProcess(
   const fetchImpl = input.fetchImpl ?? fetch;
   const idleTimeoutMs =
     input.idleTimeoutMs ?? readIntEnv(env.OPENCLAW_SPARSEKERNEL_BROWSER_IDLE_MS, 30_000);
+  const maxContexts = Math.max(
+    1,
+    input.maxContexts ?? readIntEnv(env.OPENCLAW_SPARSEKERNEL_BROWSER_MAX_CONTEXTS, 8),
+  );
   const existing = pools.get(key);
   if (existing && !existing.exited && (await isCdpReady(existing.cdpEndpoint, fetchImpl, 500))) {
+    if (existing.refs >= maxContexts) {
+      throw new Error(
+        `SparseKernel native browser pool ${key} has no available context slots (${existing.refs}/${maxContexts}).`,
+      );
+    }
     clearIdleTimer(existing);
     existing.refs += 1;
     return leaseFor(existing, idleTimeoutMs);
@@ -129,6 +150,21 @@ export async function stopAllNativeBrowserProcesses(): Promise<void> {
   const active = [...pools.values()];
   pools.clear();
   await Promise.all(active.map((pool) => stopPool(pool)));
+}
+
+export function inspectNativeBrowserPools(): NativeBrowserPoolSnapshot[] {
+  return [...pools.values()]
+    .map((pool) => ({
+      key: pool.key,
+      trustZoneId: pool.trustZoneId,
+      profile: pool.profile,
+      cdpEndpoint: pool.cdpEndpoint,
+      refs: pool.refs,
+      exited: pool.exited,
+      ...(pool.proc.pid ? { pid: pool.proc.pid } : {}),
+      userDataDir: pool.userDataDir,
+    }))
+    .toSorted((left, right) => left.key.localeCompare(right.key));
 }
 
 export function resolveNativeBrowserExecutable(

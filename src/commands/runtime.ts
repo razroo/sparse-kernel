@@ -370,6 +370,52 @@ export async function runtimeBrowserObservationsCommand(
   }
 }
 
+export async function runtimeArtifactAccessCommand(
+  opts: {
+    artifact?: string;
+    subjectType?: string;
+    subject?: string;
+    permission?: string;
+    limit?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let limit: number;
+  try {
+    limit = parseLimit(opts.limit, 100);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const access = db.listArtifactAccess({
+      artifactId: opts.artifact,
+      subjectType: opts.subjectType,
+      subjectId: opts.subject,
+      permission: opts.permission,
+      limit,
+    });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { access });
+      return;
+    }
+    if (access.length === 0) {
+      runtime.log("No SparseKernel artifact access records found.");
+      return;
+    }
+    for (const row of access) {
+      runtime.log(
+        `${row.artifactId} ${row.permission} subject=${row.subjectType}:${row.subjectId} created=${row.createdAt} expires=${row.expiresAt ?? "-"}`,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
 export async function runtimeRecoverCommand(
   opts: { task?: string; json?: boolean },
   runtime: RuntimeEnv,
@@ -385,6 +431,50 @@ export async function runtimeRecoverCommand(
     }
     runtime.log(
       `Recovered ${embeddedRuns.recovered} embedded run task(s); released ${released} expired lease(s).`,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeMaintainCommand(
+  opts: { olderThan?: string; retention?: string; task?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const olderThanRaw = opts.olderThan ?? "7d";
+  let olderThanMs: number;
+  let retentionPolicies: RuntimeRetentionPolicy[] | undefined;
+  try {
+    olderThanMs = parseDurationMs(olderThanRaw, { defaultUnit: "d" });
+    retentionPolicies = parseRetentionPolicies(opts.retention);
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  const olderThan = new Date(Date.now() - olderThanMs).toISOString();
+  const db = openLocalKernelDatabase();
+  try {
+    const releasedExpiredLeases = db.releaseExpiredLeases();
+    const embeddedRuns = recoverEmbeddedRunTasks({ db, taskId: opts.task });
+    const store = new ContentAddressedArtifactStore(db);
+    const prunedArtifacts = store.prune({ olderThan, retentionPolicies });
+    const prunedBrowserObservations = db.pruneBrowserObservations({ olderThan });
+    const result = {
+      releasedExpiredLeases,
+      embeddedRuns,
+      olderThan,
+      retentionPolicies,
+      prunedArtifacts: prunedArtifacts.artifacts.length,
+      deletedFiles: prunedArtifacts.deletedFiles,
+      prunedBrowserObservations,
+    };
+    if (opts.json) {
+      writeRuntimeJson(runtime, result);
+      return;
+    }
+    runtime.log(
+      `Maintained runtime: released ${releasedExpiredLeases} lease(s), recovered ${embeddedRuns.recovered} embedded run(s), pruned ${prunedArtifacts.artifacts.length} artifact record(s), deleted ${prunedArtifacts.deletedFiles} file(s), pruned ${prunedBrowserObservations} browser observation(s).`,
     );
   } finally {
     db.close();

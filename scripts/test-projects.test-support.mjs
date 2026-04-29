@@ -263,6 +263,44 @@ const TOOLING_TEST_TARGETS = new Map([
 ]);
 const SOURCE_TEST_TARGETS = new Map([
   ...PRECISE_SOURCE_TEST_TARGETS,
+  ["src/cli/runtime-cli.ts", ["src/commands/runtime.sparsekernel.test.ts"]],
+  ["src/commands/runtime.ts", ["src/commands/runtime.sparsekernel.test.ts"]],
+  [
+    "src/local-kernel/browser-process-pool.ts",
+    ["src/local-kernel/browser-process-pool.test.ts", "src/local-kernel/tool-broker.test.ts"],
+  ],
+  [
+    "src/local-kernel/database.ts",
+    ["src/local-kernel/database.test.ts", "src/local-kernel/run-ledger-runtime.test.ts"],
+  ],
+  [
+    "src/local-kernel/index.ts",
+    [
+      "src/local-kernel/browser-process-pool.test.ts",
+      "src/local-kernel/database.test.ts",
+      "src/local-kernel/run-ledger-runtime.test.ts",
+      "src/local-kernel/tool-broker.test.ts",
+    ],
+  ],
+  [
+    "src/local-kernel/network-policy.ts",
+    ["src/local-kernel/database.test.ts", "src/local-kernel/tool-broker.test.ts"],
+  ],
+  [
+    "src/local-kernel/sandbox-broker.ts",
+    ["src/local-kernel/database.test.ts", "src/local-kernel/tool-broker.test.ts"],
+  ],
+  ["src/local-kernel/tool-broker-runtime.ts", ["src/local-kernel/tool-broker.test.ts"]],
+  ["src/local-kernel/tool-broker.ts", ["src/local-kernel/tool-broker.test.ts"]],
+  [
+    "src/local-kernel/types.ts",
+    [
+      "src/local-kernel/browser-process-pool.test.ts",
+      "src/local-kernel/database.test.ts",
+      "src/local-kernel/run-ledger-runtime.test.ts",
+      "src/local-kernel/tool-broker.test.ts",
+    ],
+  ],
   ["extensions/google-meet/index.ts", ["extensions/google-meet/index.test.ts"]],
   ["extensions/google-meet/src/cli.ts", ["extensions/google-meet/src/cli.test.ts"]],
   ["extensions/google-meet/src/create.ts", ["extensions/google-meet/index.test.ts"]],
@@ -595,6 +633,32 @@ function resolveChannelContractTargetKind(relative) {
   return "contractsChannelSession";
 }
 
+function resolveGatewayTargetKind(relative) {
+  if (relative.startsWith("src/gateway/server-methods/")) {
+    return "gatewayMethods";
+  }
+  if (
+    relative.startsWith("src/gateway/protocol/") ||
+    /(?:^|\/)[^/]*(?:client|reconnect|android-node|gateway-cli-backend)[^/]*\.[cm]?[jt]sx?$/u.test(
+      relative,
+    )
+  ) {
+    return "gatewayClient";
+  }
+  if (
+    /(?:^|\/)[^/]*server[^/]*\.(?:test\.)?[cm]?[jt]sx?$/u.test(relative) ||
+    /^src\/gateway\/(?:embeddings-http|models-http|openai-http|openresponses-http|probe\.auth\.integration)\.test\.ts$/u.test(
+      relative,
+    ) ||
+    /^src\/gateway\/(?:embeddings-http|models-http|openai-http|openresponses-http|probe-auth)\.ts$/u.test(
+      relative,
+    )
+  ) {
+    return "gatewayServer";
+  }
+  return "gatewayCore";
+}
+
 function listChangedPathsFromGit(baseRef, cwd) {
   return listChangedPathsFromGitSource({ base: baseRef, cwd });
 }
@@ -887,7 +951,7 @@ function classifyTarget(arg, cwd) {
     return "channel";
   }
   if (relative.startsWith("src/gateway/")) {
-    return "gateway";
+    return resolveGatewayTargetKind(relative);
   }
   if (relative.startsWith("src/hooks/")) {
     return "hooks";

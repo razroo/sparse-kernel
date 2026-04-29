@@ -194,6 +194,58 @@ describe("scripts/test-projects changed-target routing", () => {
     ]);
   });
 
+  it("routes changed gateway targets through split gateway shards", () => {
+    const plans = buildVitestRunPlans([
+      "src/gateway/protocol/connect-error-details.test.ts",
+      "src/gateway/server-methods/config.test.ts",
+      "src/gateway/server-runtime-config.test.ts",
+      "src/gateway/canvas-documents.test.ts",
+    ]);
+
+    expect(plans).toEqual([
+      {
+        config: "test/vitest/vitest.gateway-core.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/gateway/canvas-documents.test.ts"],
+        watchMode: false,
+      },
+      {
+        config: "test/vitest/vitest.gateway-client.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/gateway/protocol/connect-error-details.test.ts"],
+        watchMode: false,
+      },
+      {
+        config: "test/vitest/vitest.gateway-methods.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/gateway/server-methods/config.test.ts"],
+        watchMode: false,
+      },
+      {
+        config: "test/vitest/vitest.gateway-server.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/gateway/server-runtime-config.test.ts"],
+        watchMode: false,
+      },
+    ]);
+  });
+
+  it("routes changed SparseKernel runtime sources to focused runtime tests", () => {
+    expect(
+      resolveChangedTargetArgs(["--changed", "origin/main"], process.cwd(), () => [
+        "src/cli/runtime-cli.ts",
+        "src/local-kernel/index.ts",
+        "src/local-kernel/tool-broker.ts",
+      ]),
+    ).toEqual([
+      "src/commands/runtime.sparsekernel.test.ts",
+      "src/local-kernel/browser-process-pool.test.ts",
+      "src/local-kernel/database.test.ts",
+      "src/local-kernel/run-ledger-runtime.test.ts",
+      "src/local-kernel/tool-broker.test.ts",
+    ]);
+  });
+
   it("routes misc extensions to the misc extension shard", () => {
     const plans = buildVitestRunPlans(["extensions/thread-ownership"], process.cwd());
 

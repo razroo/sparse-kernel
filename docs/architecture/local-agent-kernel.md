@@ -39,11 +39,13 @@ openclaw runtime inspect
 openclaw sparsekernel sessions
 openclaw sparsekernel tasks --kind openclaw.embedded_run
 openclaw sparsekernel transcript --session <session-id>
+openclaw sparsekernel artifact-access --subject main --subject-type agent
 openclaw sparsekernel browser-targets --json
 openclaw sparsekernel browser-observations --context <browser-context-id>
 openclaw sparsekernel recover
 openclaw runtime budget
 openclaw runtime budget set --trust-zone code_execution --max-runtime-seconds 600
+openclaw runtime maintain --older-than 7d
 openclaw runtime vacuum
 openclaw runtime prune --older-than 7d
 ```
@@ -71,7 +73,7 @@ Retention policies are:
 - `durable`
 - `debug`
 
-`openclaw runtime prune` currently prunes old `ephemeral` and `debug` artifacts by default. Pass `--retention ephemeral,debug,session` only when session-scoped artifacts should also be removed.
+`openclaw runtime prune` currently prunes old `ephemeral` and `debug` artifacts by default. Pass `--retention ephemeral,debug,session` only when session-scoped artifacts should also be removed. `openclaw runtime maintain` combines expired lease recovery, embedded-run recovery, artifact pruning, and browser-observation pruning for local maintenance jobs.
 
 ## Trust zones
 
@@ -98,11 +100,11 @@ The browser broker model is:
 
 Important boundary: BrowserContext isolation is session isolation, not host isolation. Playwright route blocking and SSRF guards are useful controls, but they are not hard security boundaries.
 
-The broker applies configured trust-zone network policy to explicit allowed origins before allocating a context. This is an egress guard for brokered contexts, not a kernel or VM boundary. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=cdp` and `OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT=<loopback endpoint>` to make the OpenClaw browser tool acquire a real SparseKernel CDP context for the active run. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=managed` to use the existing OpenClaw browser control service as the managed process owner and let SparseKernel lease CDP contexts from its reported endpoint. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=native` to let SparseKernel launch and supervise a local Chromium-compatible process pool keyed by trust zone/profile, with process lifetime tied to brokered context leases and idle timeout. The runtime injects an internal browser proxy for supported navigation, tab, snapshot, console, screenshot, PDF, direct file-input upload, dialog, and action routes instead of exposing raw CDP to the agent. Brokered actions cover the OpenClaw action contract with CDP input events, bounded DOM evaluation, selector retry, per-target CDP-backed network-idle waiting, and post-action navigation checks. Same-target action navigations must stay inside the context's allowed origins when a policy is configured; same-policy popups are attached as broker-owned targets and disallowed popups are closed. Broker-owned targets and per-target console/network/artifact observations are persisted in first-class ledger tables and mirrored to audit events. CDP Fetch interception blocks out-of-policy requests when an allowed-origin policy is configured, but this remains request control rather than a hard security boundary. Closing a target releases the whole context only when no broker-owned targets remain. Screenshot and PDF outputs go through the artifact store.
+The broker applies configured trust-zone network policy to explicit allowed origins before allocating a context. It also denies unsupported URL schemes, private-network destinations when the policy disallows them, and literal IPs matching denied CIDRs when broker code consults the policy. This is an egress guard for brokered contexts, not a kernel or VM boundary. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=cdp` and `OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT=<loopback endpoint>` to make the OpenClaw browser tool acquire a real SparseKernel CDP context for the active run. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=managed` to use the existing OpenClaw browser control service as the managed process owner and let SparseKernel lease CDP contexts from its reported endpoint. Set `OPENCLAW_RUNTIME_BROWSER_BROKER=native` to let SparseKernel launch and supervise a local Chromium-compatible process pool keyed by trust zone/profile, with process lifetime tied to brokered context leases and idle timeout. `OPENCLAW_SPARSEKERNEL_BROWSER_MAX_CONTEXTS` caps active contexts per native pool. The runtime injects an internal browser proxy for supported navigation, tab, snapshot, console, screenshot, PDF, direct file-input upload, dialog, and action routes instead of exposing raw CDP to the agent. Brokered actions cover the OpenClaw action contract with CDP input events, bounded DOM evaluation, selector retry, per-target CDP-backed network-idle waiting, and post-action navigation checks. Same-target action navigations must stay inside the context's allowed origins when a policy is configured; same-policy popups are attached as broker-owned targets and disallowed popups are closed. Broker-owned targets and per-target console/network/artifact observations are persisted in first-class ledger tables and mirrored to audit events. CDP Fetch interception blocks out-of-policy requests when an allowed-origin policy is configured, but this remains request control rather than a hard security boundary. Closing a target releases the whole context only when no broker-owned targets remain. Screenshot and PDF outputs go through the artifact store.
 
 ## Sandbox broker
 
-The sandbox broker records allocations and leases behind a backend abstraction. Current v0 includes a local/no-isolation backend that can run trusted local commands behind an active sandbox lease for scheduling, timeout, output, usage, and audit accounting. It detects Docker/bwrap/minijail availability when those backends are requested and preserves existing Docker/SSH/OpenShell sandbox systems for later wrapping. In daemon broker mode, embedded runs grant sandbox allocation capability and allocate/release the `code_execution` sandbox lease through the SparseKernel daemon API before falling back to local accounting.
+The sandbox broker records allocations and leases behind a backend abstraction. Current v0 includes a local/no-isolation backend that can run trusted local commands behind an active sandbox lease for scheduling, timeout, output, usage, and audit accounting. It can also build command spawn plans for requested bwrap and minijail backends when those binaries are available. Docker, SSH, OpenShell, and VM-backed execution remain explicit future wrappers and are not silently executed on the host. In daemon broker mode, embedded runs grant sandbox allocation capability and allocate/release the `code_execution` sandbox lease through the SparseKernel daemon API before falling back to local accounting.
 
 Important boundary: `local/no_isolation` means accounting only. It does not provide process, filesystem, network, kernel, or VM isolation. Docker, bwrap, minijail, gVisor, or VM backends must be described by their actual guarantees when implemented.
 
@@ -115,7 +117,7 @@ Sensitive operations should check capabilities before they mutate state or alloc
 - sandbox allocation;
 - tool invocation.
 
-Capability grants, revokes, and denied checks are audited. Embedded agent runs now materialize the active step as a task lease and transcript events, then wrap the effective tool set with the local ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` to use the `sparsekerneld` run-ledger and ToolBroker path; daemon setup failures fall back to the local runtime broker. Set `OPENCLAW_RUNTIME_TOOL_CAPABILITY_MODE=strict` to stop auto-granting sensitive tools such as `exec`, `read`, `write`, and `browser`; those tools then fail closed unless a capability already exists or `OPENCLAW_RUNTIME_TOOL_ALLOW_SENSITIVE=1` is set for compatibility. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
+Capability grants, revokes, and denied checks are audited. Embedded agent runs now materialize the active step as a task lease and transcript events, then wrap the effective tool set with the local ToolBroker outside tests unless explicitly disabled with `OPENCLAW_RUNTIME_TOOL_BROKER=off`. Set `OPENCLAW_RUNTIME_TOOL_BROKER=daemon` to use the `sparsekerneld` run-ledger and ToolBroker path; daemon setup failures fall back to the local runtime broker. Set `OPENCLAW_RUNTIME_TOOL_CAPABILITY_MODE=strict` to stop auto-granting sensitive tools such as `exec`, `read`, `write`, and `browser`; those tools then fail closed unless a capability already exists or `OPENCLAW_RUNTIME_TOOL_ALLOW_SENSITIVE=1` is set for compatibility. Set `OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC=1` to route `exec`, `bash`, and `shell` shaped tools through the sandbox broker command runner instead of the ambient in-process tool implementation when the active agent has sandbox allocation capability. Native in-process plugins remain trusted in v0; the broker wrapper establishes the contract for moving plugin/tool invocation behind capability checks and then out of process.
 
 The SparseKernel daemon now exposes the v0 run and ToolBroker lifecycle over local JSON: session upsert/list, transcript append/list, task enqueue/claim-by-id/claim-next/heartbeat/complete/fail, tool-call create/start/complete/fail/list, browser acquire/release, sandbox allocate/release, and artifact access. Tool-call create checks `tool` / `<tool-name>` / `invoke`; completion records small structured output plus `artifact_ids`; and every transition writes audit records. See [Tool Broker](/architecture/tool-broker).
 
@@ -140,10 +142,10 @@ Session metadata writes are mirrored into the runtime ledger by default. Set `OP
 ## Current limitations
 
 - Full transcript ownership is still staged: session metadata can run with SQLite as primary, assistant transcript mirrors and import/export are ledger-backed, and the pi session manager still appends JSONL.
-- Native browser process pooling exists for loopback CDP contexts, but it is still a small supervisor around Chromium. Brokered actions now cover selector retry, CDP-backed network-idle waits, and post-action navigation checks, but the engine is still not a full Playwright-equivalent process manager and does not provide host isolation.
-- Sandbox allocation records requested bwrap/minijail/Docker backends and checks availability, but local/no-isolation still does not harden execution.
+- Native browser process pooling exists for loopback CDP contexts, but it is still a small supervisor around Chromium. Brokered actions now cover selector retry, CDP-backed network-idle waits, post-action navigation checks, console/screenshot/PDF/upload/dialog routes, and per-pool context caps, but the engine is still not a full Playwright-equivalent process manager and does not provide host isolation.
+- Sandbox allocation can execute trusted local commands and bwrap/minijail-wrapped commands when available, but local/no-isolation still does not harden execution and Docker/VM wrappers are not implemented yet.
 - Native plugins still execute in process; tool invocation is brokered and audited but untrusted plugin isolation is a later process-boundary change.
-- Network policy enforcement currently exists where brokers call it; host-level egress proxying is still future work.
+- Network policy enforcement currently exists where brokers call it; DNS-aware CIDR enforcement, proxy-backed egress control, and host-level egress blocking are still future work.
 
 ## Contributor rules
 

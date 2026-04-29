@@ -19,6 +19,7 @@ title: "Tests"
 - Full, extension, and include-pattern shard runs update local timing data in `.artifacts/vitest-shard-timings.json`; later whole-config runs use those timings to balance slow and fast shards. Include-pattern CI shards append the shard name to the timing key, which keeps filtered shard timings visible without replacing whole-config timing data. Set `OPENCLAW_TEST_PROJECTS_TIMINGS=0` to ignore the local timing artifact.
 - Selected `plugin-sdk` and `commands` test files now route through dedicated light lanes that keep only `test/setup.ts`, leaving runtime-heavy cases on their existing lanes.
 - Source files with sibling tests map to that sibling before falling back to wider directory globs. Helper edits under `test/helpers/channels` and `test/helpers/plugins` use a local import graph to run importing tests instead of broad-running every shard when the dependency path is precise.
+- Gateway source changes route to split changed-test shards (`gateway-core`, `gateway-client`, `gateway-methods`, or `gateway-server`) instead of one broad gateway config when the changed path has a precise owner.
 - `auto-reply` now also splits into three dedicated configs (`core`, `top-level`, `reply`) so the reply harness does not dominate the lighter top-level status/token/helper tests.
 - Base Vitest config now defaults to `pool: "threads"` and `isolate: false`, with the shared non-isolated runner enabled across the repo configs.
 - `pnpm test:channels` runs `vitest.channels.config.ts`.

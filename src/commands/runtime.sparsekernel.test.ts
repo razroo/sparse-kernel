@@ -2,9 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ContentAddressedArtifactStore } from "../local-kernel/artifact-store.js";
 import { LocalKernelDatabase } from "../local-kernel/database.js";
 import type { OutputRuntimeEnv } from "../runtime.js";
 import {
+  runtimeArtifactAccessCommand,
+  runtimeMaintainCommand,
   runtimeRecoverCommand,
   runtimeSessionsCommand,
   runtimeTasksCommand,
@@ -114,6 +117,58 @@ describe("SparseKernel runtime commands", () => {
       expect(recoverRuntime.writeJson).toHaveBeenCalledWith(
         expect.objectContaining({
           embeddedRuns: expect.objectContaining({ recovered: 1 }),
+        }),
+        2,
+      );
+    });
+  });
+
+  it("lists artifact access and runs runtime maintenance", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const db = new LocalKernelDatabase();
+      let artifactId = "";
+      try {
+        const store = new ContentAddressedArtifactStore(db);
+        const artifact = await store.write({
+          bytes: "debug output",
+          mimeType: "text/plain",
+          retentionPolicy: "debug",
+          subject: { subjectType: "agent", subjectId: "main" },
+        });
+        artifactId = artifact.id;
+        db.db
+          .prepare("UPDATE artifacts SET created_at = ? WHERE id = ?")
+          .run("2026-01-01T00:00:00.000Z", artifact.id);
+      } finally {
+        db.close();
+      }
+
+      const accessRuntime = makeRuntime();
+      await runtimeArtifactAccessCommand(
+        { subjectType: "agent", subject: "main", json: true },
+        accessRuntime,
+      );
+      expect(accessRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          access: [
+            expect.objectContaining({
+              artifactId,
+              subjectType: "agent",
+              subjectId: "main",
+              permission: "read",
+            }),
+          ],
+        }),
+        2,
+      );
+
+      const maintainRuntime = makeRuntime();
+      await runtimeMaintainCommand({ olderThan: "1d", json: true }, maintainRuntime);
+      expect(maintainRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prunedArtifacts: 1,
+          deletedFiles: 1,
         }),
         2,
       );

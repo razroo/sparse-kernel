@@ -320,6 +320,71 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("can route exec-shaped tools through a brokered sandbox command", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.upsertSession({ id: "session-a", agentId: "main" });
+      db.enqueueTask({ id: "task-a", kind: "exec", sessionId: "session-a" });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "exec",
+        action: "invoke",
+      });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "sandbox",
+        resourceId: "code_execution",
+        action: "allocate",
+      });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC: "1" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(
+        {
+          name: "exec",
+          label: "Exec",
+          description: "test",
+          parameters: Type.Object({}),
+          execute: async () => {
+            throw new Error("ambient exec should not run");
+          },
+        } as AnyAgentTool,
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          taskId: "task-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
+
+      await expect(
+        tool.execute("call-exec", {
+          argv: [process.execPath, "-e", "process.stdout.write('sandboxed')"],
+          maxOutputBytes: 1024,
+        }),
+      ).resolves.toMatchObject({
+        details: { sparsekernelSandbox: true, exitCode: 0, stdout: "sandboxed" },
+      });
+      const actions = db.listAudit({ limit: 50 }).map((entry) => entry.action);
+      expect(actions).toEqual(
+        expect.arrayContaining([
+          "sandbox.allocated",
+          "sandbox.command_started",
+          "sandbox.command_completed",
+          "sandbox.released",
+          "tool_call.completed",
+        ]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it("artifactizes large tool outputs in the ledger without changing the tool result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-tool-broker-"));
     const db = new LocalKernelDatabase({ dbPath: path.join(root, "runtime.sqlite") });
@@ -546,6 +611,57 @@ describe("CapabilityToolBroker", () => {
       expect(proxyRequest).toHaveBeenCalledTimes(2);
       await broker.close();
       expect(released).toEqual(["browser_ctx_cdp"]);
+    } finally {
+      await broker.close();
+      db.close();
+    }
+  });
+
+  it("checks trust-zone network policy before CDP browser navigation", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    const proxyFactory = vi.fn(async () => ({
+      id: "browser_ctx_cdp",
+      proxyRequest: async () => ({ ok: true }),
+      release: () => {},
+    }));
+    const broker = new CapabilityToolBroker(db, {
+      env: {
+        OPENCLAW_RUNTIME_BROWSER_BROKER: "cdp",
+        OPENCLAW_RUNTIME_BROWSER_POLICY_ENFORCE: "1",
+        OPENCLAW_SPARSEKERNEL_BROWSER_CDP_ENDPOINT: "http://127.0.0.1:9222",
+      } as NodeJS.ProcessEnv,
+      browserCdpProxyFactory: proxyFactory,
+    });
+    try {
+      db.upsertSession({ id: "session-a", agentId: "main", status: "active" });
+      db.enqueueTask({ id: "task-a", agentId: "main", sessionId: "session-a", kind: "test" });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "browser",
+        action: "invoke",
+      });
+      const tool = broker.wrapTool(makeTool("browser"), {
+        agentId: "main",
+        sessionId: "session-a",
+        taskId: "task-a",
+        subject: { subjectType: "run", subjectId: "run-a" },
+        runId: "run-a",
+      });
+
+      await expect(
+        tool.execute("call-browser", {
+          action: "navigate",
+          target: "host",
+          url: "http://127.0.0.1/private",
+        }),
+      ).rejects.toThrow(/network policy/);
+      expect(proxyFactory).not.toHaveBeenCalled();
+      const call = db.db
+        .prepare("SELECT status FROM tool_calls WHERE id = ?")
+        .get("run-a:call-browser") as { status: string } | undefined;
+      expect(call?.status).toBe("failed");
     } finally {
       await broker.close();
       db.close();

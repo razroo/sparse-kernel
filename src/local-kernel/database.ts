@@ -9,6 +9,7 @@ import { LOCAL_KERNEL_MIGRATIONS, LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.j
 import type {
   ArtifactRecord,
   ArtifactRecordInput,
+  ArtifactAccessRecord,
   BrowserContextRecord,
   BrowserObservationInput,
   BrowserObservationRecord,
@@ -103,6 +104,15 @@ type ArtifactRow = {
   created_by_tool_call_id: string | null;
   classification: string | null;
   retention_policy: ArtifactRecord["retentionPolicy"] | null;
+  created_at: string;
+};
+
+type ArtifactAccessRow = {
+  artifact_id: string;
+  subject_type: string;
+  subject_id: string;
+  permission: string;
+  expires_at: string | null;
   created_at: string;
 };
 
@@ -324,6 +334,17 @@ function toArtifact(row: ArtifactRow): ArtifactRecord {
       : {}),
     ...(optionalText(row.classification) ? { classification: row.classification! } : {}),
     ...(optionalText(row.retention_policy) ? { retentionPolicy: row.retention_policy! } : {}),
+    createdAt: row.created_at,
+  };
+}
+
+function toArtifactAccess(row: ArtifactAccessRow): ArtifactAccessRecord {
+  return {
+    artifactId: row.artifact_id,
+    subjectType: row.subject_type,
+    subjectId: row.subject_id,
+    permission: row.permission,
+    ...(optionalText(row.expires_at) ? { expiresAt: row.expires_at! } : {}),
     createdAt: row.created_at,
   };
 }
@@ -1301,6 +1322,47 @@ export class LocalKernelDatabase {
         input.now ?? nowIso(),
       ) as CountRow;
     return Number(row.count) > 0;
+  }
+
+  listArtifactAccess(
+    input: {
+      artifactId?: string;
+      subjectType?: string;
+      subjectId?: string;
+      permission?: string;
+      limit?: number;
+    } = {},
+  ): ArtifactAccessRecord[] {
+    const conditions: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.artifactId) {
+      conditions.push("artifact_id = ?");
+      params.push(input.artifactId);
+    }
+    if (input.subjectType) {
+      conditions.push("subject_type = ?");
+      params.push(input.subjectType);
+    }
+    if (input.subjectId) {
+      conditions.push("subject_id = ?");
+      params.push(input.subjectId);
+    }
+    if (input.permission) {
+      conditions.push("permission = ?");
+      params.push(input.permission);
+    }
+    const limit = Math.max(1, Math.min(1000, Math.trunc(input.limit ?? 100)));
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT artifact_id, subject_type, subject_id, permission, expires_at, created_at
+         FROM artifact_access
+         ${where}
+         ORDER BY created_at DESC, artifact_id ASC
+         LIMIT ?`,
+      )
+      .all(...params, limit) as ArtifactAccessRow[];
+    return rows.map(toArtifactAccess);
   }
 
   grantCapability(input: GrantCapabilityInput): string {

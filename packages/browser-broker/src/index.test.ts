@@ -327,7 +327,7 @@ class FakeCdpTransport implements CdpTransport {
       this.nextActionNavigationUrl = undefined;
       this.nextActionNewTarget = undefined;
       this.respond(message.id, {
-        result: { value: { ok: true } },
+        result: { value: { ok: true, x: 42, y: 24 } },
       });
       if (navigationUrl) {
         setTimeout(() => this.emitFrameNavigation(navigationUrl, message.sessionId), 0);

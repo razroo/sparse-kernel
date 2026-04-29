@@ -329,6 +329,11 @@ type PostActionNavigationObservation =
   | { kind: "same-target"; url?: string }
   | { kind: "new-target"; targetId: string; url?: string };
 
+type CdpActionPoint = {
+  x: number;
+  y: number;
+};
+
 export class SparseKernelCdpBrowserBroker {
   private readonly kernel: SparseKernelBrowserKernelClient;
   private readonly fetchImpl: typeof fetch;
@@ -802,8 +807,34 @@ export class SparseKernelCdpBrowserBroker {
     }
     switch (request.kind) {
       case "click":
+      case "hover": {
+        return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
+          const selector = this.resolveActionSelector(context, request);
+          const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
+            "Runtime.evaluate",
+            {
+              expression: buildActionPointExpression(
+                request.kind,
+                selector,
+                resolveCdpActionTimeoutMs(request.timeoutMs),
+              ),
+              returnByValue: true,
+              awaitPromise: true,
+            },
+            context.page_session_id,
+            resolveCdpCommandTimeoutMs(request.timeoutMs),
+          );
+          const point = parseCdpActionPoint(evaluated.result?.value);
+          await dispatchCdpMouseAction(context, request, point);
+          return {
+            ok: true,
+            targetId: context.target_id,
+            kind: request.kind,
+            value: evaluated.result?.value,
+          };
+        });
+      }
       case "type":
-      case "hover":
       case "scrollIntoView":
       case "select": {
         return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
@@ -832,43 +863,7 @@ export class SparseKernelCdpBrowserBroker {
       }
       case "clickCoords": {
         return await this.withPostActionNavigationGuard(context, undefined, async () => {
-          const button = normalizeMouseButton(request.button);
-          const clickCount = request.doubleClick ? 2 : 1;
-          await context.connection.command(
-            "Input.dispatchMouseEvent",
-            {
-              type: "mouseMoved",
-              x: request.x,
-              y: request.y,
-              button: "none",
-            },
-            context.page_session_id,
-          );
-          await context.connection.command(
-            "Input.dispatchMouseEvent",
-            {
-              type: "mousePressed",
-              x: request.x,
-              y: request.y,
-              button,
-              clickCount,
-            },
-            context.page_session_id,
-          );
-          if (request.delayMs && request.delayMs > 0) {
-            await delay(Math.min(5_000, Math.floor(request.delayMs)));
-          }
-          await context.connection.command(
-            "Input.dispatchMouseEvent",
-            {
-              type: "mouseReleased",
-              x: request.x,
-              y: request.y,
-              button,
-              clickCount,
-            },
-            context.page_session_id,
-          );
+          await dispatchCdpMouseAction(context, request, { x: request.x, y: request.y });
           return { ok: true, targetId: context.target_id, kind: request.kind };
         });
       }
@@ -1874,6 +1869,53 @@ function normalizeMouseButton(button: string | undefined): "left" | "right" | "m
   return normalized === "right" || normalized === "middle" ? normalized : "left";
 }
 
+async function dispatchCdpMouseAction(
+  context: LiveBrowserContext,
+  request: Extract<SparseKernelBrowserActRequest, { kind: "click" | "clickCoords" | "hover" }>,
+  point: CdpActionPoint,
+): Promise<void> {
+  await context.connection.command(
+    "Input.dispatchMouseEvent",
+    {
+      type: "mouseMoved",
+      x: point.x,
+      y: point.y,
+      button: "none",
+    },
+    context.page_session_id,
+  );
+  if (request.kind === "hover") {
+    return;
+  }
+  const button = normalizeMouseButton(request.button);
+  const clickCount = request.doubleClick ? 2 : 1;
+  await context.connection.command(
+    "Input.dispatchMouseEvent",
+    {
+      type: "mousePressed",
+      x: point.x,
+      y: point.y,
+      button,
+      clickCount,
+    },
+    context.page_session_id,
+  );
+  if (request.delayMs && request.delayMs > 0) {
+    await delay(Math.min(5_000, Math.floor(request.delayMs)));
+  }
+  await context.connection.command(
+    "Input.dispatchMouseEvent",
+    {
+      type: "mouseReleased",
+      x: point.x,
+      y: point.y,
+      button,
+      clickCount,
+    },
+    context.page_session_id,
+  );
+}
+
 function normalizeAllowedOrigins(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -2482,6 +2524,37 @@ function buildActionExpression(
   throw new Error(`SparseKernel CDP browser action does not support ${request.kind} yet.`);
 }
 
+function buildActionPointExpression(
+  kind: "click" | "hover",
+  selector: string,
+  timeoutMs: number,
+): string {
+  return `(async () => {
+  ${buildActionTargetHelpers(JSON.stringify(selector), JSON.stringify(timeoutMs), kind)}
+  const node = await waitForActionTarget();
+  node.scrollIntoView({ block: "center", inline: "center" });
+  await delay(0);
+  const target = await waitForActionTarget();
+  const rect = target.getBoundingClientRect();
+  const x = Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(window.innerWidth - 1, 0));
+  const y = Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(window.innerHeight - 1, 0));
+  return { ok: true, x, y, rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height } };
+})()`;
+}
+
+function parseCdpActionPoint(value: unknown): CdpActionPoint {
+  if (!value || typeof value !== "object") {
+    throw new Error("SparseKernel browser action target did not return coordinates");
+  }
+  const record = value as { x?: unknown; y?: unknown };
+  const x = Number(record.x);
+  const y = Number(record.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error("SparseKernel browser action target returned invalid coordinates");
+  }
+  return { x, y };
+}
+
 function buildDragExpression(
   startSelector: string,
   endSelector: string,
@@ -2632,7 +2705,12 @@ function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kin
     const deadline = Date.now() + timeoutMs;
     while (Date.now() <= deadline) {
       const node = document.querySelector(selector);
-      if (node && await isActionable(node)) return node;
+      if (node) {
+        if (actionKind !== "scrollIntoView") {
+          node.scrollIntoView({ block: "center", inline: "center" });
+        }
+        if (await isActionable(node)) return node;
+      }
       await delay(100);
     }
     throw new Error("SparseKernel browser action target not actionable");

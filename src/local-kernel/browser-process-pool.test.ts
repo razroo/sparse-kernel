@@ -9,6 +9,7 @@ import {
   inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
   stopAllNativeBrowserProcesses,
+  sweepNativeBrowserProcesses,
 } from "./browser-process-pool.js";
 
 class FakeBrowserProcess extends EventEmitter {
@@ -177,6 +178,54 @@ describe("native browser process pool", () => {
     expect(spawnCalls[0]?.args).toContain("--proxy-server=http://127.0.0.1:18080/");
     expect(spawnCalls[0]?.args).not.toContain("--no-proxy-server");
     await lease.release();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("sweeps idle native pools whose CDP endpoint is stale", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-browser-pool-"));
+    const fakeExecutable = path.join(root, "chrome");
+    fs.writeFileSync(fakeExecutable, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(fakeExecutable, 0o700);
+
+    const fakeProcess = new FakeBrowserProcess();
+    const spawnImpl = vi.fn(
+      () => fakeProcess as unknown as ChildProcess,
+    ) as unknown as typeof spawn;
+    const fetchReady = vi.fn(async () =>
+      Response.json({ Browser: "Chrome/123" }),
+    ) as unknown as typeof fetch;
+    const fetchStale = vi.fn(
+      async () => new Response("stale", { status: 503 }),
+    ) as unknown as typeof fetch;
+    const env = {
+      OPENCLAW_STATE_DIR: root,
+      OPENCLAW_SPARSEKERNEL_BROWSER_EXECUTABLE: fakeExecutable,
+    } as NodeJS.ProcessEnv;
+
+    const lease = await acquireNativeBrowserProcess({
+      trustZoneId: "public_web",
+      env,
+      fetchImpl: fetchReady,
+      spawnImpl,
+      allocatePort: async () => 19225,
+      idleTimeoutMs: 60_000,
+    });
+
+    expect(await sweepNativeBrowserProcesses({ fetchImpl: fetchStale })).toEqual({
+      stopped: 0,
+      stalePools: [],
+    });
+    await lease.release();
+    expect(inspectNativeBrowserPools()).toEqual([
+      expect.objectContaining({ key: "public_web:default", refs: 0 }),
+    ]);
+    expect(await sweepNativeBrowserProcesses({ fetchImpl: fetchStale })).toEqual({
+      stopped: 1,
+      stalePools: ["public_web:default"],
+    });
+    expect(fakeProcess.kill).toHaveBeenCalledTimes(1);
+    expect(inspectNativeBrowserPools()).toEqual([]);
+
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

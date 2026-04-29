@@ -12,12 +12,14 @@ export {
   inspectNativeBrowserPools,
   resolveNativeBrowserExecutable,
   stopAllNativeBrowserProcesses,
+  sweepNativeBrowserProcesses,
 } from "./browser-process-pool.js";
 export type {
   NativeBrowserProcessAcquireInput,
   NativeBrowserProcessLease,
   NativeBrowserPoolStatsSnapshot,
   NativeBrowserPoolSnapshot,
+  NativeBrowserPoolSweepResult,
 } from "./browser-process-pool.js";
 export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";

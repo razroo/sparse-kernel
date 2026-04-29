@@ -79,7 +79,7 @@ Retention policies are:
 - `durable`
 - `debug`
 
-`openclaw runtime prune` currently prunes old `ephemeral` and `debug` artifacts by default. Pass `--retention ephemeral,debug,session` only when session-scoped artifacts should also be removed. `openclaw runtime maintain` combines expired lease recovery, embedded-run recovery, artifact pruning, and browser-observation pruning for local maintenance jobs. `openclaw runtime maintain --schedule-every <duration>` stores a local maintenance cadence in `runtime_info`; `--run-due` lets a cron, launchd, or systemd timer invoke maintenance frequently while the ledger skips work until the cadence is due.
+`openclaw runtime prune` currently prunes old `ephemeral` and `debug` artifacts by default. Pass `--retention ephemeral,debug,session` only when session-scoped artifacts should also be removed. `openclaw runtime maintain` combines expired lease recovery, embedded-run recovery, artifact pruning, browser-observation pruning, and idle native browser pool sweeps for local maintenance jobs. `openclaw runtime maintain --schedule-every <duration>` stores a local maintenance cadence in `runtime_info`; `--run-due` lets a cron, launchd, or systemd timer invoke maintenance frequently while the ledger skips work until the cadence is due.
 
 ## Trust zones
 

@@ -72,6 +72,11 @@ export type NativeBrowserPoolStatsSnapshot = {
   lastExitSignal?: string;
 };
 
+export type NativeBrowserPoolSweepResult = {
+  stopped: number;
+  stalePools: string[];
+};
+
 const pools = new Map<string, NativeBrowserPool>();
 const poolStats = new Map<string, NativeBrowserPoolStatsSnapshot>();
 let exitHookInstalled = false;
@@ -200,6 +205,32 @@ export async function stopAllNativeBrowserProcesses(): Promise<void> {
   const active = [...pools.values()];
   pools.clear();
   await Promise.all(active.map((pool) => stopPool(pool)));
+}
+
+export async function sweepNativeBrowserProcesses(
+  input: {
+    fetchImpl?: typeof fetch;
+    cdpProbeTimeoutMs?: number;
+    includeActive?: boolean;
+  } = {},
+): Promise<NativeBrowserPoolSweepResult> {
+  const fetchImpl = input.fetchImpl ?? fetch;
+  const stalePools: string[] = [];
+  for (const pool of [...pools.values()]) {
+    if (!input.includeActive && pool.refs > 0) {
+      continue;
+    }
+    const stale =
+      pool.exited ||
+      !(await isCdpReady(pool.cdpEndpoint, fetchImpl, input.cdpProbeTimeoutMs ?? 500));
+    if (!stale) {
+      continue;
+    }
+    pools.delete(pool.key);
+    stalePools.push(pool.key);
+    await stopPool(pool);
+  }
+  return { stopped: stalePools.length, stalePools };
 }
 
 export function inspectNativeBrowserPools(): NativeBrowserPoolSnapshot[] {

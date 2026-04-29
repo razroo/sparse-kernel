@@ -25,7 +25,7 @@ Supported v0 actions (`status`, `doctor`, `profiles`, `tabs`, `open`, `navigate`
 
 Use `openclaw sparsekernel browser-pools` to inspect durable ledger pools and currently materialized native browser process pools. Native pool snapshots include trust zone, profile, active refs, max context slots, idle timeout, endpoint, PID when available, last activity, start count, clean stop count, and crash count.
 
-Use `openclaw sparsekernel browser-targets` and `openclaw sparsekernel browser-observations` to inspect durable target state and per-target observations. `openclaw runtime prune` also prunes old browser observations with the same age cutoff used for ephemeral/debug artifact cleanup; `openclaw runtime maintain` combines that pruning with expired lease and embedded-run recovery.
+Use `openclaw sparsekernel browser-targets` and `openclaw sparsekernel browser-observations` to inspect durable target state and per-target observations. `openclaw runtime prune` also prunes old browser observations with the same age cutoff used for ephemeral/debug artifact cleanup; `openclaw runtime maintain` combines that pruning with expired lease and embedded-run recovery and sweeps idle native browser pools whose CDP endpoint no longer responds.
 
 BrowserContext isolation is session isolation, not host isolation. Playwright route blocking is useful request control, not a hard security boundary.
 

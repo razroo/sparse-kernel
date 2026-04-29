@@ -13,6 +13,7 @@ import {
   inspectNativeBrowserPools,
   openLocalKernelDatabase,
   recoverEmbeddedRunTasks,
+  sweepNativeBrowserProcesses,
 } from "../local-kernel/index.js";
 import type { RuntimeRetentionPolicy } from "../local-kernel/index.js";
 import type { OutputRuntimeEnv, RuntimeEnv } from "../runtime.js";
@@ -631,6 +632,7 @@ export async function runtimeMaintainCommand(
     const store = new ContentAddressedArtifactStore(db);
     const prunedArtifacts = store.prune({ olderThan, retentionPolicies });
     const prunedBrowserObservations = db.pruneBrowserObservations({ olderThan });
+    const sweptBrowserPools = await sweepNativeBrowserProcesses();
     const result = {
       releasedExpiredLeases,
       embeddedRuns,
@@ -639,6 +641,7 @@ export async function runtimeMaintainCommand(
       prunedArtifacts: prunedArtifacts.artifacts.length,
       deletedFiles: prunedArtifacts.deletedFiles,
       prunedBrowserObservations,
+      sweptBrowserPools,
       scheduleEveryMs,
     };
     const completedAt = new Date().toISOString();
@@ -649,7 +652,7 @@ export async function runtimeMaintainCommand(
       return;
     }
     runtime.log(
-      `Maintained runtime: released ${releasedExpiredLeases} lease(s), recovered ${embeddedRuns.recovered} embedded run(s), pruned ${prunedArtifacts.artifacts.length} artifact record(s), deleted ${prunedArtifacts.deletedFiles} file(s), pruned ${prunedBrowserObservations} browser observation(s).`,
+      `Maintained runtime: released ${releasedExpiredLeases} lease(s), recovered ${embeddedRuns.recovered} embedded run(s), pruned ${prunedArtifacts.artifacts.length} artifact record(s), deleted ${prunedArtifacts.deletedFiles} file(s), pruned ${prunedBrowserObservations} browser observation(s), swept ${sweptBrowserPools.stopped} browser pool(s).`,
     );
   } finally {
     db.close();

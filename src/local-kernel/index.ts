@@ -45,6 +45,16 @@ export type {
   SandboxWorkerIdentitySnapshot,
 } from "./hard-egress-firewall.js";
 export {
+  applyWorkerIdentityProvisionPlan,
+  buildWorkerIdentityProvisionPlan,
+} from "./worker-identity-provision.js";
+export type {
+  WorkerIdentityProvisionApplyResult,
+  WorkerIdentityProvisionOptions,
+  WorkerIdentityProvisionPlatform,
+  WorkerIdentityProvisionPlan,
+} from "./worker-identity-provision.js";
+export {
   compactLedgerContent,
   materializeEmbeddedRunInKernel,
   recoverEmbeddedRunTasks,

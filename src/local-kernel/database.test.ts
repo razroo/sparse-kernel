@@ -12,6 +12,7 @@ import {
   buildBuiltinFirewallEgressPlan,
   buildSandboxProcessEnv,
   buildSandboxSpawnPlan,
+  buildWorkerIdentityProvisionPlan,
   checkTrustZoneNetworkUrl,
   checkTrustZoneNetworkUrlWithDns,
   ContentAddressedArtifactStore,
@@ -879,7 +880,7 @@ describe("local runtime kernel database", () => {
           id: "public_web_default",
           defaultAction: "allow",
           allowPrivateNetwork: false,
-          allowedHosts: ["203.0.113.10", "2001:db8::/32"],
+          allowedHosts: ["203.0.113.10", "2001:db8::/32", "example.com"],
           proxyRef: "http://127.0.0.1:8080",
         },
       },
@@ -897,6 +898,8 @@ describe("local runtime kernel database", () => {
       "203.0.113.10/32",
       "::1/128",
     ]);
+    expect(plan.proxyDelegatedHosts).toEqual(["example.com"]);
+    expect(plan.protocolCoverage).toBe("all_ip");
     expect(plan.commands.map((entry) => entry.command)).toEqual(
       expect.arrayContaining(["iptables", "ip6tables"]),
     );
@@ -926,6 +929,7 @@ describe("local runtime kernel database", () => {
       } as NodeJS.ProcessEnv,
     });
     expect(plan.platform).toBe("darwin_pf");
+    expect(plan.protocolCoverage).toBe("tcp_udp");
     expect(plan.commands[0]?.command).toBe("/bin/sh");
     expect(plan.commands[0]?.args.join(" ")).toContain("pfctl");
     expect(plan.commands[0]?.args.join(" ")).toContain("user 4242");
@@ -958,7 +962,9 @@ describe("local runtime kernel database", () => {
     });
     expect(plan.platform).toBe("windows_advfirewall");
     expect(plan.commands[0]?.command).toBe("powershell.exe");
-    expect(plan.commands[0]?.args).toEqual(
+    expect(plan.commands[0]?.args.join(" ")).toContain("Get-NetFirewallProfile");
+    expect(plan.commands.some((entry) => entry.args.includes("-LocalUser"))).toBe(true);
+    expect(plan.commands.flatMap((entry) => entry.args)).toEqual(
       expect.arrayContaining(["-LocalUser", `D:(A;;CC;;;${sid})`]),
     );
     expect(plan.releaseCommands[0]?.args).toEqual(
@@ -1053,10 +1059,13 @@ describe("local runtime kernel database", () => {
       const result = await broker.runCommand({
         allocationId: allocation.id,
         command: process.execPath,
-        args: ["-e", "console.log(`${process.getuid?.()}:${process.getgid?.()}`)"],
+        args: [
+          "-e",
+          "console.log(`${process.getuid?.()}:${process.getgid?.()}:${process.env.HTTP_PROXY}`)",
+        ],
       });
       expect(result.exitCode).toBe(0);
-      expect(result.stdout.trim()).toBe(`${uid}:${gid}`);
+      expect(result.stdout.trim()).toBe(`${uid}:${gid}:http://127.0.0.1:8080/`);
       expect(broker.releaseSandbox(allocation.id)).toBe(true);
     } finally {
       for (const name of envNames) {
@@ -1177,6 +1186,74 @@ describe("local runtime kernel database", () => {
         }
       }
     }
+  });
+
+  it("fails closed when full-protocol firewall coverage is required but macOS pf is selected", () => {
+    if (typeof process.getuid !== "function") {
+      return;
+    }
+    const trueCommand = fs.existsSync("/usr/bin/true") ? "/usr/bin/true" : "true";
+    const envNames = [
+      "OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_REQUIRE_FULL_PROTOCOL",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PFCTL",
+    ];
+    const previous = new Map(envNames.map((name) => [name, process.env[name]]));
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = "builtin-firewall";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM = "darwin_pf";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE = `uid:${process.getuid()}`;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_REQUIRE_FULL_PROTOCOL = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PFCTL = trueCommand;
+    try {
+      const db = openTempDb();
+      db.db
+        .prepare("UPDATE network_policies SET proxy_ref = ? WHERE id = 'public_web_default'")
+        .run("http://127.0.0.1:8080");
+      const broker = new LocalSandboxBroker(db);
+      expect(() =>
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "public_web",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toThrow(/full-protocol/);
+    } finally {
+      for (const name of envNames) {
+        const value = previous.get(name);
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
+  });
+
+  it("builds broker-managed worker identity provisioning plans", () => {
+    const plan = buildWorkerIdentityProvisionPlan({
+      platform: "linux",
+      count: 2,
+      prefix: "openclaw-worker",
+      uidStart: 63000,
+      gid: 63000,
+      group: "openclaw-workers",
+    });
+    expect(plan.identities).toEqual([
+      expect.objectContaining({ id: "openclaw-worker-0", uid: 63000, gid: 63000 }),
+      expect.objectContaining({ id: "openclaw-worker-1", uid: 63001, gid: 63000 }),
+    ]);
+    expect(plan.environment.OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITY_MODE).toBe("managed");
+    expect(plan.commands.some((entry) => entry.args.join(" ").includes("useradd"))).toBe(true);
   });
 
   it("persists sandbox backend metadata across broker instances", async () => {

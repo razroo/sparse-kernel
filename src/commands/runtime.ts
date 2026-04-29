@@ -7,6 +7,8 @@ import {
 import { formatErrorMessage } from "../infra/errors.js";
 import {
   ContentAddressedArtifactStore,
+  applyWorkerIdentityProvisionPlan,
+  buildWorkerIdentityProvisionPlan,
   exportSessionAsJsonl,
   importLegacySessionStore,
   inspectNativeBrowserPoolStats,
@@ -16,6 +18,7 @@ import {
   sweepNativeBrowserProcesses,
 } from "../local-kernel/index.js";
 import type { RuntimeRetentionPolicy } from "../local-kernel/index.js";
+import type { WorkerIdentityProvisionPlatform } from "../local-kernel/index.js";
 import type { OutputRuntimeEnv, RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
 
@@ -767,6 +770,79 @@ export async function runtimeBudgetSetCommand(
     runtime.log(`Updated runtime budget for trust zone ${trustZone}.`);
   } finally {
     db.close();
+  }
+}
+
+export async function runtimeWorkerIdentitiesCommand(
+  opts: {
+    count?: string;
+    prefix?: string;
+    uidStart?: string;
+    gid?: string;
+    group?: string;
+    platform?: string;
+    apply?: boolean;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  let count: number | undefined;
+  let uidStart: number | undefined;
+  let gid: number | undefined;
+  try {
+    count = parseOptionalInteger(opts.count, "--count");
+    uidStart = parseOptionalInteger(opts.uidStart, "--uid-start");
+    gid = parseOptionalInteger(opts.gid, "--gid");
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  let plan;
+  try {
+    plan = buildWorkerIdentityProvisionPlan({
+      ...(opts.platform ? { platform: opts.platform as WorkerIdentityProvisionPlatform } : {}),
+      ...(count !== undefined ? { count } : {}),
+      ...(opts.prefix ? { prefix: opts.prefix } : {}),
+      ...(uidStart !== undefined ? { uidStart } : {}),
+      ...(gid !== undefined ? { gid } : {}),
+      ...(opts.group ? { group: opts.group } : {}),
+    });
+  } catch (err) {
+    runtime.error(formatErrorMessage(err));
+    runtime.exit(1);
+    return;
+  }
+  let applyResults;
+  if (opts.apply) {
+    applyResults = applyWorkerIdentityProvisionPlan(plan);
+    const failed = applyResults.find((result) => result.status !== 0);
+    if (failed) {
+      runtime.error(
+        `Worker identity provision command failed: ${failed.command.command} ${failed.command.args.join(" ")}\n${failed.stderr || failed.stdout}`,
+      );
+      runtime.exit(1);
+      return;
+    }
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, { plan, ...(applyResults ? { applyResults } : {}) });
+    return;
+  }
+  runtime.log(`SparseKernel worker identity plan (${plan.platform}, ${plan.count} worker(s))`);
+  runtime.log("Commands:");
+  for (const entry of plan.commands) {
+    runtime.log(`  ${entry.command} ${entry.args.map((arg) => JSON.stringify(arg)).join(" ")}`);
+  }
+  runtime.log("Environment:");
+  for (const [name, value] of Object.entries(plan.environment)) {
+    runtime.log(`  ${name}=${value}`);
+  }
+  for (const note of plan.notes) {
+    runtime.log(`Note: ${note}`);
+  }
+  if (applyResults) {
+    runtime.log(`Applied ${applyResults.length} worker identity command(s).`);
   }
 }
 

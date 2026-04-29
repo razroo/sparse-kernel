@@ -86,6 +86,8 @@ export type HardEgressEnforcementSnapshot = {
     platform: BuiltinFirewallPlatform | string;
     scope: string;
     allowedCidrs?: string[];
+    proxyDelegatedHosts?: string[];
+    protocolCoverage?: string;
     releaseCommands?: BuiltinFirewallCommand[];
     applied?: boolean;
     limitations?: string[];
@@ -673,9 +675,19 @@ function readProgramFirewallScope(metadata: SandboxLeaseMetadata): string | unde
 export function buildSandboxProcessEnv(params: {
   backend: SandboxBackendKind;
   env?: Record<string, string>;
+  proxyServer?: string;
 }): NodeJS.ProcessEnv {
+  const proxyEnv =
+    params.proxyServer && params.backend === "local/no_isolation"
+      ? {
+          HTTP_PROXY: params.proxyServer,
+          HTTPS_PROXY: params.proxyServer,
+          ALL_PROXY: params.proxyServer,
+          NO_PROXY: "127.0.0.1,localhost,::1",
+        }
+      : {};
   if (params.backend === "local/no_isolation") {
-    return params.env ? { ...process.env, ...params.env } : process.env;
+    return { ...process.env, ...proxyEnv, ...(params.env ?? {}) };
   }
   const base: NodeJS.ProcessEnv = {
     PATH: readHostEnv("PATH") ?? "/usr/local/bin:/usr/bin:/bin",
@@ -1226,7 +1238,16 @@ export class LocalSandboxBroker implements SandboxBroker {
         backend,
         spawnPlan,
         cwd: request.cwd,
-        env: request.env,
+        env:
+          backend === "local/no_isolation" && metadata.policy?.docker?.proxyServer
+            ? {
+                HTTP_PROXY: metadata.policy.docker.proxyServer,
+                HTTPS_PROXY: metadata.policy.docker.proxyServer,
+                ALL_PROXY: metadata.policy.docker.proxyServer,
+                NO_PROXY: "127.0.0.1,localhost,::1",
+                ...(request.env ?? {}),
+              }
+            : request.env,
         stdin: request.stdin,
         signal: request.signal,
         timeoutMs,

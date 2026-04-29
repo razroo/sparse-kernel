@@ -17,6 +17,7 @@ import {
   runtimeTasksCommand,
   runtimeTranscriptCommand,
   runtimeVacuumCommand,
+  runtimeWorkerIdentitiesCommand,
 } from "../commands/runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
@@ -67,6 +68,10 @@ export function registerRuntimeCli(program: Command) {
           [
             "openclaw runtime budget set --trust-zone code_execution --max-runtime-seconds 600",
             "Update a trust-zone budget.",
+          ],
+          [
+            "openclaw runtime worker-identities --count 4 --json",
+            "Plan broker-managed SparseKernel worker identities.",
           ],
           [
             "openclaw runtime maintain --run-due --schedule-every 1h",
@@ -380,6 +385,35 @@ export function registerRuntimeCli(program: Command) {
             maxProcesses: opts.maxProcesses as string | undefined,
             maxMemoryMb: opts.maxMemoryMb as string | undefined,
             maxRuntimeSeconds: opts.maxRuntimeSeconds as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("worker-identities")
+    .description("Plan or provision broker-managed SparseKernel worker identities")
+    .option("--count <n>", "Number of worker identities", "2")
+    .option("--prefix <name>", "Worker account name prefix")
+    .option("--uid-start <uid>", "First UID for Unix worker accounts")
+    .option("--gid <gid>", "Unix worker group id")
+    .option("--group <name>", "Worker group name")
+    .option("--platform <platform>", "linux, darwin, or windows")
+    .option("--apply", "Run the generated provisioning commands", false)
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeWorkerIdentitiesCommand(
+          {
+            count: opts.count as string | undefined,
+            prefix: opts.prefix as string | undefined,
+            uidStart: opts.uidStart as string | undefined,
+            gid: opts.gid as string | undefined,
+            group: opts.group as string | undefined,
+            platform: opts.platform as string | undefined,
+            apply: Boolean(opts.apply),
             json: Boolean(opts.json),
           },
           defaultRuntime,

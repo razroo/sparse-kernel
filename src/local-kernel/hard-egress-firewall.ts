@@ -34,6 +34,8 @@ export type BuiltinFirewallEgressPlan = {
   enforcementId: string;
   scope: BuiltinFirewallScope;
   allowedCidrs: string[];
+  proxyDelegatedHosts: string[];
+  protocolCoverage: "all_ip" | "tcp_udp";
   commands: BuiltinFirewallCommand[];
   releaseCommands: BuiltinFirewallCommand[];
   description: string;
@@ -192,12 +194,20 @@ function cidrFamily(cidr: string): 4 | 6 {
   return net.isIP(address) === 6 ? 6 : 4;
 }
 
-function collectFirewallAllowedCidrs(policy: SandboxPolicySnapshot | undefined): string[] {
+type FirewallDestinationPlan = {
+  allowedCidrs: string[];
+  proxyDelegatedHosts: string[];
+};
+
+function collectFirewallDestinations(
+  policy: SandboxPolicySnapshot | undefined,
+): FirewallDestinationPlan {
   const networkPolicy = policy?.networkPolicy;
   if (!networkPolicy) {
     throw new Error("builtin firewall manager requires a network policy snapshot");
   }
   const allowed = new Set<string>();
+  const proxyDelegatedHosts = new Set<string>();
   const proxyDecision = resolveNetworkPolicyProxyRef(networkPolicy.proxyRef);
   if (proxyDecision.ok) {
     allowed.add("127.0.0.0/8");
@@ -207,19 +217,25 @@ function collectFirewallAllowedCidrs(policy: SandboxPolicySnapshot | undefined):
   }
   for (const host of networkPolicy.allowedHosts ?? []) {
     const cidr = normalizeIpOrCidr(host);
-    if (!cidr) {
+    if (cidr) {
+      allowed.add(cidr);
+    } else if (proxyDecision.ok) {
+      proxyDelegatedHosts.add(host.trim().toLowerCase());
+    } else {
       throw new Error(
         "builtin firewall manager accepts only IP/CIDR allowed_hosts; route hostnames through a loopback proxy_ref",
       );
     }
-    allowed.add(cidr);
   }
   if (allowed.size === 0) {
     throw new Error(
       "builtin firewall manager requires a loopback proxy_ref or IP/CIDR allowed_hosts",
     );
   }
-  return [...allowed].sort();
+  return {
+    allowedCidrs: [...allowed].sort(),
+    proxyDelegatedHosts: [...proxyDelegatedHosts].sort(),
+  };
 }
 
 function linuxOwnerArgs(scope: BuiltinFirewallScope): string[] {
@@ -340,7 +356,7 @@ function buildLinuxIptablesPlan(params: {
     limitations: [
       "Requires iptables/ip6tables owner match support and administrative privileges.",
       "The UID/GID scope must be dedicated to this SparseKernel allocation or policy can leak between processes sharing the scope.",
-      "Hostname allowlists must be enforced by a proxy; firewall rules accept only IP/CIDR destinations.",
+      "Hostname allowlists are enforced only when the trust zone also uses a loopback proxy_ref; firewall rules accept only loopback and IP/CIDR destinations.",
     ],
   };
 }
@@ -391,19 +407,18 @@ function buildWindowsAdvfirewallPlan(params: {
   allowedCidrs: string[];
   env: NodeJS.ProcessEnv;
 }): Pick<BuiltinFirewallEgressPlan, "commands" | "releaseCommands" | "limitations"> {
-  if (
-    !truthy(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED)
-  ) {
-    throw new Error(
-      "Windows builtin firewall manager requires an operator-managed outbound default-block profile; set OPENCLAW_RUNTIME_SANDBOX_FIREWALL_WINDOWS_DEFAULT_OUTBOUND_BLOCK_CONFIRMED=1 only after that policy is active",
-    );
-  }
   if (params.scope.kind !== "sid" && params.scope.kind !== "program") {
     throw new Error("Windows builtin firewall manager supports only sid/program scopes");
   }
   const powershell =
     params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_POWERSHELL?.trim() || "powershell.exe";
   const baseName = `OpenClaw-SparseKernel-${sanitizeFirewallToken(params.allocationId)}`;
+  const preflight = firewallCommand(powershell, [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "$bad = Get-NetFirewallProfile -Profile Domain,Private,Public | Where-Object { $_.Enabled -ne $true -or $_.DefaultOutboundAction -ne 'Block' }; if ($bad) { Write-Error 'SparseKernel requires all Windows Firewall profiles enabled with DefaultOutboundAction Block before scoped allow rules are meaningful.'; exit 42 }",
+  ]);
   const commands = params.allowedCidrs.map((cidr, index) => {
     const name = `${baseName}-${index}`;
     const args = [
@@ -435,7 +450,7 @@ function buildWindowsAdvfirewallPlan(params: {
     return firewallCommand(powershell, args);
   });
   return {
-    commands,
+    commands: [preflight, ...commands],
     releaseCommands: params.allowedCidrs.map((_, index) =>
       firewallCommand(powershell, [
         "-NoProfile",
@@ -447,7 +462,7 @@ function buildWindowsAdvfirewallPlan(params: {
       ]),
     ),
     limitations: [
-      "Requires an operator-managed Windows outbound default-block firewall profile; SparseKernel does not change the global default profile action.",
+      "Verifies that Windows Firewall profiles are enabled with DefaultOutboundAction Block before installing scoped allow rules.",
       "Explicit Windows block rules take precedence over allow rules, so this manager only installs scoped allow rules under a confirmed default-block profile.",
       "SID scopes require the command worker to run as the corresponding Windows principal; use an external launcher/helper to materialize that identity.",
     ],
@@ -481,21 +496,23 @@ export function buildBuiltinFirewallEgressPlan(params: {
   }
   const platform = normalizePlatform(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM);
   const scope = resolveFirewallScope({ env: params.env, workerIdentity: params.workerIdentity });
-  const allowedCidrs = collectFirewallAllowedCidrs(params.policy);
+  const destinations = collectFirewallDestinations(params.policy);
   const enforcementId = `builtin-firewall:${platform}:${params.allocationId}`;
   const managedPrefix = params.workerIdentity ? "managed " : "";
   if (platform === "linux_iptables") {
     const linux = buildLinuxIptablesPlan({
       allocationId: params.allocationId,
       scope,
-      allowedCidrs,
+      allowedCidrs: destinations.allowedCidrs,
       env: params.env,
     });
     return {
       platform,
       enforcementId,
       scope,
-      allowedCidrs,
+      allowedCidrs: destinations.allowedCidrs,
+      proxyDelegatedHosts: destinations.proxyDelegatedHosts,
+      protocolCoverage: "all_ip",
       commands: linux.commands,
       releaseCommands: linux.releaseCommands,
       description: `Linux iptables owner-match allowlist for ${managedPrefix}${scope.kind}:${scope.value}`,
@@ -506,14 +523,16 @@ export function buildBuiltinFirewallEgressPlan(params: {
     const darwin = buildDarwinPfPlan({
       allocationId: params.allocationId,
       scope,
-      allowedCidrs,
+      allowedCidrs: destinations.allowedCidrs,
       env: params.env,
     });
     return {
       platform,
       enforcementId,
       scope,
-      allowedCidrs,
+      allowedCidrs: destinations.allowedCidrs,
+      proxyDelegatedHosts: destinations.proxyDelegatedHosts,
+      protocolCoverage: "tcp_udp",
       commands: darwin.commands,
       releaseCommands: darwin.releaseCommands,
       description: `macOS pf scoped allowlist for ${managedPrefix}${scope.kind}:${scope.value}`,
@@ -523,14 +542,16 @@ export function buildBuiltinFirewallEgressPlan(params: {
   const windows = buildWindowsAdvfirewallPlan({
     allocationId: params.allocationId,
     scope,
-    allowedCidrs,
+    allowedCidrs: destinations.allowedCidrs,
     env: params.env,
   });
   return {
     platform,
     enforcementId,
     scope,
-    allowedCidrs,
+    allowedCidrs: destinations.allowedCidrs,
+    proxyDelegatedHosts: destinations.proxyDelegatedHosts,
+    protocolCoverage: "all_ip",
     commands: windows.commands,
     releaseCommands: windows.releaseCommands,
     description: `Windows Firewall default-block allowlist for ${scope.kind}:${scope.value}`,
@@ -705,6 +726,14 @@ export function runBuiltinFirewallHardEgressHelper(
       `builtin firewall manager generated a ${plan.platform} plan but will not mutate the host firewall without OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY=1`,
     );
   }
+  if (
+    truthy(params.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_REQUIRE_FULL_PROTOCOL) &&
+    plan.protocolCoverage !== "all_ip"
+  ) {
+    throw new Error(
+      `builtin firewall manager generated a ${plan.protocolCoverage} plan for ${plan.platform}; use a full-protocol backend, VM, or external helper for this trust zone`,
+    );
+  }
   assertFirewallScopeMatchesSandboxRunner({
     backend: params.backend,
     scope: plan.scope,
@@ -729,6 +758,8 @@ export function runBuiltinFirewallHardEgressHelper(
       platform: plan.platform,
       scope: `${plan.scope.kind}:${plan.scope.value}`,
       allowedCidrs: plan.allowedCidrs,
+      proxyDelegatedHosts: plan.proxyDelegatedHosts,
+      protocolCoverage: plan.protocolCoverage,
       releaseCommands: plan.releaseCommands,
       applied: true,
       limitations: plan.limitations,

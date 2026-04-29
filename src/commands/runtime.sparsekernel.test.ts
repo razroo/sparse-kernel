@@ -15,6 +15,7 @@ import {
   runtimeSessionsCommand,
   runtimeTasksCommand,
   runtimeTranscriptCommand,
+  runtimeWorkerIdentitiesCommand,
 } from "./runtime.js";
 
 const roots: string[] = [];
@@ -241,5 +242,36 @@ describe("SparseKernel runtime commands", () => {
         2,
       );
     });
+  });
+
+  it("prints broker-managed worker identity plans", async () => {
+    const runtime = makeRuntime();
+    await runtimeWorkerIdentitiesCommand(
+      {
+        platform: "linux",
+        count: "2",
+        prefix: "openclaw-worker",
+        uidStart: "63000",
+        gid: "63000",
+        group: "openclaw-workers",
+        json: true,
+      },
+      runtime,
+    );
+    expect(runtime.writeJson).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plan: expect.objectContaining({
+          platform: "linux",
+          identities: [
+            expect.objectContaining({ id: "openclaw-worker-0", uid: 63000 }),
+            expect.objectContaining({ id: "openclaw-worker-1", uid: 63001 }),
+          ],
+          environment: expect.objectContaining({
+            OPENCLAW_RUNTIME_SANDBOX_WORKER_IDENTITY_MODE: "managed",
+          }),
+        }),
+      }),
+      2,
+    );
   });
 });

@@ -140,6 +140,10 @@ type SandboxLeaseMetadata = {
 
 type CommandResolver = (commands: string[]) => string | undefined;
 
+function isTruthyRuntimeFlag(value: string | undefined): boolean {
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
@@ -235,6 +239,44 @@ function validDockerEnvName(name: string): boolean {
 function readHostEnv(name: string): string | undefined {
   const value = process.env[name];
   return value?.trim() ? value : undefined;
+}
+
+function dockerContainerProxyServer(proxyServer: string): {
+  proxyServer: string;
+  addHostGateway: boolean;
+} {
+  try {
+    const parsed = new URL(proxyServer);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+      parsed.hostname = "host.docker.internal";
+      return { proxyServer: parsed.toString(), addHostGateway: true };
+    }
+  } catch {
+    return { proxyServer, addHostGateway: false };
+  }
+  return { proxyServer, addHostGateway: false };
+}
+
+function sandboxNetworkProxyValidationFailure(params: {
+  policy: SandboxPolicySnapshot;
+  backend: SandboxBackendKind;
+  env?: NodeJS.ProcessEnv;
+}): string | undefined {
+  if (!isTruthyRuntimeFlag(params.env?.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY)) {
+    return undefined;
+  }
+  if (params.policy.networkPolicy?.defaultAction !== "allow") {
+    return undefined;
+  }
+  const proxyDecision = resolveNetworkPolicyProxyRef(params.policy.networkPolicy.proxyRef);
+  if (!proxyDecision.ok) {
+    return proxyDecision.reason;
+  }
+  if (params.backend !== "docker") {
+    return `backend cannot carry proxy-required sandbox egress in v0: ${params.backend}`;
+  }
+  return undefined;
 }
 
 export function buildSandboxProcessEnv(params: {
@@ -361,9 +403,13 @@ export function buildSandboxSpawnPlan(params: {
       }
       const env = { ...(params.env ?? {}) };
       if (dockerPolicy.proxyServer) {
-        env.HTTP_PROXY ??= dockerPolicy.proxyServer;
-        env.HTTPS_PROXY ??= dockerPolicy.proxyServer;
-        env.ALL_PROXY ??= dockerPolicy.proxyServer;
+        const dockerProxy = dockerContainerProxyServer(dockerPolicy.proxyServer);
+        if (dockerProxy.addHostGateway) {
+          args.push("--add-host", "host.docker.internal:host-gateway");
+        }
+        env.HTTP_PROXY ??= dockerProxy.proxyServer;
+        env.HTTPS_PROXY ??= dockerProxy.proxyServer;
+        env.ALL_PROXY ??= dockerProxy.proxyServer;
         env.NO_PROXY ??= "127.0.0.1,localhost,::1";
       }
       for (const [name, value] of Object.entries(env)) {
@@ -487,6 +533,24 @@ export class LocalSandboxBroker implements SandboxBroker {
       trustZoneId: request.trustZoneId,
       backend,
     });
+    const proxyFailure = sandboxNetworkProxyValidationFailure({
+      policy,
+      backend,
+      env: process.env,
+    });
+    if (proxyFailure) {
+      this.db.recordAudit({
+        actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
+        action: "network_policy.proxy_required_missing",
+        objectType: "trust_zone",
+        objectId: request.trustZoneId,
+        payload: {
+          backend,
+          reason: proxyFailure,
+        },
+      });
+      throw new Error(`Sandbox requires a proxy-backed network policy: ${proxyFailure}`);
+    }
     const allocationId = `sandbox_${crypto.randomUUID()}`;
     const ownerTaskId =
       request.taskId && this.db.getTask(request.taskId) ? request.taskId : undefined;

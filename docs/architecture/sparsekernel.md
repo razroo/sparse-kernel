@@ -56,4 +56,4 @@ The tool broker records tool-call lifecycle transitions, capability-checks agent
 
 ## Current limitations
 
-V0 proves the foundation. It does not launch or supervise Playwright browser process pools, implement production sandbox backends, enforce an egress proxy, make subprocess plugin workers safe when no real isolation backend is available, stream large artifact transfers, or rewrite OpenClaw around SparseKernel.
+V0 proves the foundation. It does not implement production sandbox backends, provide bypass-proof host-level egress blocking, make subprocess plugin workers safe when no real isolation backend is available, stream large artifact transfers, or rewrite OpenClaw around SparseKernel.

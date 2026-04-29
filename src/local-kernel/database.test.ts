@@ -589,6 +589,41 @@ describe("local runtime kernel database", () => {
     }
   });
 
+  it("fails closed for proxy-required sandbox egress without a proxy policy", () => {
+    const previous = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY = "1";
+    try {
+      const db = openTempDb();
+      const broker = new LocalSandboxBroker(db);
+      expect(() =>
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "public_web",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toThrow(/proxy-backed network policy/);
+      const audit = db.db
+        .prepare("SELECT action, payload_json FROM audit_log ORDER BY id DESC LIMIT 1")
+        .get() as { action: string; payload_json: string };
+      expect(audit.action).toBe("network_policy.proxy_required_missing");
+      expect(JSON.parse(audit.payload_json)).toMatchObject({ reason: "missing proxy_ref" });
+
+      expect(
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "code_execution",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toMatchObject({ backend: "local/no_isolation", status: "active" });
+    } finally {
+      if (previous === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY = previous;
+      }
+    }
+  });
+
   it("persists sandbox backend metadata across broker instances", async () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });
@@ -719,10 +754,12 @@ describe("local runtime kernel database", () => {
         "512m",
         "--pids-limit",
         "16",
+        "--add-host",
+        "host.docker.internal:host-gateway",
         "--env",
         "SAFE_ENV=1",
         "--env",
-        "HTTP_PROXY=http://127.0.0.1:18080/",
+        "HTTP_PROXY=http://host.docker.internal:18080/",
         "-v",
         "/work:/workspace:rw",
         "openclaw-runtime:local",

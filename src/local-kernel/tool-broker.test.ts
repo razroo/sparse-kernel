@@ -31,6 +31,7 @@ import {
   LocalKernelDatabase,
   resolveRuntimeToolBrokerMode,
 } from "./index.js";
+import { resolvePluginSandboxConfig } from "./tool-broker.js";
 
 function makeTool(name = "sensitive_tool"): AnyAgentTool {
   return {
@@ -330,6 +331,48 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("auto-selects an available isolated backend for plugin subprocess workers", () => {
+    expect(
+      resolvePluginSandboxConfig({
+        plan: { command: "worker" },
+        env: {} as NodeJS.ProcessEnv,
+        backendAvailable: (backend) => backend === "minijail",
+      }),
+    ).toMatchObject({
+      backend: "minijail",
+      selection: "auto",
+      trustZoneId: "plugin_untrusted",
+      requireIsolated: true,
+    });
+
+    expect(
+      resolvePluginSandboxConfig({
+        plan: { command: "worker" },
+        env: { OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKENDS: "docker,bwrap" } as NodeJS.ProcessEnv,
+        backendAvailable: () => true,
+      }),
+    ).toMatchObject({
+      backend: "bwrap",
+      selection: "auto",
+      candidateBackends: ["docker", "bwrap"],
+    });
+
+    expect(
+      resolvePluginSandboxConfig({
+        plan: { command: "worker" },
+        env: {
+          OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKENDS: "docker,bwrap",
+          OPENCLAW_RUNTIME_PLUGIN_DOCKER_IMAGE: "openclaw-plugin-worker:local",
+        } as NodeJS.ProcessEnv,
+        backendAvailable: () => true,
+      }),
+    ).toMatchObject({
+      backend: "docker",
+      dockerImage: "openclaw-plugin-worker:local",
+      selection: "auto",
+    });
+  });
+
   it("can run an opt-in plugin tool through a subprocess worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-plugin-worker-"));
     const workerPath = path.join(root, "worker.mjs");
@@ -381,7 +424,10 @@ describe("CapabilityToolBroker", () => {
         },
       });
       const broker = new CapabilityToolBroker(db, {
-        env: { OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "subprocess" } as NodeJS.ProcessEnv,
+        env: {
+          OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "subprocess",
+          OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKENDS: "local/no_isolation",
+        } as NodeJS.ProcessEnv,
       });
       const tool = broker.wrapTool(rawTool, {
         subject: { subjectType: "agent", subjectId: "main" },

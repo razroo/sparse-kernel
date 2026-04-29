@@ -13,10 +13,29 @@ import {
   checkTrustZoneNetworkUrlWithDns,
   resolveNetworkPolicyProxyRef,
 } from "./network-policy.js";
-import { LocalSandboxBroker, type SandboxBackendKind } from "./sandbox-broker.js";
+import {
+  isSandboxBackendAvailable,
+  LocalSandboxBroker,
+  type SandboxBackendKind,
+} from "./sandbox-broker.js";
 
 const DEFAULT_TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES = 256 * 1024;
 const DEFAULT_PLUGIN_SANDBOX_TRUST_ZONE_ID = "plugin_untrusted";
+const DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS: SandboxBackendKind[] = [
+  "bwrap",
+  "minijail",
+  "docker",
+];
+const PLUGIN_SANDBOX_BACKENDS = new Set<SandboxBackendKind>([
+  "local/no_isolation",
+  "docker",
+  "bwrap",
+  "minijail",
+  "ssh",
+  "openshell",
+  "vm",
+  "other",
+]);
 
 export type ToolBrokerSubject = {
   subjectType: string;
@@ -35,12 +54,15 @@ export type CapabilityToolBrokerOptions = {
   artifactRootDir?: string;
   outputArtifactThresholdBytes?: number;
   env?: NodeJS.ProcessEnv;
+  sandboxBackendAvailable?: PluginSandboxBackendAvailability;
   browserControlFetch?: typeof fetch;
   browserCdpProxyFactory?: (
     input: SparseKernelBrowserToolCdpProxyInput,
   ) => Promise<BrowserToolLease>;
   browserNativeAcquire?: typeof acquireNativeBrowserProcess;
 };
+
+export type PluginSandboxBackendAvailability = (backend: SandboxBackendKind) => boolean;
 
 export type BrowserToolLease = {
   id: string;
@@ -98,6 +120,17 @@ function requiresPluginSubprocess(raw: string | undefined): boolean {
 
 type PluginSubprocessPlan = NonNullable<PluginToolMeta["subprocess"]>;
 
+export type PluginSandboxConfig = {
+  trustZoneId: string;
+  backend: SandboxBackendKind;
+  dockerImage?: string;
+  requireIsolated: boolean;
+  maxRuntimeMs?: number;
+  maxBytesOut: number;
+  selection: "explicit" | "auto" | "fallback";
+  candidateBackends: SandboxBackendKind[];
+};
+
 function resolvePluginSubprocessPlan(
   meta: PluginToolMeta | undefined,
 ): PluginToolMeta["subprocess"] {
@@ -135,40 +168,108 @@ function resolvePluginSubprocessPlan(
   };
 }
 
-function resolvePluginSandboxConfig(params: {
-  plan: PluginSubprocessPlan;
-  env: NodeJS.ProcessEnv;
-}): {
-  trustZoneId: string;
+function isPluginSandboxBackend(value: string): value is SandboxBackendKind {
+  return PLUGIN_SANDBOX_BACKENDS.has(value as SandboxBackendKind);
+}
+
+function readPluginSandboxBackend(
+  raw: string | undefined,
+  source: string,
+): SandboxBackendKind | undefined {
+  const value = raw?.trim();
+  if (!value) {
+    return undefined;
+  }
+  if (!isPluginSandboxBackend(value)) {
+    throw new Error(`Unsupported plugin sandbox backend from ${source}: ${value}`);
+  }
+  return value;
+}
+
+function readPluginSandboxBackendCandidates(raw: string | undefined): SandboxBackendKind[] {
+  const values =
+    raw
+      ?.split(/[,\s]+/)
+      .map((entry) => entry.trim())
+      .filter(Boolean) ?? [];
+  const candidates: SandboxBackendKind[] = [];
+  for (const value of values) {
+    if (!isPluginSandboxBackend(value)) {
+      throw new Error(`Unsupported plugin sandbox backend in candidate list: ${value}`);
+    }
+    candidates.push(value);
+  }
+  return candidates.length > 0 ? candidates : DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS;
+}
+
+function isAutoSelectablePluginBackend(params: {
   backend: SandboxBackendKind;
   dockerImage?: string;
   requireIsolated: boolean;
-  maxRuntimeMs?: number;
-  maxBytesOut: number;
-} {
+  backendAvailable: PluginSandboxBackendAvailability;
+}): boolean {
+  if (params.requireIsolated && params.backend === "local/no_isolation") {
+    return false;
+  }
+  if (
+    params.requireIsolated &&
+    !DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS.includes(params.backend)
+  ) {
+    return false;
+  }
+  if (params.backend === "docker" && !params.dockerImage) {
+    return false;
+  }
+  return params.backendAvailable(params.backend);
+}
+
+export function resolvePluginSandboxConfig(params: {
+  plan: PluginSubprocessPlan;
+  env: NodeJS.ProcessEnv;
+  backendAvailable?: PluginSandboxBackendAvailability;
+}): PluginSandboxConfig {
   const sandbox = params.plan.sandbox;
-  const rawBackend =
-    sandbox?.backend ??
-    params.env.OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKEND ??
-    params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_SANDBOX_BACKEND;
-  const backend = (rawBackend?.trim() || "local/no_isolation") as SandboxBackendKind;
   const dockerImage =
     sandbox?.dockerImage ??
     params.env.OPENCLAW_RUNTIME_PLUGIN_DOCKER_IMAGE ??
     params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_DOCKER_IMAGE ??
     params.env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE;
+  const explicitBackend =
+    readPluginSandboxBackend(sandbox?.backend, "plugin metadata") ??
+    readPluginSandboxBackend(
+      params.env.OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKEND ??
+        params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_SANDBOX_BACKEND,
+      "environment",
+    );
+  const requireIsolated =
+    sandbox?.requireIsolated === false ||
+    isTruthyToolFlag(params.env.OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION)
+      ? false
+      : true;
+  const candidateBackends = readPluginSandboxBackendCandidates(
+    params.env.OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKENDS ??
+      params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_SANDBOX_BACKENDS,
+  );
+  const backendAvailable = params.backendAvailable ?? isSandboxBackendAvailable;
+  const autoBackend = candidateBackends.find((backend) =>
+    isAutoSelectablePluginBackend({
+      backend,
+      dockerImage: dockerImage?.trim(),
+      requireIsolated,
+      backendAvailable,
+    }),
+  );
+  const backend = explicitBackend ?? autoBackend ?? "local/no_isolation";
   const maxRuntimeMs = sandbox?.maxRuntimeMs;
   return {
     trustZoneId: sandbox?.trustZoneId?.trim() || DEFAULT_PLUGIN_SANDBOX_TRUST_ZONE_ID,
     backend,
     ...(dockerImage?.trim() ? { dockerImage: dockerImage.trim() } : {}),
-    requireIsolated:
-      sandbox?.requireIsolated === false ||
-      isTruthyToolFlag(params.env.OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION)
-        ? false
-        : true,
+    requireIsolated,
     ...(maxRuntimeMs !== undefined ? { maxRuntimeMs } : {}),
     maxBytesOut: sandbox?.maxBytesOut ?? 256 * 1024,
+    selection: explicitBackend ? "explicit" : autoBackend ? "auto" : "fallback",
+    candidateBackends,
   };
 }
 
@@ -344,7 +445,11 @@ export class CapabilityToolBroker {
       throw new Error("Plugin subprocess sandbox allocation requires an agent id.");
     }
     const env = this.options.env ?? process.env;
-    const sandboxConfig = resolvePluginSandboxConfig({ plan: input.plan, env });
+    const sandboxConfig = resolvePluginSandboxConfig({
+      plan: input.plan,
+      env,
+      backendAvailable: this.options.sandboxBackendAvailable,
+    });
     const timeoutMs = Math.max(1, sandboxConfig.maxRuntimeMs ?? input.plan.timeoutMs ?? 30_000);
     if (sandboxConfig.backend === "local/no_isolation" && sandboxConfig.requireIsolated) {
       this.db.recordAudit({
@@ -356,11 +461,16 @@ export class CapabilityToolBroker {
           pluginId: input.pluginMeta.pluginId,
           trustZoneId: sandboxConfig.trustZoneId,
           backend: sandboxConfig.backend,
-          reason: "isolated backend required",
+          backendSelection: sandboxConfig.selection,
+          candidateBackends: sandboxConfig.candidateBackends,
+          reason:
+            sandboxConfig.selection === "fallback"
+              ? "no isolated backend available"
+              : "isolated backend required",
         },
       });
       throw new Error(
-        `Plugin subprocess for ${input.tool.name} requires an isolated sandbox backend; configure subprocess.sandbox.backend or set OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION=1 only for trusted local workers.`,
+        `Plugin subprocess for ${input.tool.name} requires an isolated sandbox backend; install bwrap/minijail, configure Docker with OPENCLAW_RUNTIME_PLUGIN_DOCKER_IMAGE, or set OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION=1 only for trusted local workers.`,
       );
     }
     const payload = JSON.stringify({

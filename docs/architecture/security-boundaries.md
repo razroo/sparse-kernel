@@ -20,6 +20,7 @@ SparseKernel security claims must be precise.
 - The bwrap and minijail command runners use the installed backend binaries when available, but their exact isolation depends on host kernel support and the broker-selected bind policy. Isolated command backends receive a sanitized environment by default; plugin or sandbox callers must pass required worker environment explicitly.
 - SparseKernel network policy checks, including DNS-aware hostname resolution, are broker-side request guards unless backed by a real proxy, firewall, sandbox, or VM boundary.
 - Sandbox proxy-required mode fails closed for network-allowing trust zones without a valid loopback proxy reference and configures Docker command workers to use that proxy. It is not a bypass-proof host egress boundary for arbitrary code.
+- `OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS=1` fails closed for network-allowing sandbox trust zones because current v0 backends cannot prove host-level firewall, VM, or egress-proxy enforcement.
 - Browser proxy-required mode configures SparseKernel-owned native browser processes with a loopback proxy and denies unverified external CDP endpoints; it does not control arbitrary host processes.
 - Docker command execution requires an explicit image and disables container networking by default, but its isolation is only the host Docker daemon's isolation; it is not a per-agent security model.
 - Persisted lease metadata records the selected backend and policy intent; it is audit/accounting state, not isolation by itself.

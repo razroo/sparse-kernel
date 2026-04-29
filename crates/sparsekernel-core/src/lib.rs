@@ -80,6 +80,13 @@ fn parse_json(raw: Option<String>) -> Option<Value> {
     raw.and_then(|text| serde_json::from_str(&text).ok())
 }
 
+fn truthy_env_flag(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SparseKernelPaths {
     pub home_dir: PathBuf,
@@ -2203,6 +2210,21 @@ pub struct LocalSandboxBroker<'a> {
     pub db: &'a SparseKernelDb,
 }
 
+fn trust_zone_allows_network(db: &SparseKernelDb, trust_zone_id: &str) -> Result<bool> {
+    let action = db
+        .conn
+        .query_row(
+            "SELECT np.default_action
+             FROM trust_zones tz
+             JOIN network_policies np ON np.id = tz.network_policy_id
+             WHERE tz.id = ?",
+            params![trust_zone_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(matches!(action.as_deref(), Some("allow")))
+}
+
 impl SandboxBroker for LocalSandboxBroker<'_> {
     fn allocate_sandbox(
         &self,
@@ -2231,6 +2253,24 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
         let allocation_id = format!("sandbox_{}", Uuid::new_v4());
         let now = now_iso();
         let backend = backend.unwrap_or("local/no_isolation").to_string();
+        if truthy_env_flag("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS")
+            && trust_zone_allows_network(self.db, trust_zone_id)?
+        {
+            let reason = format!(
+                "host-level egress enforcement is not implemented for sandbox backend: {backend}"
+            );
+            self.db.record_audit(AuditInput {
+                actor_type: agent_id.map(|_| "agent".to_string()),
+                actor_id: agent_id.map(str::to_string),
+                action: "network_policy.hard_egress_unavailable".to_string(),
+                object_type: Some("trust_zone".to_string()),
+                object_id: Some(trust_zone_id.to_string()),
+                payload: Some(json!({ "backend": backend, "reason": reason })),
+            })?;
+            return Err(SparseKernelError::Denied(format!(
+                "sandbox requires host-level egress enforcement: {reason}"
+            )));
+        }
         self.db.conn.execute(
             "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, created_at, updated_at)
              VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?)",
@@ -2649,5 +2689,26 @@ mod tests {
             .unwrap();
         assert_eq!(allocation.backend, "local/no_isolation");
         assert!(sandbox.release_sandbox(&allocation.id).unwrap());
+    }
+
+    #[test]
+    fn sandbox_hard_egress_mode_fails_closed_for_network_allowing_zones() {
+        let (_dir, db) = temp_db();
+        let previous = env::var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS").ok();
+        env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", "1");
+        let result = LocalSandboxBroker { db: &db }.allocate_sandbox(
+            None,
+            None,
+            "public_web",
+            Some("local/no_isolation"),
+        );
+        match previous {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
+        }
+        assert!(result.is_err());
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "network_policy.hard_egress_unavailable");
+        assert_eq!(audit[0].object_id.as_deref(), Some("public_web"));
     }
 }

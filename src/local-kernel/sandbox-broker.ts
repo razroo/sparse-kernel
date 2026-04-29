@@ -263,6 +263,12 @@ function sandboxNetworkProxyValidationFailure(params: {
   backend: SandboxBackendKind;
   env?: NodeJS.ProcessEnv;
 }): string | undefined {
+  if (isTruthyRuntimeFlag(params.env?.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS)) {
+    if (params.policy.networkPolicy?.defaultAction !== "allow") {
+      return undefined;
+    }
+    return `host-level egress enforcement is not implemented for sandbox backend: ${params.backend}`;
+  }
   if (!isTruthyRuntimeFlag(params.env?.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY)) {
     return undefined;
   }
@@ -539,9 +545,14 @@ export class LocalSandboxBroker implements SandboxBroker {
       env: process.env,
     });
     if (proxyFailure) {
+      const hardEgressRequired = isTruthyRuntimeFlag(
+        process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS,
+      );
       this.db.recordAudit({
         actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
-        action: "network_policy.proxy_required_missing",
+        action: hardEgressRequired
+          ? "network_policy.hard_egress_unavailable"
+          : "network_policy.proxy_required_missing",
         objectType: "trust_zone",
         objectId: request.trustZoneId,
         payload: {
@@ -549,7 +560,11 @@ export class LocalSandboxBroker implements SandboxBroker {
           reason: proxyFailure,
         },
       });
-      throw new Error(`Sandbox requires a proxy-backed network policy: ${proxyFailure}`);
+      throw new Error(
+        hardEgressRequired
+          ? `Sandbox requires host-level egress enforcement: ${proxyFailure}`
+          : `Sandbox requires a proxy-backed network policy: ${proxyFailure}`,
+      );
     }
     const allocationId = `sandbox_${crypto.randomUUID()}`;
     const ownerTaskId =

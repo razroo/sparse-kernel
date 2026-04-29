@@ -686,6 +686,55 @@ describe("local runtime kernel database", () => {
     }
   });
 
+  it("fails closed when hard sandbox egress enforcement is required for network-allowing zones", () => {
+    const previousHard = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
+    const previousProxy = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+    try {
+      const db = openTempDb();
+      db.db
+        .prepare("UPDATE network_policies SET proxy_ref = ? WHERE id = 'public_web_default'")
+        .run("http://127.0.0.1:8080");
+      const broker = new LocalSandboxBroker(db);
+      expect(() =>
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "public_web",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toThrow(/host-level egress enforcement/);
+      const audit = db.db
+        .prepare("SELECT action, payload_json FROM audit_log ORDER BY id DESC LIMIT 1")
+        .get() as { action: string; payload_json: string };
+      expect(audit.action).toBe("network_policy.hard_egress_unavailable");
+      expect(JSON.parse(audit.payload_json)).toMatchObject({
+        backend: "local/no_isolation",
+        reason:
+          "host-level egress enforcement is not implemented for sandbox backend: local/no_isolation",
+      });
+
+      expect(
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "code_execution",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toMatchObject({ backend: "local/no_isolation", status: "active" });
+    } finally {
+      if (previousHard === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = previousHard;
+      }
+      if (previousProxy === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY = previousProxy;
+      }
+    }
+  });
+
   it("persists sandbox backend metadata across broker instances", async () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });

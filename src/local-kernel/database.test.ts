@@ -476,6 +476,58 @@ describe("local runtime kernel database", () => {
     });
   });
 
+  it("enforces trust-zone sandbox budgets and runtime clamps", () => {
+    const db = openTempDb();
+    expect(
+      db.updateTrustZoneLimits({
+        id: "code_execution",
+        maxProcesses: 1,
+        maxRuntimeSeconds: 2,
+      }),
+    ).toBe(true);
+    const first = db.createResourceLease({
+      id: "sandbox-budget-a",
+      resourceType: "sandbox",
+      resourceId: "sandbox-budget-a",
+      trustZoneId: "code_execution",
+      maxRuntimeMs: 10_000,
+      leaseUntil: "2030-01-01T00:00:00.000Z",
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    expect(db.getResourceLease(first)).toMatchObject({
+      maxRuntimeMs: 2_000,
+      leaseUntil: "2026-01-01T00:00:02.000Z",
+    });
+    expect(() =>
+      db.createResourceLease({
+        id: "sandbox-budget-b",
+        resourceType: "sandbox",
+        resourceId: "sandbox-budget-b",
+        trustZoneId: "code_execution",
+        now: "2026-01-01T00:00:01.000Z",
+      }),
+    ).toThrow(/budget exhausted/);
+    const audit = db.db
+      .prepare("SELECT action, payload_json FROM audit_log ORDER BY id DESC LIMIT 1")
+      .get() as { action: string; payload_json: string };
+    expect(audit.action).toBe("resource_lease.denied_budget_exhausted");
+    expect(JSON.parse(audit.payload_json)).toMatchObject({
+      trustZoneId: "code_execution",
+      resourceType: "sandbox",
+      active: 1,
+      limit: 1,
+    });
+    expect(db.releaseResourceLease(first)).toBe(true);
+    expect(
+      db.createResourceLease({
+        id: "sandbox-budget-c",
+        resourceType: "sandbox",
+        resourceId: "sandbox-budget-c",
+        trustZoneId: "code_execution",
+      }),
+    ).toBe("sandbox-budget-c");
+  });
+
   it("brokers local/no-isolation sandbox allocations without pretending isolation", () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });

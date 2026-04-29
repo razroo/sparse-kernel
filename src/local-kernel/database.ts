@@ -239,6 +239,16 @@ type RuntimeInfoRow = {
   updated_at: string;
 };
 
+class ResourceLeaseBudgetError extends Error {
+  constructor(
+    message: string,
+    readonly payload: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ResourceLeaseBudgetError";
+  }
+}
+
 export type OpenLocalKernelDatabaseOptions = {
   dbPath?: string;
   env?: NodeJS.ProcessEnv;
@@ -526,6 +536,8 @@ export class LocalKernelDatabase {
   readonly dbPath: string;
   private readonly walMaintenance: SqliteWalMaintenance;
   private closed = false;
+  private transactionDepth = 0;
+  private savepointCounter = 0;
 
   constructor(options: OpenLocalKernelDatabaseOptions = {}) {
     const env = options.env ?? process.env;
@@ -748,7 +760,26 @@ export class LocalKernelDatabase {
   }
 
   withTransaction<T>(fn: () => T): T {
+    if (this.transactionDepth > 0) {
+      const savepoint = `local_kernel_sp_${++this.savepointCounter}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      this.transactionDepth += 1;
+      try {
+        const result = fn();
+        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        return result;
+      } catch (error) {
+        try {
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        } catch {}
+        throw error;
+      } finally {
+        this.transactionDepth -= 1;
+      }
+    }
     this.db.exec("BEGIN IMMEDIATE");
+    this.transactionDepth += 1;
     try {
       const result = fn();
       this.db.exec("COMMIT");
@@ -758,6 +789,8 @@ export class LocalKernelDatabase {
         this.db.exec("ROLLBACK");
       } catch {}
       throw error;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -1994,37 +2027,120 @@ export class LocalKernelDatabase {
   }): string {
     const id = input.id ?? `lease_${crypto.randomUUID()}`;
     const now = input.now ?? nowIso();
-    this.db
-      .prepare(
-        `INSERT INTO resource_leases(
-          id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id,
-          status, lease_until, max_runtime_ms, max_bytes_out, max_tokens, metadata_json, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        input.resourceType,
-        input.resourceId,
-        input.ownerTaskId ?? null,
-        input.ownerAgentId ?? null,
-        input.trustZoneId ?? null,
-        input.leaseUntil ?? null,
-        input.maxRuntimeMs ?? null,
-        input.maxBytesOut ?? null,
-        input.maxTokens ?? null,
-        jsonToText(input.metadata),
-        now,
-        now,
-      );
-    this.recordAudit({
-      actor: { type: "runtime" },
-      action: "resource_lease.created",
-      objectType: "resource_lease",
-      objectId: id,
-      payload: { resourceType: input.resourceType, resourceId: input.resourceId },
-      createdAt: now,
-    });
-    return id;
+    try {
+      return this.withTransaction(() => {
+        const budget = this.resolveResourceLeaseBudget(input, now);
+        this.db
+          .prepare(
+            `INSERT INTO resource_leases(
+              id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id,
+              status, lease_until, max_runtime_ms, max_bytes_out, max_tokens, metadata_json, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            id,
+            input.resourceType,
+            input.resourceId,
+            input.ownerTaskId ?? null,
+            input.ownerAgentId ?? null,
+            input.trustZoneId ?? null,
+            budget.leaseUntil ?? null,
+            budget.maxRuntimeMs ?? null,
+            input.maxBytesOut ?? null,
+            input.maxTokens ?? null,
+            jsonToText(input.metadata),
+            now,
+            now,
+          );
+        this.recordAudit({
+          actor: { type: "runtime" },
+          action: "resource_lease.created",
+          objectType: "resource_lease",
+          objectId: id,
+          payload: {
+            resourceType: input.resourceType,
+            resourceId: input.resourceId,
+            ...(input.trustZoneId ? { trustZoneId: input.trustZoneId } : {}),
+            ...(budget.maxRuntimeMs !== input.maxRuntimeMs
+              ? { maxRuntimeMs: budget.maxRuntimeMs }
+              : {}),
+          },
+          createdAt: now,
+        });
+        return id;
+      });
+    } catch (error) {
+      if (error instanceof ResourceLeaseBudgetError) {
+        this.recordAudit({
+          actor: { type: "runtime" },
+          action: "resource_lease.denied_budget_exhausted",
+          objectType: "trust_zone",
+          objectId: input.trustZoneId,
+          payload: error.payload,
+          createdAt: now,
+        });
+      }
+      throw error;
+    }
+  }
+
+  private resolveResourceLeaseBudget(
+    input: {
+      resourceType: string;
+      trustZoneId?: string;
+      leaseUntil?: string;
+      maxRuntimeMs?: number;
+    },
+    now: string,
+  ): { leaseUntil?: string; maxRuntimeMs?: number } {
+    const zone = input.trustZoneId
+      ? this.listTrustZones().find((entry) => entry.id === input.trustZoneId)
+      : undefined;
+    if (
+      zone?.maxProcesses !== undefined &&
+      input.resourceType === "sandbox" &&
+      zone.maxProcesses >= 0
+    ) {
+      const row = this.db
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM resource_leases
+           WHERE trust_zone_id = ? AND resource_type = 'sandbox' AND status = 'active'`,
+        )
+        .get(zone.id) as CountRow;
+      const active = Number(row.count);
+      if (active >= zone.maxProcesses) {
+        throw new ResourceLeaseBudgetError(
+          `Trust zone ${zone.id} sandbox budget exhausted: ${active}/${zone.maxProcesses} active`,
+          {
+            trustZoneId: zone.id,
+            resourceType: input.resourceType,
+            active,
+            limit: zone.maxProcesses,
+          },
+        );
+      }
+    }
+
+    let maxRuntimeMs = input.maxRuntimeMs;
+    if (zone?.maxRuntimeSeconds !== undefined) {
+      const trustZoneMaxMs = Math.max(1, Math.trunc(zone.maxRuntimeSeconds * 1000));
+      maxRuntimeMs =
+        maxRuntimeMs === undefined
+          ? trustZoneMaxMs
+          : Math.min(Math.max(1, Math.trunc(maxRuntimeMs)), trustZoneMaxMs);
+    } else if (maxRuntimeMs !== undefined) {
+      maxRuntimeMs = Math.max(1, Math.trunc(maxRuntimeMs));
+    }
+
+    let leaseUntil = input.leaseUntil;
+    if (maxRuntimeMs !== undefined) {
+      const runtimeLeaseUntil = futureIso(now, maxRuntimeMs);
+      if (!leaseUntil || Date.parse(leaseUntil) > Date.parse(runtimeLeaseUntil)) {
+        leaseUntil = runtimeLeaseUntil;
+      }
+    }
+    return { leaseUntil, maxRuntimeMs };
   }
 
   getResourceLease(id: string): ResourceLeaseRecord | undefined {

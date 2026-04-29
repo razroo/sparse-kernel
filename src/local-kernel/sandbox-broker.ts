@@ -572,6 +572,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         policy,
       },
     });
+    const lease = this.db.getResourceLease(allocationId);
     this.db.recordAudit({
       actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
       action: "sandbox.allocated",
@@ -593,7 +594,7 @@ export class LocalSandboxBroker implements SandboxBroker {
       backend,
       status: "active",
       createdAt: new Date().toISOString(),
-      leaseUntil: request.requirements?.leaseUntil,
+      leaseUntil: lease?.leaseUntil ?? request.requirements?.leaseUntil,
     };
   }
 

@@ -1,15 +1,27 @@
 import {
-  createOpenClawSparseKernelToolBroker,
   OpenClawSparseKernelToolBroker,
   type OpenClawSparseKernelBrowserProxyFactory,
   type OpenClawSparseKernelToolBrokerClient,
 } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
+import { SparseKernelClient } from "../../packages/sparsekernel-client/src/index.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { getPluginToolMeta } from "../plugins/tools.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
 import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import { openLocalKernelDatabase, type LocalKernelDatabase } from "./database.js";
-import { CapabilityToolBroker, isSandboxCommandToolName } from "./tool-broker.js";
+import {
+  buildSandboxSpawnPlan,
+  runSandboxSpawnPlan,
+  type SandboxBackendKind,
+} from "./sandbox-broker.js";
+import {
+  CapabilityToolBroker,
+  isSandboxCommandToolName,
+  requiresPluginSubprocess,
+  resolvePluginSandboxConfig,
+  resolvePluginSubprocessPlan,
+  type PluginSubprocessPlan,
+} from "./tool-broker.js";
 
 export type RuntimeToolBrokerMode = "off" | "local" | "daemon";
 
@@ -256,42 +268,174 @@ export async function brokerToolsForRunWithDaemon(
 ): Promise<BrokeredToolsForRun> {
   const capabilityExpiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
   const browserProxyFactory = createDaemonBrowserProxyFactory(input);
-  const broker = input.daemonKernel
-    ? new OpenClawSparseKernelToolBroker({
-        kernel: input.daemonKernel,
-        agentId: input.agentId,
-        sessionId: input.sessionId,
-        sessionKey: input.sessionKey,
-        channel: input.channel,
-        runId: input.runId,
-        taskId: input.taskId,
-        capabilityExpiresAt,
-        autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
-        outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
-        browserProxyFactory,
-      })
-    : createOpenClawSparseKernelToolBroker({
-        baseUrl:
-          input.sparseKernelBaseUrl ??
-          input.env?.OPENCLAW_SPARSEKERNEL_BASE_URL ??
-          input.env?.SPARSEKERNEL_BASE_URL,
-        agentId: input.agentId,
-        sessionId: input.sessionId,
-        sessionKey: input.sessionKey,
-        channel: input.channel,
-        runId: input.runId,
-        taskId: input.taskId,
-        capabilityExpiresAt,
-        autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
-        outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
-        browserProxyFactory,
-      });
-  await broker.prepareRun(input.tools);
+  const kernel =
+    input.daemonKernel ??
+    new SparseKernelClient({
+      baseUrl:
+        input.sparseKernelBaseUrl ??
+        input.env?.OPENCLAW_SPARSEKERNEL_BASE_URL ??
+        input.env?.SPARSEKERNEL_BASE_URL,
+    });
+  const daemonTools = wrapDaemonPluginSubprocessTools(input, kernel, capabilityExpiresAt);
+  const broker = new OpenClawSparseKernelToolBroker({
+    kernel,
+    agentId: input.agentId,
+    sessionId: input.sessionId,
+    sessionKey: input.sessionKey,
+    channel: input.channel,
+    runId: input.runId,
+    taskId: input.taskId,
+    capabilityExpiresAt,
+    autoGrantToolCapability: (toolName) => shouldAutoGrantToolCapability(toolName, input.env),
+    outputArtifactThresholdBytes: input.outputArtifactThresholdBytes,
+    browserProxyFactory,
+  });
+  await broker.prepareRun(daemonTools);
   return {
-    tools: broker.wrapTools(input.tools),
+    tools: broker.wrapTools(daemonTools),
     mode: "daemon",
     close: () => broker.close(),
   };
+}
+
+function wrapDaemonPluginSubprocessTools(
+  input: BrokerToolsForRunInput,
+  kernel: OpenClawSparseKernelToolBrokerClient,
+  capabilityExpiresAt: string,
+): AnyAgentTool[] {
+  const env = input.env ?? process.env;
+  const strictPluginBoundary =
+    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
+    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS);
+  return input.tools.map((tool) => {
+    const pluginMeta = getPluginToolMeta(tool);
+    if (!pluginMeta) {
+      return tool;
+    }
+    const plan = resolvePluginSubprocessPlan(pluginMeta);
+    if (!plan && !strictPluginBoundary) {
+      return tool;
+    }
+    return {
+      ...tool,
+      execute: async (toolCallId, params, signal) => {
+        if (!plan) {
+          throw new Error(
+            `Plugin tool ${tool.name} from ${pluginMeta.pluginId} requires out-of-process execution, but no subprocess worker is configured.`,
+          );
+        }
+        return await runDaemonPluginToolSubprocess({
+          input,
+          kernel,
+          capabilityExpiresAt,
+          plan,
+          pluginId: pluginMeta.pluginId,
+          tool,
+          toolCallId,
+          params,
+          signal,
+        });
+      },
+    } as AnyAgentTool;
+  });
+}
+
+async function runDaemonPluginToolSubprocess(params: {
+  input: BrokerToolsForRunInput;
+  kernel: OpenClawSparseKernelToolBrokerClient;
+  capabilityExpiresAt: string;
+  plan: PluginSubprocessPlan;
+  pluginId: string;
+  tool: AnyAgentTool;
+  toolCallId: string;
+  params: unknown;
+  signal?: AbortSignal;
+}): Promise<unknown> {
+  const env = params.input.env ?? process.env;
+  const sandboxConfig = resolvePluginSandboxConfig({ plan: params.plan, env });
+  const timeoutMs = Math.max(1, sandboxConfig.maxRuntimeMs ?? params.plan.timeoutMs ?? 30_000);
+  if (sandboxConfig.backend === "local/no_isolation" && sandboxConfig.requireIsolated) {
+    throw new Error(
+      `Plugin subprocess for ${params.tool.name} requires an isolated sandbox backend; install bwrap/minijail, configure Docker with OPENCLAW_RUNTIME_PLUGIN_DOCKER_IMAGE, or set OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION=1 only for trusted local workers.`,
+    );
+  }
+  await params.kernel.grantCapability({
+    subject_type: "agent",
+    subject_id: params.input.agentId,
+    resource_type: "sandbox",
+    resource_id: sandboxConfig.trustZoneId,
+    action: "allocate",
+    constraints: {
+      sessionId: params.input.sessionId,
+      sessionKey: params.input.sessionKey,
+      runId: params.input.runId,
+      taskId: params.input.taskId,
+      pluginId: params.pluginId,
+      reason: "plugin subprocess worker available for daemon brokered run",
+    },
+    expires_at: params.capabilityExpiresAt,
+  });
+  const allocation = await params.kernel.allocateSandbox({
+    agent_id: params.input.agentId,
+    task_id: params.input.taskId ?? params.input.runId ?? params.input.sessionId,
+    trust_zone_id: sandboxConfig.trustZoneId,
+    backend: sandboxConfig.backend,
+    docker_image: sandboxConfig.dockerImage,
+    max_runtime_ms: timeoutMs,
+    max_bytes_out: sandboxConfig.maxBytesOut,
+  });
+  try {
+    const payload = JSON.stringify({
+      protocol: "openclaw.sparsekernel.plugin_tool.v1",
+      pluginId: params.pluginId,
+      toolName: params.tool.name,
+      toolCallId: params.toolCallId,
+      params: params.params,
+      context: {
+        agentId: params.input.agentId,
+        sessionId: params.input.sessionId,
+        taskId: params.input.taskId,
+        runId: params.input.runId,
+        subject: { subjectType: "agent", subjectId: params.input.agentId },
+      },
+    });
+    const spawnPlan = buildSandboxSpawnPlan({
+      backend: sandboxConfig.backend,
+      command: params.plan.command,
+      args: params.plan.args ?? [],
+      cwd: params.plan.cwd,
+      stdin: true,
+      dockerImage: sandboxConfig.dockerImage,
+    });
+    const result = await runSandboxSpawnPlan({
+      allocationId: allocation.id,
+      backend: sandboxConfig.backend as SandboxBackendKind,
+      spawnPlan,
+      cwd: params.plan.cwd,
+      stdin: payload,
+      signal: params.signal,
+      timeoutMs,
+      maxOutputBytes: sandboxConfig.maxBytesOut,
+    });
+    if (result.exitCode !== 0 || result.timedOut) {
+      throw new Error(
+        `Plugin subprocess failed: exit=${
+          result.exitCode ?? result.signal ?? "unknown"
+        } stderr=${result.stderr.trim()}`,
+      );
+    }
+    try {
+      return JSON.parse(result.stdout) as unknown;
+    } catch (err) {
+      throw new Error(
+        `Plugin subprocess returned invalid JSON: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  } finally {
+    await params.kernel.releaseSandbox(allocation.id);
+  }
 }
 
 export async function brokerEffectiveToolsForRun(

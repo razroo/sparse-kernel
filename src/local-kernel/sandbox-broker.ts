@@ -78,6 +78,18 @@ export type SandboxCommandResult = {
   durationMs: number;
 };
 
+export type SandboxSpawnCommandRequest = {
+  allocationId: string;
+  backend: SandboxBackendKind;
+  spawnPlan: SandboxSpawnPlan;
+  cwd?: string;
+  env?: Record<string, string>;
+  stdin?: string | Buffer | Uint8Array;
+  signal?: AbortSignal;
+  timeoutMs: number;
+  maxOutputBytes: number;
+};
+
 export interface SandboxBroker {
   allocateSandbox(request: SandboxAllocationRequest): SandboxAllocationRecord;
   releaseSandbox(allocationId: string): boolean;
@@ -350,6 +362,66 @@ export function buildSandboxSpawnPlan(params: {
   }
 }
 
+export async function runSandboxSpawnPlan(
+  request: SandboxSpawnCommandRequest,
+): Promise<SandboxCommandResult> {
+  const started = Date.now();
+  const timeoutMs = Math.max(1, request.timeoutMs);
+  const maxOutputBytes = Math.max(1, request.maxOutputBytes);
+  return await new Promise<SandboxCommandResult>((resolve, reject) => {
+    const child = spawn(request.spawnPlan.command, request.spawnPlan.args, {
+      cwd: request.backend === "local/no_isolation" ? request.cwd : undefined,
+      env: request.env ? { ...process.env, ...request.env } : process.env,
+      stdio: [request.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    let timedOut = false;
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    const abort = () => {
+      child.kill("SIGTERM");
+    };
+    const append = (current: Buffer, chunk: Buffer) =>
+      Buffer.concat([current, chunk]).subarray(0, maxOutputBytes);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+    timer.unref?.();
+    if (request.signal?.aborted) {
+      abort();
+    } else {
+      request.signal?.addEventListener("abort", abort, { once: true });
+    }
+    if (request.stdin !== undefined) {
+      child.stdin?.end(request.stdin);
+    }
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = append(stderr, chunk);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      request.signal?.removeEventListener("abort", abort);
+      reject(error);
+    });
+    child.on("close", (exitCode, signal) => {
+      clearTimeout(timer);
+      request.signal?.removeEventListener("abort", abort);
+      resolve({
+        allocationId: request.allocationId,
+        exitCode,
+        ...(signal ? { signal } : {}),
+        stdout: stdout.toString("utf8"),
+        stderr: stderr.toString("utf8"),
+        timedOut,
+        durationMs: Date.now() - started,
+      });
+    });
+  });
+}
+
 export class LocalSandboxBroker implements SandboxBroker {
   private readonly allocationBackends = new Map<string, SandboxBackendKind>();
 
@@ -513,7 +585,6 @@ export class LocalSandboxBroker implements SandboxBroker {
       1,
       Math.min(requestedOutputBytes || 256 * 1024, leaseOutputBytes || 256 * 1024),
     );
-    const started = Date.now();
     this.db.recordAudit({
       actor: { type: "runtime" },
       action: "sandbox.command_started",
@@ -527,91 +598,55 @@ export class LocalSandboxBroker implements SandboxBroker {
         isolation: spawnPlan.isolation,
       },
     });
-    return await new Promise<SandboxCommandResult>((resolve, reject) => {
-      const child = spawn(spawnPlan.command, spawnPlan.args, {
-        cwd: backend === "local/no_isolation" ? request.cwd : undefined,
-        env: request.env ? { ...process.env, ...request.env } : process.env,
-        stdio: [request.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    try {
+      const result = await runSandboxSpawnPlan({
+        allocationId: request.allocationId,
+        backend,
+        spawnPlan,
+        cwd: request.cwd,
+        env: request.env,
+        stdin: request.stdin,
+        signal: request.signal,
+        timeoutMs,
+        maxOutputBytes,
       });
-      let timedOut = false;
-      let stdout = Buffer.alloc(0);
-      let stderr = Buffer.alloc(0);
-      const abort = () => {
-        child.kill("SIGTERM");
-      };
-      const append = (current: Buffer, chunk: Buffer) =>
-        Buffer.concat([current, chunk]).subarray(0, maxOutputBytes);
-      const timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGTERM");
-      }, timeoutMs);
-      timer.unref?.();
-      if (request.signal?.aborted) {
-        abort();
-      } else {
-        request.signal?.addEventListener("abort", abort, { once: true });
-      }
-      if (request.stdin !== undefined) {
-        child.stdin?.end(request.stdin);
-      }
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdout = append(stdout, chunk);
+      this.db.recordUsage({
+        resourceType: "sandbox_runtime",
+        amount: result.durationMs,
+        unit: "ms",
       });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderr = append(stderr, chunk);
+      this.db.recordUsage({
+        resourceType: "sandbox_output",
+        amount: Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr),
+        unit: "byte",
       });
-      child.on("error", (error) => {
-        clearTimeout(timer);
-        request.signal?.removeEventListener("abort", abort);
-        this.db.recordAudit({
-          actor: { type: "runtime" },
-          action: "sandbox.command_failed",
-          objectType: "resource_lease",
-          objectId: request.allocationId,
-          payload: { error: error.message },
-        });
-        reject(error);
+      this.db.recordAudit({
+        actor: { type: "runtime" },
+        action:
+          result.exitCode === 0 && !result.timedOut
+            ? "sandbox.command_completed"
+            : "sandbox.command_failed",
+        objectType: "resource_lease",
+        objectId: request.allocationId,
+        payload: {
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs: result.durationMs,
+          stdoutBytes: Buffer.byteLength(result.stdout),
+          stderrBytes: Buffer.byteLength(result.stderr),
+        },
       });
-      child.on("close", (exitCode, signal) => {
-        clearTimeout(timer);
-        request.signal?.removeEventListener("abort", abort);
-        const durationMs = Date.now() - started;
-        const result: SandboxCommandResult = {
-          allocationId: request.allocationId,
-          exitCode,
-          ...(signal ? { signal } : {}),
-          stdout: stdout.toString("utf8"),
-          stderr: stderr.toString("utf8"),
-          timedOut,
-          durationMs,
-        };
-        this.db.recordUsage({
-          resourceType: "sandbox_runtime",
-          amount: durationMs,
-          unit: "ms",
-        });
-        this.db.recordUsage({
-          resourceType: "sandbox_output",
-          amount: stdout.byteLength + stderr.byteLength,
-          unit: "byte",
-        });
-        this.db.recordAudit({
-          actor: { type: "runtime" },
-          action:
-            exitCode === 0 && !timedOut ? "sandbox.command_completed" : "sandbox.command_failed",
-          objectType: "resource_lease",
-          objectId: request.allocationId,
-          payload: {
-            exitCode,
-            signal,
-            timedOut,
-            durationMs,
-            stdoutBytes: stdout.byteLength,
-            stderrBytes: stderr.byteLength,
-          },
-        });
-        resolve(result);
+      return result;
+    } catch (error) {
+      this.db.recordAudit({
+        actor: { type: "runtime" },
+        action: "sandbox.command_failed",
+        objectType: "resource_lease",
+        objectId: request.allocationId,
+        payload: { error: error instanceof Error ? error.message : String(error) },
       });
-    });
+      throw error;
+    }
   }
 }

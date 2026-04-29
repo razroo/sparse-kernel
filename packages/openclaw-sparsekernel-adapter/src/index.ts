@@ -8,7 +8,9 @@ import {
   type SparseKernelCreateArtifactInput,
   type SparseKernelCreateToolCallInput,
   type SparseKernelGrantCapabilityInput,
+  type SparseKernelAllocateSandboxInput,
   type SparseKernelSession,
+  type SparseKernelSandboxAllocation,
   type SparseKernelToolCall,
   type SparseKernelUpsertSessionInput,
 } from "../../sparsekernel-client/src/index.js";
@@ -66,6 +68,8 @@ export type OpenClawSparseKernelToolBrokerClient = {
   completeToolCall(input: SparseKernelCompleteToolCallInput): Promise<SparseKernelToolCall>;
   failToolCall(id: string, error: string): Promise<SparseKernelToolCall>;
   createArtifact(input: SparseKernelCreateArtifactInput): Promise<SparseKernelArtifact>;
+  allocateSandbox(input: SparseKernelAllocateSandboxInput): Promise<SparseKernelSandboxAllocation>;
+  releaseSandbox(allocationId: string): Promise<boolean>;
 };
 
 export type OpenClawSparseKernelToolBrokerOptions = {

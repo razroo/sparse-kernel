@@ -58,9 +58,14 @@ export type {
   SandboxCommandResult,
   SandboxBroker,
   SandboxPolicySnapshot,
+  SandboxSpawnCommandRequest,
   SandboxSpawnPlan,
 } from "./sandbox-broker.js";
-export { buildSandboxSpawnPlan, isSandboxBackendAvailable } from "./sandbox-broker.js";
+export {
+  buildSandboxSpawnPlan,
+  isSandboxBackendAvailable,
+  runSandboxSpawnPlan,
+} from "./sandbox-broker.js";
 export { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat.js";
 export type { SessionImportResult, SessionStoreImportTarget } from "./session-compat.js";
 export { CapabilityToolBroker, isSandboxCommandToolName } from "./tool-broker.js";

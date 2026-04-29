@@ -313,6 +313,33 @@ export type SparseKernelAllocateSandboxInput = {
   task_id?: string | null;
   trust_zone_id: string;
   backend?: string | null;
+  docker_image?: string | null;
+  max_runtime_ms?: number | null;
+  max_bytes_out?: number | null;
+};
+
+export type SparseKernelRunSandboxCommandInput = {
+  allocation_id: string;
+  backend?: string | null;
+  docker_image?: string | null;
+  command: string;
+  args?: string[];
+  cwd?: string | null;
+  env?: Record<string, string>;
+  stdin_text?: string;
+  stdin_base64?: string;
+  timeout_ms?: number | null;
+  max_output_bytes?: number | null;
+};
+
+export type SparseKernelRunSandboxCommandResult = {
+  allocation_id: string;
+  exit_code: number | null;
+  signal?: string | null;
+  stdout: string;
+  stderr: string;
+  timed_out: boolean;
+  duration_ms: number;
 };
 
 export type SparseKernelCreateToolCallInput = {
@@ -531,6 +558,12 @@ export class SparseKernelClient {
       allocation_id: allocationId,
     });
     return response.released;
+  }
+
+  async runSandboxCommand(
+    input: SparseKernelRunSandboxCommandInput,
+  ): Promise<SparseKernelRunSandboxCommandResult> {
+    return await this.postJson<SparseKernelRunSandboxCommandResult>("/sandbox/run-command", input);
   }
 
   async createToolCall(input: SparseKernelCreateToolCallInput): Promise<SparseKernelToolCall> {

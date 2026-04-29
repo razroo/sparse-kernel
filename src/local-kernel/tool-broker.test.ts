@@ -7,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawSparseKernelToolBrokerClient } from "../../packages/openclaw-sparsekernel-adapter/src/index.js";
 import type {
   SparseKernelArtifact,
+  SparseKernelAllocateSandboxInput,
+  SparseKernelSandboxAllocation,
   SparseKernelCapability,
   SparseKernelCompleteToolCallInput,
   SparseKernelCreateArtifactInput,
@@ -51,6 +53,8 @@ class FakeDaemonKernel implements OpenClawSparseKernelToolBrokerClient {
   readonly completes: SparseKernelCompleteToolCallInput[] = [];
   readonly failures: Array<{ id: string; error: string }> = [];
   readonly artifacts: SparseKernelCreateArtifactInput[] = [];
+  readonly sandboxAllocations: SparseKernelAllocateSandboxInput[] = [];
+  readonly releasedSandboxes: string[] = [];
 
   async upsertSession(input: SparseKernelUpsertSessionInput): Promise<SparseKernelSession> {
     this.sessions.push(input);
@@ -131,6 +135,25 @@ class FakeDaemonKernel implements OpenClawSparseKernelToolBrokerClient {
       retention_policy: input.retention_policy,
       created_at: "2026-04-27T00:00:00Z",
     };
+  }
+
+  async allocateSandbox(
+    input: SparseKernelAllocateSandboxInput,
+  ): Promise<SparseKernelSandboxAllocation> {
+    this.sandboxAllocations.push(input);
+    return {
+      id: `sandbox_${this.sandboxAllocations.length}`,
+      task_id: input.task_id,
+      trust_zone_id: input.trust_zone_id,
+      backend: input.backend ?? "local/no_isolation",
+      status: "active",
+      created_at: "2026-04-27T00:00:00Z",
+    };
+  }
+
+  async releaseSandbox(allocationId: string): Promise<boolean> {
+    this.releasedSandboxes.push(allocationId);
+    return true;
   }
 
   protected toolCall(
@@ -216,6 +239,78 @@ describe("CapabilityToolBroker", () => {
       id: "run-a:provider-call",
       artifact_ids: [],
     });
+  });
+
+  it("routes daemon plugin subprocess workers through sandbox accounting", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-daemon-plugin-worker-"));
+    const workerPath = path.join(root, "worker.mjs");
+    fs.writeFileSync(
+      workerPath,
+      [
+        "let input = '';",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', chunk => { input += chunk; });",
+        "process.stdin.on('end', () => {",
+        "  const request = JSON.parse(input);",
+        "  process.stdout.write(JSON.stringify({",
+        "    content: [{ type: 'text', text: `daemon-worker:${request.params.value}` }],",
+        "    details: { pluginId: request.pluginId, toolName: request.toolName }",
+        "  }));",
+        "});",
+      ].join("\n"),
+    );
+    const kernel = new FakeDaemonKernel();
+    const rawTool = makeTool("plugin_tool");
+    setPluginToolMeta(rawTool, {
+      pluginId: "community-plugin",
+      optional: false,
+      subprocess: {
+        command: process.execPath,
+        args: [workerPath],
+        sandbox: {
+          backend: "local/no_isolation",
+          requireIsolated: false,
+          maxBytesOut: 16_384,
+        },
+      },
+    });
+    try {
+      const run = await brokerEffectiveToolsForRun({
+        tools: [rawTool],
+        agentId: "main",
+        sessionId: "session-a",
+        sessionKey: "agent:main:main",
+        runId: "run-a",
+        taskId: "task-a",
+        daemonKernel: kernel,
+        env: { OPENCLAW_RUNTIME_TOOL_BROKER: "daemon" } as NodeJS.ProcessEnv,
+      });
+      expect(run?.mode).toBe("daemon");
+      await expect(run?.tools[0]?.execute("provider-plugin", { value: "ok" })).resolves.toEqual({
+        content: [{ type: "text", text: "daemon-worker:ok" }],
+        details: { pluginId: "community-plugin", toolName: "plugin_tool" },
+      });
+      expect(kernel.sandboxAllocations[0]).toMatchObject({
+        agent_id: "main",
+        task_id: "task-a",
+        trust_zone_id: "plugin_untrusted",
+        backend: "local/no_isolation",
+        max_bytes_out: 16_384,
+      });
+      expect(kernel.releasedSandboxes).toEqual(["sandbox_1"]);
+      expect(kernel.grants).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            resource_type: "sandbox",
+            resource_id: "plugin_untrusted",
+            action: "allocate",
+          }),
+        ]),
+      );
+      expect(kernel.completes[0]).toMatchObject({ id: "run-a:provider-plugin" });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("falls back from daemon broker mode to the local broker", async () => {

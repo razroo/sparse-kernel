@@ -108,7 +108,7 @@ function isTruthyToolFlag(raw: string | undefined): boolean {
   return normalized === "on" || normalized === "1" || normalized === "true";
 }
 
-function requiresPluginSubprocess(raw: string | undefined): boolean {
+export function requiresPluginSubprocess(raw: string | undefined): boolean {
   const normalized = raw?.trim().toLowerCase();
   return (
     normalized === "subprocess" ||
@@ -118,7 +118,7 @@ function requiresPluginSubprocess(raw: string | undefined): boolean {
   );
 }
 
-type PluginSubprocessPlan = NonNullable<PluginToolMeta["subprocess"]>;
+export type PluginSubprocessPlan = NonNullable<PluginToolMeta["subprocess"]>;
 
 export type PluginSandboxConfig = {
   trustZoneId: string;
@@ -131,7 +131,7 @@ export type PluginSandboxConfig = {
   candidateBackends: SandboxBackendKind[];
 };
 
-function resolvePluginSubprocessPlan(
+export function resolvePluginSubprocessPlan(
   meta: PluginToolMeta | undefined,
 ): PluginToolMeta["subprocess"] {
   if (!meta?.subprocess?.command?.trim()) {

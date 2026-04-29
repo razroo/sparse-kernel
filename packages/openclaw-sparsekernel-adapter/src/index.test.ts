@@ -7,7 +7,9 @@ import type {
   SparseKernelCreateArtifactInput,
   SparseKernelCreateToolCallInput,
   SparseKernelGrantCapabilityInput,
+  SparseKernelAllocateSandboxInput,
   SparseKernelSession,
+  SparseKernelSandboxAllocation,
   SparseKernelToolCall,
   SparseKernelUpsertSessionInput,
 } from "../../sparsekernel-client/src/index.js";
@@ -22,6 +24,8 @@ class FakeKernel implements OpenClawSparseKernelToolBrokerClient {
   readonly completes: SparseKernelCompleteToolCallInput[] = [];
   readonly failures: Array<{ id: string; error: string }> = [];
   readonly artifacts: SparseKernelCreateArtifactInput[] = [];
+  readonly sandboxAllocations: SparseKernelAllocateSandboxInput[] = [];
+  readonly releasedSandboxes: string[] = [];
 
   async upsertSession(input: SparseKernelUpsertSessionInput): Promise<SparseKernelSession> {
     this.sessions.push(input);
@@ -113,6 +117,25 @@ class FakeKernel implements OpenClawSparseKernelToolBrokerClient {
       retention_policy: input.retention_policy,
       created_at: "2026-04-27T00:00:00Z",
     };
+  }
+
+  async allocateSandbox(
+    input: SparseKernelAllocateSandboxInput,
+  ): Promise<SparseKernelSandboxAllocation> {
+    this.sandboxAllocations.push(input);
+    return {
+      id: `sandbox_${this.sandboxAllocations.length}`,
+      task_id: input.task_id,
+      trust_zone_id: input.trust_zone_id,
+      backend: input.backend ?? "local/no_isolation",
+      status: "active",
+      created_at: "2026-04-27T00:00:00Z",
+    };
+  }
+
+  async releaseSandbox(allocationId: string): Promise<boolean> {
+    this.releasedSandboxes.push(allocationId);
+    return true;
   }
 
   private toolCall(

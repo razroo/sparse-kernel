@@ -204,7 +204,17 @@ describe("local runtime kernel database", () => {
       mimeType: "text/plain",
       retentionPolicy: "session",
     });
+    const sourcePath = path.join(root, "source.txt");
+    fs.writeFileSync(sourcePath, "hello");
+    const imported = await store.importFile({
+      filePath: sourcePath,
+      mimeType: "text/plain",
+      retentionPolicy: "session",
+    });
     expect(second.id).toBe(first.id);
+    expect(imported.id).toBe(first.id);
+    const tmpDir = path.join(root, "artifacts", ".tmp");
+    expect(fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : []).toEqual([]);
     await expect(
       store.read(first.id, { subjectType: "agent", subjectId: "main" }),
     ).resolves.toEqual(Buffer.from("hello"));

@@ -1,5 +1,9 @@
 export { ContentAddressedArtifactStore } from "./artifact-store.js";
-export type { ArtifactStoreFileInput, ArtifactStoreWriteInput } from "./artifact-store.js";
+export type {
+  ArtifactStoreFileInput,
+  ArtifactStoreStreamInput,
+  ArtifactStoreWriteInput,
+} from "./artifact-store.js";
 export { LocalBrowserBroker } from "./browser-broker.js";
 export type { BrowserBroker, BrowserContextLeaseRequest } from "./browser-broker.js";
 export {

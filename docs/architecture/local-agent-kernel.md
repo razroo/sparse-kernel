@@ -68,6 +68,8 @@ Large outputs are content-addressed files under:
 
 SQLite stores metadata, access records, and retention policy only. Screenshots, downloads, PDFs, browser traces, videos, large HTML dumps, workspace snapshots, and exported transcripts should be artifact files, not SQLite blobs.
 
+The local artifact store streams file imports through a temporary blob while hashing them, then moves the finished file into the content-addressed path. This keeps large downloads and workspace snapshots out of Node heap while preserving sha256 dedupe.
+
 Brokered tool calls also keep oversized JSON outputs out of `tool_calls.output_json`. The ToolBroker returns the original tool result to the agent, stores large serialized outputs as `debug` artifacts, and records an artifact reference plus audit event in the ledger.
 
 Retention policies are:

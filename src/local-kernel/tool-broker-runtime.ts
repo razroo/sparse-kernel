@@ -309,7 +309,7 @@ function wrapDaemonPluginSubprocessTools(
     if (!pluginMeta) {
       return tool;
     }
-    const plan = resolvePluginSubprocessPlan(pluginMeta);
+    const plan = resolvePluginSubprocessPlan(pluginMeta, env);
     if (!plan && !pluginToolRequiresSubprocess(pluginMeta, env)) {
       return tool;
     }

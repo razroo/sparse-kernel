@@ -10,14 +10,16 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 2;
+pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 3;
 pub const SPARSEKERNEL_PROTOCOL_VERSION: &str = "2026-04-29.v1";
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_0002: &str =
     include_str!("../../../migrations/0002_browser_targets_observations.sql");
+const MIGRATION_0003: &str = include_str!("../../../migrations/0003_resource_lease_metadata.sql");
 
 pub type Result<T> = std::result::Result<T, SparseKernelError>;
 
@@ -457,6 +459,13 @@ impl SparseKernelDb {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
                     params![2, now_iso()],
+                )?;
+            }
+            if current < 3 {
+                self.conn.execute_batch(MIGRATION_0003)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    params![3, now_iso()],
                 )?;
             }
             Ok(())
@@ -2360,6 +2369,112 @@ fn trust_zone_allows_network(db: &SparseKernelDb, trust_zone_id: &str) -> Result
     Ok(matches!(action.as_deref(), Some("allow")))
 }
 
+fn hard_egress_helper_args() -> Result<Vec<String>> {
+    let raw = env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS").unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        return Ok(serde_json::from_str(trimmed)?);
+    }
+    Ok(trimmed
+        .split_whitespace()
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn run_hard_egress_helper(
+    action: &str,
+    allocation_id: &str,
+    backend: &str,
+    trust_zone_id: &str,
+    agent_id: Option<&str>,
+    task_id: Option<&str>,
+    enforcement: Option<&Value>,
+) -> Result<Option<Value>> {
+    let helper = env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SparseKernelError::Denied("missing hard egress helper".to_string()))?;
+    let payload = json!({
+        "protocol": "openclaw.sparsekernel.sandbox-egress.v1",
+        "action": action,
+        "allocationId": allocation_id,
+        "backend": backend,
+        "trustZoneId": trust_zone_id,
+        "agentId": agent_id,
+        "taskId": task_id,
+        "enforcement": enforcement,
+    });
+    let mut child = Command::new(&helper)
+        .args(hard_egress_helper_args()?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(payload.to_string().as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(SparseKernelError::Denied(format!(
+            "hard egress helper exited {}: {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            if stderr.is_empty() {
+                "no stderr".to_string()
+            } else {
+                stderr
+            }
+        )));
+    }
+    if action == "release" {
+        return Ok(None);
+    }
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(SparseKernelError::Denied(
+            "hard egress helper did not confirm enforcement".to_string(),
+        ));
+    }
+    let enforcement_id = response
+        .get("enforcementId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            SparseKernelError::Denied(
+                "hard egress helper response missing enforcementId".to_string(),
+            )
+        })?;
+    let boundary = response
+        .get("boundary")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "host_firewall" | "egress_proxy" | "vm_firewall" | "platform_enforcer"
+            )
+        })
+        .ok_or_else(|| {
+            SparseKernelError::Denied(
+                "hard egress helper response missing supported boundary".to_string(),
+            )
+        })?;
+    Ok(Some(json!({
+        "helper": helper,
+        "enforcementId": enforcement_id,
+        "boundary": boundary,
+        "description": response.get("description").and_then(Value::as_str),
+    })))
+}
+
 impl SandboxBroker for LocalSandboxBroker<'_> {
     fn allocate_sandbox(
         &self,
@@ -2388,28 +2503,69 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
         let allocation_id = format!("sandbox_{}", Uuid::new_v4());
         let now = now_iso();
         let backend = backend.unwrap_or("local/no_isolation").to_string();
+        let mut metadata = json!({ "backend": backend.clone() });
         if truthy_env_flag("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS")
             && trust_zone_allows_network(self.db, trust_zone_id)?
         {
-            let reason = format!(
-                "host-level egress enforcement is not implemented for sandbox backend: {backend}"
-            );
-            self.db.record_audit(AuditInput {
-                actor_type: agent_id.map(|_| "agent".to_string()),
-                actor_id: agent_id.map(str::to_string),
-                action: "network_policy.hard_egress_unavailable".to_string(),
-                object_type: Some("trust_zone".to_string()),
-                object_id: Some(trust_zone_id.to_string()),
-                payload: Some(json!({ "backend": backend, "reason": reason })),
-            })?;
-            return Err(SparseKernelError::Denied(format!(
-                "sandbox requires host-level egress enforcement: {reason}"
-            )));
+            match run_hard_egress_helper(
+                "allocate",
+                &allocation_id,
+                &backend,
+                trust_zone_id,
+                agent_id,
+                task_id,
+                None,
+            ) {
+                Ok(Some(enforcement)) => {
+                    metadata["hardEgress"] = enforcement.clone();
+                    self.db.record_audit(AuditInput {
+                        actor_type: agent_id.map(|_| "agent".to_string()),
+                        actor_id: agent_id.map(str::to_string),
+                        action: "network_policy.hard_egress_enforced".to_string(),
+                        object_type: Some("trust_zone".to_string()),
+                        object_id: Some(trust_zone_id.to_string()),
+                        payload: Some(json!({
+                            "backend": backend.clone(),
+                            "allocationId": allocation_id,
+                            "enforcement": enforcement,
+                        })),
+                    })?;
+                }
+                Ok(None) => {
+                    return Err(SparseKernelError::Denied(
+                        "sandbox requires host-level egress enforcement: helper returned no enforcement"
+                            .to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    self.db.record_audit(AuditInput {
+                        actor_type: agent_id.map(|_| "agent".to_string()),
+                        actor_id: agent_id.map(str::to_string),
+                        action: "network_policy.hard_egress_unavailable".to_string(),
+                        object_type: Some("trust_zone".to_string()),
+                        object_id: Some(trust_zone_id.to_string()),
+                        payload: Some(json!({ "backend": backend.clone(), "reason": reason })),
+                    })?;
+                    return Err(SparseKernelError::Denied(format!(
+                        "sandbox requires host-level egress enforcement: {reason}"
+                    )));
+                }
+            }
         }
         self.db.conn.execute(
-            "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, created_at, updated_at)
-             VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?)",
-            params![allocation_id, allocation_id, task_id, agent_id, trust_zone_id, now, now],
+            "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, metadata_json, created_at, updated_at)
+             VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?, ?)",
+            params![
+                allocation_id,
+                allocation_id,
+                task_id,
+                agent_id,
+                trust_zone_id,
+                metadata.to_string(),
+                now,
+                now
+            ],
         )?;
         self.db.record_audit(AuditInput {
             actor_type: agent_id.map(|_| "agent".to_string()),
@@ -2417,7 +2573,7 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
             action: "sandbox.allocated".to_string(),
             object_type: Some("resource_lease".to_string()),
             object_id: Some(allocation_id.clone()),
-            payload: Some(json!({ "trustZoneId": trust_zone_id, "backend": backend })),
+            payload: Some(json!({ "trustZoneId": trust_zone_id, "backend": backend.clone() })),
         })?;
         Ok(SandboxAllocationRecord {
             id: allocation_id,
@@ -2431,6 +2587,48 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
 
     fn release_sandbox(&self, allocation_id: &str) -> Result<bool> {
         let now = now_iso();
+        let lease: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT trust_zone_id, owner_agent_id, owner_task_id, metadata_json FROM resource_leases WHERE id = ? AND resource_type = 'sandbox' AND status = 'active'",
+                params![allocation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((trust_zone_id, owner_agent_id, owner_task_id, Some(raw_metadata))) =
+            lease.as_ref()
+        {
+            let parsed: Value = serde_json::from_str(raw_metadata)?;
+            if let Some(enforcement) = parsed.get("hardEgress") {
+                let backend = parsed
+                    .get("backend")
+                    .and_then(Value::as_str)
+                    .unwrap_or("local/no_isolation");
+                if let Err(err) = run_hard_egress_helper(
+                    "release",
+                    allocation_id,
+                    backend,
+                    trust_zone_id.as_deref().unwrap_or(""),
+                    owner_agent_id.as_deref(),
+                    owner_task_id.as_deref(),
+                    Some(enforcement),
+                ) {
+                    self.db.record_audit(AuditInput {
+                        actor_type: Some("runtime".to_string()),
+                        actor_id: None,
+                        action: "network_policy.hard_egress_release_failed".to_string(),
+                        object_type: Some("resource_lease".to_string()),
+                        object_id: Some(allocation_id.to_string()),
+                        payload: Some(json!({
+                            "reason": err.to_string(),
+                            "enforcement": enforcement,
+                        })),
+                    })?;
+                    return Err(err);
+                }
+            }
+        }
         let updated = self.db.conn.execute(
             "UPDATE resource_leases SET status = 'released', updated_at = ? WHERE id = ? AND resource_type = 'sandbox' AND status = 'active'",
             params![now, allocation_id],
@@ -2454,8 +2652,14 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use tempfile::tempdir;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn temp_db() -> (tempfile::TempDir, SparseKernelDb) {
         let dir = tempdir().expect("temp dir");
@@ -2839,9 +3043,15 @@ mod tests {
 
     #[test]
     fn sandbox_hard_egress_mode_fails_closed_for_network_allowing_zones() {
+        let _guard = env_lock();
         let (_dir, db) = temp_db();
         let previous = env::var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS").ok();
+        let previous_helper = env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER").ok();
+        let previous_helper_args =
+            env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS").ok();
         env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", "1");
+        env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER");
+        env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS");
         let result = LocalSandboxBroker { db: &db }.allocate_sandbox(
             None,
             None,
@@ -2852,9 +3062,66 @@ mod tests {
             Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
             None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
         }
+        match previous_helper {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER"),
+        }
+        match previous_helper_args {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS"),
+        }
         assert!(result.is_err());
         let audit = db.list_audit(1).unwrap();
         assert_eq!(audit[0].action, "network_policy.hard_egress_unavailable");
         assert_eq!(audit[0].object_id.as_deref(), Some("public_web"));
+    }
+
+    #[test]
+    fn sandbox_hard_egress_helper_allows_network_allocations() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let _guard = env_lock();
+        let (_dir, db) = temp_db();
+        let previous = env::var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS").ok();
+        let previous_helper = env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER").ok();
+        let previous_helper_args =
+            env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS").ok();
+        env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", "1");
+        env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", "/bin/sh");
+        env::set_var(
+            "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
+            serde_json::to_string(&vec![
+                "-c",
+                "cat >/dev/null; printf '{\"ok\":true,\"enforcementId\":\"fw-test\",\"boundary\":\"host_firewall\"}'",
+            ])
+            .unwrap(),
+        );
+        let sandbox = LocalSandboxBroker { db: &db };
+        let allocation =
+            sandbox.allocate_sandbox(None, None, "public_web", Some("local/no_isolation"));
+        let release_result = allocation
+            .as_ref()
+            .ok()
+            .map(|allocation| sandbox.release_sandbox(&allocation.id));
+        let audit = db.list_audit(5).unwrap();
+        match previous {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
+        }
+        match previous_helper {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER"),
+        }
+        match previous_helper_args {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS"),
+        }
+        let allocation = allocation.unwrap();
+        assert_eq!(allocation.backend, "local/no_isolation");
+        assert!(audit
+            .iter()
+            .any(|entry| entry.action == "network_policy.hard_egress_enforced"));
+        assert!(release_result.unwrap().unwrap());
     }
 }

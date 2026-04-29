@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket, { type RawData } from "ws";
@@ -14,8 +14,10 @@ import {
   type SparseKernelBrowserTarget,
   type SparseKernelCloseBrowserTargetInput,
   type SparseKernelCreateArtifactInput,
+  type SparseKernelImportArtifactFileInput,
   type SparseKernelRecordBrowserTargetInput,
 } from "../../sparsekernel-client/src/index.js";
+import { defaultSparseKernelArtifactStagingDir } from "../../sparsekernel-client/src/node-artifacts.js";
 
 export type {
   SparseKernelAcquireBrowserContextInput,
@@ -27,6 +29,7 @@ export type {
   SparseKernelBrowserTarget,
   SparseKernelCloseBrowserTargetInput,
   SparseKernelCreateArtifactInput,
+  SparseKernelImportArtifactFileInput,
   SparseKernelRecordBrowserTargetInput,
 } from "../../sparsekernel-client/src/index.js";
 
@@ -39,6 +42,7 @@ export type SparseKernelBrowserKernelClient = {
   ): Promise<SparseKernelBrowserContext>;
   releaseBrowserContext(contextId: string): Promise<boolean>;
   createArtifact(input: SparseKernelCreateArtifactInput): Promise<SparseKernelArtifact>;
+  importArtifactFile?(input: SparseKernelImportArtifactFileInput): Promise<SparseKernelArtifact>;
   recordBrowserObservation?(input: SparseKernelBrowserObservationInput): Promise<void>;
   recordBrowserTarget?(
     input: SparseKernelRecordBrowserTargetInput,
@@ -62,10 +66,12 @@ export type SparseKernelBrowserBrokerOptions = {
   kernel: SparseKernelBrowserKernelClient;
   fetchImpl?: typeof fetch;
   transportFactory?: CdpTransportFactory;
+  artifactStagingDir?: string | false;
 };
 
 export type SparseKernelCdpBrowserBrokerFactoryOptions = SparseKernelClientOptions & {
   transportFactory?: CdpTransportFactory;
+  artifactStagingDir?: string | false;
 };
 
 export type AcquireMaterializedBrowserContextInput = {
@@ -275,6 +281,7 @@ export function createSparseKernelCdpBrowserBroker(
     kernel: client,
     fetchImpl: options.fetchImpl,
     transportFactory: options.transportFactory,
+    artifactStagingDir: options.artifactStagingDir,
   });
 }
 
@@ -338,12 +345,17 @@ export class SparseKernelCdpBrowserBroker {
   private readonly kernel: SparseKernelBrowserKernelClient;
   private readonly fetchImpl: typeof fetch;
   private readonly transportFactory: CdpTransportFactory;
+  private readonly artifactStagingDir: string | false;
   private readonly contexts = new Map<string, LiveBrowserContext>();
 
   constructor(options: SparseKernelBrowserBrokerOptions) {
     this.kernel = options.kernel;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.transportFactory = options.transportFactory ?? createWebSocketTransport;
+    this.artifactStagingDir =
+      options.artifactStagingDir === undefined
+        ? defaultSparseKernelArtifactStagingDir()
+        : options.artifactStagingDir;
   }
 
   async acquireContext(
@@ -487,8 +499,8 @@ export class SparseKernelCdpBrowserBroker {
       },
       context.page_session_id,
     );
-    const artifact = await this.kernel.createArtifact({
-      content_base64: screenshot.data,
+    const artifact = await this.createArtifactFromBytes({
+      bytes: Buffer.from(screenshot.data, "base64"),
       mime_type: format === "jpeg" ? "image/jpeg" : "image/png",
       retention_policy: input.retention_policy ?? "debug",
       subject: input.subject,
@@ -530,8 +542,8 @@ export class SparseKernelCdpBrowserBroker {
     );
     const downloadedPath = join(context.download_dir, guid);
     const bytes = await readFile(downloadedPath);
-    const artifact = await this.kernel.createArtifact({
-      content_base64: bytes.toString("base64"),
+    const artifact = await this.createArtifactFromBytes({
+      bytes,
       mime_type: input.mime_type ?? "application/octet-stream",
       retention_policy: input.retention_policy ?? "session",
       subject: input.subject,
@@ -567,8 +579,8 @@ export class SparseKernelCdpBrowserBroker {
       { printBackground: true },
       context.page_session_id,
     );
-    const artifact = await this.kernel.createArtifact({
-      content_base64: pdf.data,
+    const artifact = await this.createArtifactFromBytes({
+      bytes: Buffer.from(pdf.data, "base64"),
       mime_type: "application/pdf",
       retention_policy: input.retention_policy ?? "debug",
       subject: input.subject,
@@ -584,6 +596,36 @@ export class SparseKernelCdpBrowserBroker {
       artifact,
       artifact_type: "pdf",
     };
+  }
+
+  private async createArtifactFromBytes(input: {
+    bytes: Buffer;
+    mime_type: string;
+    retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
+    subject?: SparseKernelArtifactSubject;
+  }): Promise<SparseKernelArtifact> {
+    if (!this.kernel.importArtifactFile || this.artifactStagingDir === false) {
+      return await this.kernel.createArtifact({
+        content_base64: input.bytes.toString("base64"),
+        mime_type: input.mime_type,
+        retention_policy: input.retention_policy,
+        subject: input.subject,
+      });
+    }
+    await mkdir(this.artifactStagingDir, { recursive: true });
+    const stageDir = await mkdtemp(join(this.artifactStagingDir, "browser-artifact-"));
+    const stagedPath = join(stageDir, "artifact.bin");
+    try {
+      await writeFile(stagedPath, input.bytes);
+      return await this.kernel.importArtifactFile({
+        staged_path: stagedPath,
+        mime_type: input.mime_type,
+        retention_policy: input.retention_policy,
+        subject: input.subject,
+      });
+    } finally {
+      await rm(stageDir, { recursive: true, force: true });
+    }
   }
 
   listConsoleMessages(
@@ -1874,6 +1916,7 @@ async function dispatchCdpMouseAction(
   request: Extract<SparseKernelBrowserActRequest, { kind: "click" | "clickCoords" | "hover" }>,
   point: CdpActionPoint,
 ): Promise<void> {
+  const modifiers = request.kind === "click" ? resolveCdpInputModifiers(request.modifiers) : 0;
   await context.connection.command(
     "Input.dispatchMouseEvent",
     {
@@ -1881,6 +1924,7 @@ async function dispatchCdpMouseAction(
       x: point.x,
       y: point.y,
       button: "none",
+      ...(modifiers ? { modifiers } : {}),
     },
     context.page_session_id,
   );
@@ -1897,6 +1941,7 @@ async function dispatchCdpMouseAction(
       y: point.y,
       button,
       clickCount,
+      ...(modifiers ? { modifiers } : {}),
     },
     context.page_session_id,
   );
@@ -1911,9 +1956,39 @@ async function dispatchCdpMouseAction(
       y: point.y,
       button,
       clickCount,
+      ...(modifiers ? { modifiers } : {}),
     },
     context.page_session_id,
   );
+}
+
+function resolveCdpInputModifiers(modifiers: string[] | undefined): number {
+  let bitmask = 0;
+  for (const modifier of modifiers ?? []) {
+    switch (modifier.trim().toLowerCase()) {
+      case "alt":
+        bitmask |= 1;
+        break;
+      case "control":
+      case "ctrl":
+        bitmask |= 2;
+        break;
+      case "meta":
+      case "cmd":
+      case "command":
+        bitmask |= 4;
+        break;
+      case "shift":
+        bitmask |= 8;
+        break;
+      case "controlormeta":
+      case "control_or_meta":
+      case "mod":
+        bitmask |= process.platform === "darwin" ? 4 : 2;
+        break;
+    }
+  }
+  return bitmask;
 }
 
 function normalizeAllowedOrigins(value: unknown): string[] {

@@ -426,6 +426,72 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("uses an operator default plugin subprocess worker when per-tool metadata is absent", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-default-plugin-worker-"));
+    const workerPath = path.join(root, "worker.mjs");
+    fs.writeFileSync(
+      workerPath,
+      [
+        "let input = '';",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', chunk => { input += chunk; });",
+        "process.stdin.on('end', () => {",
+        "  const request = JSON.parse(input);",
+        "  process.stdout.write(JSON.stringify({",
+        "    content: [{ type: 'text', text: `default-worker:${request.params.value}` }],",
+        "    details: { pluginId: request.pluginId, toolName: request.toolName }",
+        "  }));",
+        "});",
+      ].join("\n"),
+    );
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "plugin_tool",
+        action: "invoke",
+      });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "sandbox",
+        resourceId: "plugin_untrusted",
+        action: "allocate",
+      });
+      const rawTool = makeTool("plugin_tool");
+      setPluginToolMeta(rawTool, { pluginId: "community-plugin", optional: false });
+      const broker = new CapabilityToolBroker(db, {
+        env: {
+          OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "subprocess",
+          OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION: "1",
+          OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND: process.execPath,
+          OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_ARGS: JSON.stringify([workerPath]),
+        } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-plugin-default-worker", { value: "ok" })).resolves.toEqual({
+        content: [{ type: "text", text: "default-worker:ok" }],
+        details: { pluginId: "community-plugin", toolName: "plugin_tool" },
+      });
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining([
+          "plugin_tool.subprocess_started",
+          "sandbox.command_completed",
+          "plugin_tool.subprocess_finished",
+        ]),
+      );
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when plugin tool metadata requires a subprocess boundary", async () => {
     const db = new LocalKernelDatabase({ dbPath: ":memory:" });
     try {

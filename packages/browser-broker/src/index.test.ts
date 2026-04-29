@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
@@ -6,6 +7,7 @@ import type {
   SparseKernelBrowserContext,
   SparseKernelBrowserTarget,
   SparseKernelCreateArtifactInput,
+  SparseKernelImportArtifactFileInput,
   SparseKernelRecordBrowserTargetInput,
 } from "../../sparsekernel-client/src/index.js";
 import type {
@@ -525,6 +527,61 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     );
   });
 
+  it("uses staged artifact import when the kernel supports local file transfer", async () => {
+    const kernel = new (class extends FakeKernel {
+      readonly importedFiles: SparseKernelImportArtifactFileInput[] = [];
+
+      async importArtifactFile(
+        input: SparseKernelImportArtifactFileInput,
+      ): Promise<SparseKernelArtifact> {
+        this.importedFiles.push(input);
+        const bytes = await readFile(input.staged_path);
+        return {
+          id: `imported_${this.importedFiles.length}`,
+          sha256: `imported_sha_${this.importedFiles.length}`,
+          size_bytes: bytes.length,
+          storage_ref: `sha256/aa/bb/imported_${this.importedFiles.length}`,
+          mime_type: input.mime_type,
+          retention_policy: input.retention_policy,
+          created_at: "2026-04-27T00:00:00Z",
+        };
+      }
+    })();
+    const transport = new FakeCdpTransport();
+    const stageRoot = await mkdtemp(join(tmpdir(), "sparsekernel-browser-stage-"));
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      artifactStagingDir: stageRoot,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+    try {
+      const context = await broker.acquireContext({
+        trust_zone_id: "public_web",
+        cdp_endpoint: "http://127.0.0.1:9222",
+      });
+      const result = await broker.captureScreenshotArtifact(context.ledger_context.id, {
+        retention_policy: "session",
+      });
+
+      expect(result.artifact).toMatchObject({
+        id: "imported_1",
+        mime_type: "image/png",
+        size_bytes: 6,
+      });
+      expect(kernel.importedFiles[0]).toMatchObject({
+        mime_type: "image/png",
+        retention_policy: "session",
+      });
+      expect(kernel.artifactInputs).toEqual([]);
+    } finally {
+      await rm(stageRoot, { recursive: true, force: true });
+    }
+  });
+
   it("stores completed CDP downloads as SparseKernel artifacts", async () => {
     const kernel = new FakeKernel();
     const transport = new FakeCdpTransport();
@@ -786,6 +843,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     const clicked = await broker.actContext(context.ledger_context.id, {
       kind: "click",
       ref: "e1",
+      modifiers: ["Shift"],
     });
     const pressed = await broker.actContext(context.ledger_context.id, {
       kind: "press",
@@ -797,10 +855,8 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     expect(transport.sent).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          method: "Runtime.evaluate",
-          params: expect.objectContaining({
-            expression: expect.stringContaining("body > a:nth-of-type(1)"),
-          }),
+          method: "Input.dispatchMouseEvent",
+          params: expect.objectContaining({ type: "mousePressed", modifiers: 8 }),
         }),
         expect.objectContaining({ method: "Input.dispatchKeyEvent" }),
       ]),
@@ -1278,8 +1334,10 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
   it("constructs from the SparseKernel daemon client", async () => {
     const calls: Array<{ url: string; body?: unknown }> = [];
     const transport = new FakeCdpTransport();
+    const stageRoot = await mkdtemp(join(tmpdir(), "sparsekernel-browser-client-stage-"));
     const broker = createSparseKernelCdpBrowserBroker({
       baseUrl: "http://127.0.0.1:8765",
+      artifactStagingDir: stageRoot,
       fetchImpl: async (input, init) => {
         const url = input.toString();
         const body =
@@ -1306,11 +1364,11 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
             webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
           });
         }
-        if (url.endsWith("/artifacts/create")) {
+        if (url.endsWith("/artifacts/import-file")) {
           return Response.json({
             id: "artifact_client",
             sha256: "sha_client",
-            size_bytes: Buffer.from(body.content_base64, "base64").length,
+            size_bytes: 6,
             storage_ref: "sha256/aa/bb/sha_client",
             mime_type: body.mime_type,
             retention_policy: body.retention_policy,
@@ -1341,37 +1399,43 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       transportFactory: async () => transport,
     });
 
-    const context = await broker.acquireContext({
-      trust_zone_id: "public_web",
-      cdp_endpoint: "http://127.0.0.1:9222",
-    });
-    const screenshot = await broker.captureScreenshotArtifact(context.ledger_context.id);
-    await expect(broker.releaseContext(context.ledger_context.id)).resolves.toBe(true);
+    try {
+      const context = await broker.acquireContext({
+        trust_zone_id: "public_web",
+        cdp_endpoint: "http://127.0.0.1:9222",
+      });
+      const screenshot = await broker.captureScreenshotArtifact(context.ledger_context.id);
+      await expect(broker.releaseContext(context.ledger_context.id)).resolves.toBe(true);
 
-    expect(screenshot.artifact.id).toBe("artifact_client");
-    expect(calls.map((call) => new URL(call.url).pathname)).toEqual(
-      expect.arrayContaining([
-        "/browser/pools/probe",
-        "/browser/contexts/acquire",
-        "/json/version",
-        "/artifacts/create",
-        "/browser/contexts/observe",
-        "/browser/targets/record",
-        "/browser/targets/close",
-        "/browser/contexts/release",
-      ]),
-    );
-    expect(
-      calls.find((call) => call.url.endsWith("/browser/contexts/observe"))?.body,
-    ).toMatchObject({
-      context_id: "browser_ctx_client",
-      target_id: "target-1",
-      observation_type: "browser_artifact.created",
-    });
-    expect(calls.find((call) => call.url.endsWith("/artifacts/create"))?.body).toMatchObject({
-      content_base64: Buffer.from("pixels").toString("base64"),
-      mime_type: "image/png",
-    });
+      expect(screenshot.artifact.id).toBe("artifact_client");
+      expect(calls.map((call) => new URL(call.url).pathname)).toEqual(
+        expect.arrayContaining([
+          "/browser/pools/probe",
+          "/browser/contexts/acquire",
+          "/json/version",
+          "/artifacts/import-file",
+          "/browser/contexts/observe",
+          "/browser/targets/record",
+          "/browser/targets/close",
+          "/browser/contexts/release",
+        ]),
+      );
+      expect(
+        calls.find((call) => call.url.endsWith("/browser/contexts/observe"))?.body,
+      ).toMatchObject({
+        context_id: "browser_ctx_client",
+        target_id: "target-1",
+        observation_type: "browser_artifact.created",
+      });
+      expect(calls.find((call) => call.url.endsWith("/artifacts/import-file"))?.body).toMatchObject(
+        {
+          staged_path: expect.stringContaining("browser-artifact-"),
+          mime_type: "image/png",
+        },
+      );
+    } finally {
+      await rm(stageRoot, { recursive: true, force: true });
+    }
   });
 });
 

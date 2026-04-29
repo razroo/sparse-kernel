@@ -689,8 +689,12 @@ describe("local runtime kernel database", () => {
   it("fails closed when hard sandbox egress enforcement is required for network-allowing zones", () => {
     const previousHard = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
     const previousProxy = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+    const previousHelper = process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+    const previousHelperArgs = process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
     process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
     delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
     try {
       const db = openTempDb();
       db.db
@@ -710,8 +714,7 @@ describe("local runtime kernel database", () => {
       expect(audit.action).toBe("network_policy.hard_egress_unavailable");
       expect(JSON.parse(audit.payload_json)).toMatchObject({
         backend: "local/no_isolation",
-        reason:
-          "host-level egress enforcement is not implemented for sandbox backend: local/no_isolation",
+        reason: "missing hard egress helper",
       });
 
       expect(
@@ -731,6 +734,83 @@ describe("local runtime kernel database", () => {
         delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY;
       } else {
         process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY = previousProxy;
+      }
+      if (previousHelper === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = previousHelper;
+      }
+      if (previousHelperArgs === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS = previousHelperArgs;
+      }
+    }
+  });
+
+  it("uses a hard egress helper for network-allowing sandbox leases", () => {
+    const previousHard = process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
+    const previousHelper = process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+    const previousHelperArgs = process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = process.execPath;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS = JSON.stringify([
+      "-e",
+      [
+        "let input='';",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', chunk => input += chunk);",
+        "process.stdin.on('end', () => {",
+        "  const request = JSON.parse(input);",
+        "  if (request.action === 'release') process.exit(0);",
+        "  process.stdout.write(JSON.stringify({",
+        "    ok: true,",
+        "    enforcementId: `fw-${request.allocationId}`,",
+        "    boundary: 'host_firewall',",
+        "    description: 'unit-test-helper'",
+        "  }));",
+        "});",
+      ].join("\n"),
+    ]);
+    try {
+      const db = openTempDb();
+      const broker = new LocalSandboxBroker(db);
+      const allocation = broker.allocateSandbox({
+        taskId: "task-a",
+        trustZoneId: "public_web",
+        requirements: { backend: "local/no_isolation" },
+      });
+      expect(allocation).toMatchObject({ backend: "local/no_isolation", status: "active" });
+      const lease = db.getResourceLease(allocation.id);
+      expect(lease?.metadata).toMatchObject({
+        hardEgress: {
+          enforcementId: `fw-${allocation.id}`,
+          boundary: "host_firewall",
+        },
+      });
+      expect(broker.releaseSandbox(allocation.id)).toBe(true);
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining([
+          "network_policy.hard_egress_enforced",
+          "sandbox.allocated",
+          "sandbox.released",
+        ]),
+      );
+    } finally {
+      if (previousHard === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = previousHard;
+      }
+      if (previousHelper === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = previousHelper;
+      }
+      if (previousHelperArgs === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS = previousHelperArgs;
       }
     }
   });

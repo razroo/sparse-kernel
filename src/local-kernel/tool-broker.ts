@@ -161,19 +161,63 @@ export type PluginSandboxConfig = {
   candidateBackends: SandboxBackendKind[];
 };
 
-export function resolvePluginSubprocessPlan(
-  meta: PluginToolMeta | undefined,
-): PluginToolMeta["subprocess"] {
-  if (!meta?.subprocess?.command?.trim()) {
+function readJsonOrWhitespaceArgs(raw: string | undefined, name: string): string[] {
+  const value = raw?.trim();
+  if (!value) {
+    return [];
+  }
+  if (value.startsWith("[")) {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) {
+      throw new Error(`${name} must be a JSON string array`);
+    }
+    return parsed;
+  }
+  return value.split(/\s+/).filter(Boolean);
+}
+
+function readPositiveIntegerEnv(raw: string | undefined): number | undefined {
+  const parsed = Number.parseInt(raw?.trim() ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function resolveDefaultPluginSubprocessPlan(env: NodeJS.ProcessEnv): PluginToolMeta["subprocess"] {
+  const command = env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND?.trim();
+  if (!command) {
     return undefined;
   }
-  const sandbox = meta.subprocess.sandbox;
   return {
-    command: meta.subprocess.command.trim(),
-    args: meta.subprocess.args?.map(String) ?? [],
-    ...(meta.subprocess.cwd?.trim() ? { cwd: meta.subprocess.cwd.trim() } : {}),
-    ...(typeof meta.subprocess.timeoutMs === "number" && Number.isFinite(meta.subprocess.timeoutMs)
-      ? { timeoutMs: Math.max(1, Math.trunc(meta.subprocess.timeoutMs)) }
+    command,
+    args: readJsonOrWhitespaceArgs(
+      env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_ARGS,
+      "OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_ARGS",
+    ),
+    ...(env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_CWD?.trim()
+      ? { cwd: env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_CWD.trim() }
+      : {}),
+    ...(readPositiveIntegerEnv(env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_TIMEOUT_MS)
+      ? { timeoutMs: readPositiveIntegerEnv(env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_TIMEOUT_MS) }
+      : {}),
+  };
+}
+
+export function resolvePluginSubprocessPlan(
+  meta: PluginToolMeta | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): PluginToolMeta["subprocess"] {
+  const rawPlan = meta?.subprocess?.command?.trim()
+    ? meta.subprocess
+    : resolveDefaultPluginSubprocessPlan(env);
+  if (!rawPlan?.command?.trim()) {
+    return undefined;
+  }
+  const sandbox = rawPlan.sandbox;
+  return {
+    command: rawPlan.command.trim(),
+    args: rawPlan.args?.map(String) ?? [],
+    ...(rawPlan.cwd?.trim() ? { cwd: rawPlan.cwd.trim() } : {}),
+    ...(typeof rawPlan.timeoutMs === "number" && Number.isFinite(rawPlan.timeoutMs)
+      ? { timeoutMs: Math.max(1, Math.trunc(rawPlan.timeoutMs)) }
       : {}),
     ...(sandbox
       ? {
@@ -374,7 +418,7 @@ export class CapabilityToolBroker {
           throw err;
         }
         const env = this.options.env ?? process.env;
-        const pluginSubprocessPlan = resolvePluginSubprocessPlan(pluginMeta);
+        const pluginSubprocessPlan = resolvePluginSubprocessPlan(pluginMeta, env);
         if (pluginMeta && pluginToolRequiresSubprocess(pluginMeta, env) && !pluginSubprocessPlan) {
           const err = new Error(
             `Plugin tool ${tool.name} from ${pluginMeta.pluginId} requires out-of-process execution, but no subprocess worker is configured.`,

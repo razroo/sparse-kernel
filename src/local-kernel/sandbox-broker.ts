@@ -68,6 +68,13 @@ export type SandboxPolicySnapshot = {
   docker?: DockerSandboxPolicy;
 };
 
+export type HardEgressEnforcementSnapshot = {
+  helper: string;
+  enforcementId: string;
+  boundary: "host_firewall" | "egress_proxy" | "vm_firewall" | "platform_enforcer";
+  description?: string;
+};
+
 export type SandboxCommandResult = {
   allocationId: string;
   exitCode: number | null;
@@ -136,6 +143,7 @@ type SandboxLeaseMetadata = {
   dockerImage?: string;
   isolation?: string;
   policy?: SandboxPolicySnapshot;
+  hardEgress?: HardEgressEnforcementSnapshot;
 };
 
 type CommandResolver = (commands: string[]) => string | undefined;
@@ -161,7 +169,19 @@ function readSandboxLeaseMetadata(value: unknown): SandboxLeaseMetadata {
       ? { isolation: value.isolation.trim() }
       : {}),
     ...(isRecord(value.policy) ? { policy: value.policy as SandboxPolicySnapshot } : {}),
+    ...(isHardEgressEnforcementSnapshot(value.hardEgress) ? { hardEgress: value.hardEgress } : {}),
   };
+}
+
+function isHardEgressEnforcementSnapshot(value: unknown): value is HardEgressEnforcementSnapshot {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.helper === "string" &&
+    typeof value.enforcementId === "string" &&
+    isHardEgressBoundary(value.boundary)
+  );
 }
 
 function resolveSandboxPolicySnapshot(params: {
@@ -241,6 +261,49 @@ function readHostEnv(name: string): string | undefined {
   return value?.trim() ? value : undefined;
 }
 
+function isHardEgressBoundary(value: unknown): value is HardEgressEnforcementSnapshot["boundary"] {
+  return (
+    value === "host_firewall" ||
+    value === "egress_proxy" ||
+    value === "vm_firewall" ||
+    value === "platform_enforcer"
+  );
+}
+
+function readJsonOrWhitespaceArgs(raw: string | undefined, name: string): string[] {
+  const value = raw?.trim();
+  if (!value) {
+    return [];
+  }
+  if (value.startsWith("[")) {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) {
+      throw new Error(`${name} must be a JSON string array`);
+    }
+    return parsed;
+  }
+  return value.split(/\s+/).filter(Boolean);
+}
+
+function readPositiveIntegerEnv(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(raw?.trim() ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resolveHardEgressHelper(env: NodeJS.ProcessEnv): { command: string; args: string[] } {
+  const command = env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER?.trim();
+  if (!command) {
+    throw new Error("missing hard egress helper");
+  }
+  return {
+    command,
+    args: readJsonOrWhitespaceArgs(
+      env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS,
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
+    ),
+  };
+}
+
 function dockerContainerProxyServer(proxyServer: string): {
   proxyServer: string;
   addHostGateway: boolean;
@@ -258,17 +321,89 @@ function dockerContainerProxyServer(proxyServer: string): {
   return { proxyServer, addHostGateway: false };
 }
 
+function runHardEgressHelper(params: {
+  action: "allocate" | "release";
+  allocationId: string;
+  backend: SandboxBackendKind;
+  trustZoneId?: string;
+  agentId?: string;
+  taskId?: string;
+  policy?: SandboxPolicySnapshot;
+  enforcement?: HardEgressEnforcementSnapshot;
+  env: NodeJS.ProcessEnv;
+}): HardEgressEnforcementSnapshot | undefined {
+  const helper = resolveHardEgressHelper(params.env);
+  const result = spawnSync(helper.command, helper.args, {
+    input: JSON.stringify({
+      protocol: "openclaw.sparsekernel.sandbox-egress.v1",
+      action: params.action,
+      allocationId: params.allocationId,
+      backend: params.backend,
+      trustZoneId: params.trustZoneId,
+      agentId: params.agentId,
+      taskId: params.taskId,
+      policy: params.policy,
+      enforcement: params.enforcement,
+    }),
+    encoding: "utf8",
+    maxBuffer: 256 * 1024,
+    timeout: readPositiveIntegerEnv(
+      params.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_TIMEOUT_MS,
+      30_000,
+    ),
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `hard egress helper exited ${result.status ?? result.signal ?? "unknown"}: ${
+        result.stderr?.trim() || "no stderr"
+      }`,
+    );
+  }
+  if (params.action === "release") {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout || "{}") as unknown;
+  } catch (error) {
+    throw new Error(
+      `hard egress helper returned invalid JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (!isRecord(parsed) || parsed.ok !== true) {
+    throw new Error("hard egress helper did not confirm enforcement");
+  }
+  const enforcementId =
+    typeof parsed.enforcementId === "string" && parsed.enforcementId.trim()
+      ? parsed.enforcementId.trim()
+      : undefined;
+  if (!enforcementId) {
+    throw new Error("hard egress helper response missing enforcementId");
+  }
+  const boundary = parsed.boundary;
+  if (!isHardEgressBoundary(boundary)) {
+    throw new Error("hard egress helper response missing supported boundary");
+  }
+  return {
+    helper: helper.command,
+    enforcementId,
+    boundary,
+    ...(typeof parsed.description === "string" && parsed.description.trim()
+      ? { description: parsed.description.trim() }
+      : {}),
+  };
+}
+
 function sandboxNetworkProxyValidationFailure(params: {
   policy: SandboxPolicySnapshot;
   backend: SandboxBackendKind;
   env?: NodeJS.ProcessEnv;
 }): string | undefined {
-  if (isTruthyRuntimeFlag(params.env?.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS)) {
-    if (params.policy.networkPolicy?.defaultAction !== "allow") {
-      return undefined;
-    }
-    return `host-level egress enforcement is not implemented for sandbox backend: ${params.backend}`;
-  }
   if (!isTruthyRuntimeFlag(params.env?.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_PROXY)) {
     return undefined;
   }
@@ -534,11 +669,54 @@ export class LocalSandboxBroker implements SandboxBroker {
       });
       throw new Error(`Sandbox backend unavailable: ${backend}`);
     }
+    const allocationId = `sandbox_${crypto.randomUUID()}`;
     const policy = resolveSandboxPolicySnapshot({
       db: this.db,
       trustZoneId: request.trustZoneId,
       backend,
     });
+    let hardEgress: HardEgressEnforcementSnapshot | undefined;
+    if (
+      isTruthyRuntimeFlag(process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS) &&
+      policy.networkPolicy?.defaultAction === "allow"
+    ) {
+      try {
+        hardEgress = runHardEgressHelper({
+          action: "allocate",
+          allocationId,
+          backend,
+          trustZoneId: request.trustZoneId,
+          agentId: request.agentId,
+          taskId: request.taskId,
+          policy,
+          env: process.env,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.db.recordAudit({
+          actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
+          action: "network_policy.hard_egress_unavailable",
+          objectType: "trust_zone",
+          objectId: request.trustZoneId,
+          payload: {
+            backend,
+            reason,
+          },
+        });
+        throw new Error(`Sandbox requires host-level egress enforcement: ${reason}`);
+      }
+      this.db.recordAudit({
+        actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
+        action: "network_policy.hard_egress_enforced",
+        objectType: "trust_zone",
+        objectId: request.trustZoneId,
+        payload: {
+          backend,
+          allocationId,
+          enforcement: hardEgress,
+        },
+      });
+    }
     const proxyFailure = sandboxNetworkProxyValidationFailure({
       policy,
       backend,
@@ -566,27 +744,48 @@ export class LocalSandboxBroker implements SandboxBroker {
           : `Sandbox requires a proxy-backed network policy: ${proxyFailure}`,
       );
     }
-    const allocationId = `sandbox_${crypto.randomUUID()}`;
     const ownerTaskId =
       request.taskId && this.db.getTask(request.taskId) ? request.taskId : undefined;
-    this.db.createResourceLease({
-      id: allocationId,
-      resourceType: "sandbox",
-      resourceId: allocationId,
-      ownerTaskId,
-      ownerAgentId: request.agentId,
-      trustZoneId: request.trustZoneId,
-      leaseUntil: request.requirements?.leaseUntil,
-      maxRuntimeMs: request.requirements?.maxRuntimeMs,
-      maxBytesOut: request.requirements?.maxBytesOut,
-      maxTokens: request.requirements?.maxTokens,
-      metadata: {
-        backend,
-        dockerImage: request.requirements?.dockerImage,
-        isolation: describeSandboxBackend(backend),
-        policy,
-      },
-    });
+    try {
+      this.db.createResourceLease({
+        id: allocationId,
+        resourceType: "sandbox",
+        resourceId: allocationId,
+        ownerTaskId,
+        ownerAgentId: request.agentId,
+        trustZoneId: request.trustZoneId,
+        leaseUntil: request.requirements?.leaseUntil,
+        maxRuntimeMs: request.requirements?.maxRuntimeMs,
+        maxBytesOut: request.requirements?.maxBytesOut,
+        maxTokens: request.requirements?.maxTokens,
+        metadata: {
+          backend,
+          dockerImage: request.requirements?.dockerImage,
+          isolation: describeSandboxBackend(backend),
+          policy,
+          ...(hardEgress ? { hardEgress } : {}),
+        },
+      });
+    } catch (error) {
+      if (hardEgress) {
+        try {
+          runHardEgressHelper({
+            action: "release",
+            allocationId,
+            backend,
+            trustZoneId: request.trustZoneId,
+            agentId: request.agentId,
+            taskId: request.taskId,
+            policy,
+            enforcement: hardEgress,
+            env: process.env,
+          });
+        } catch {
+          // Preserve the original lease error; operators can reconcile by allocation id.
+        }
+      }
+      throw error;
+    }
     const lease = this.db.getResourceLease(allocationId);
     this.db.recordAudit({
       actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
@@ -599,6 +798,7 @@ export class LocalSandboxBroker implements SandboxBroker {
         backend,
         isolation: describeSandboxBackend(backend),
         policy,
+        ...(hardEgress ? { hardEgress } : {}),
       },
     });
     this.allocationBackends.set(allocationId, backend);
@@ -614,6 +814,36 @@ export class LocalSandboxBroker implements SandboxBroker {
   }
 
   releaseSandbox(allocationId: string): boolean {
+    const lease = this.db.getResourceLease(allocationId);
+    const metadata = readSandboxLeaseMetadata(lease?.metadata);
+    if (lease?.status === "active" && metadata.hardEgress && metadata.backend) {
+      try {
+        runHardEgressHelper({
+          action: "release",
+          allocationId,
+          backend: metadata.backend,
+          trustZoneId: lease.trustZoneId,
+          agentId: lease.ownerAgentId,
+          taskId: lease.ownerTaskId,
+          policy: metadata.policy,
+          enforcement: metadata.hardEgress,
+          env: process.env,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.db.recordAudit({
+          actor: { type: "runtime" },
+          action: "network_policy.hard_egress_release_failed",
+          objectType: "resource_lease",
+          objectId: allocationId,
+          payload: {
+            reason,
+            enforcement: metadata.hardEgress,
+          },
+        });
+        throw new Error(`Sandbox hard egress release failed: ${reason}`);
+      }
+    }
     const released = this.db.releaseResourceLease(allocationId);
     if (released) {
       this.allocationBackends.delete(allocationId);

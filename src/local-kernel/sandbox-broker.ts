@@ -2,6 +2,12 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import type { LocalKernelDatabase } from "./database.js";
+import {
+  isBuiltinFirewallHardEgressHelper,
+  runBuiltinFirewallHardEgressHelper,
+  type BuiltinFirewallCommand,
+  type BuiltinFirewallPlatform,
+} from "./hard-egress-firewall.js";
 import { resolveNetworkPolicyProxyRef } from "./network-policy.js";
 import type { SandboxAllocationRecord } from "./types.js";
 
@@ -63,6 +69,8 @@ export type SandboxPolicySnapshot = {
     id: string;
     defaultAction: "allow" | "deny";
     allowPrivateNetwork: boolean;
+    allowedHosts?: string[];
+    deniedCidrs?: string[];
     proxyRef?: string;
   };
   docker?: DockerSandboxPolicy;
@@ -73,6 +81,14 @@ export type HardEgressEnforcementSnapshot = {
   enforcementId: string;
   boundary: "host_firewall" | "egress_proxy" | "vm_firewall" | "platform_enforcer";
   description?: string;
+  firewall?: {
+    platform: BuiltinFirewallPlatform | string;
+    scope: string;
+    allowedCidrs?: string[];
+    releaseCommands?: BuiltinFirewallCommand[];
+    applied?: boolean;
+    limitations?: string[];
+  };
 };
 
 export type SandboxCommandResult = {
@@ -207,6 +223,8 @@ function resolveSandboxPolicySnapshot(params: {
             id: networkPolicy.id,
             defaultAction: networkPolicy.defaultAction,
             allowPrivateNetwork: networkPolicy.allowPrivateNetwork,
+            ...(networkPolicy.allowedHosts ? { allowedHosts: networkPolicy.allowedHosts } : {}),
+            ...(networkPolicy.deniedCidrs ? { deniedCidrs: networkPolicy.deniedCidrs } : {}),
             ...(networkPolicy.proxyRef ? { proxyRef: networkPolicy.proxyRef } : {}),
           },
         }
@@ -384,6 +402,16 @@ function runHardEgressHelper(params: {
       allocationId: params.allocationId,
       backend: params.backend,
       policy: params.policy,
+    });
+  }
+  if (isBuiltinFirewallHardEgressHelper(helper.command)) {
+    return runBuiltinFirewallHardEgressHelper({
+      action: params.action,
+      allocationId: params.allocationId,
+      backend: params.backend,
+      policy: params.policy,
+      enforcement: params.enforcement,
+      env: params.env,
     });
   }
   const result = spawnSync(helper.command, helper.args, {

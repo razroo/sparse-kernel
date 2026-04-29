@@ -34,6 +34,16 @@ export type {
   NetworkPolicyProxyDecision,
 } from "./network-policy.js";
 export {
+  buildBuiltinFirewallEgressPlan,
+  isBuiltinFirewallHardEgressHelper,
+} from "./hard-egress-firewall.js";
+export type {
+  BuiltinFirewallCommand,
+  BuiltinFirewallEgressPlan,
+  BuiltinFirewallPlatform,
+  BuiltinFirewallScope,
+} from "./hard-egress-firewall.js";
+export {
   compactLedgerContent,
   materializeEmbeddedRunInKernel,
   recoverEmbeddedRunTasks,
@@ -63,6 +73,7 @@ export type {
   SandboxCommandRequest,
   SandboxCommandResult,
   SandboxBroker,
+  HardEgressEnforcementSnapshot,
   SandboxPolicySnapshot,
   SandboxSpawnCommandRequest,
   SandboxSpawnPlan,

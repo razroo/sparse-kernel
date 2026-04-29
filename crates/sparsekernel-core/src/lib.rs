@@ -2410,6 +2410,11 @@ fn run_hard_egress_helper(
     if is_builtin_hard_egress_helper(&helper) {
         return run_builtin_hard_egress_helper(action, allocation_id, backend);
     }
+    if is_builtin_firewall_hard_egress_helper(&helper) {
+        return Err(SparseKernelError::Denied(
+            "builtin firewall manager is available only in the local OpenClaw sandbox broker; sparsekerneld requires an external helper or a backend-carried no-network boundary".to_string(),
+        ));
+    }
     let payload = json!({
         "protocol": "openclaw.sparsekernel.sandbox-egress.v1",
         "action": action,
@@ -2490,6 +2495,16 @@ fn is_builtin_hard_egress_helper(helper: &str) -> bool {
     matches!(
         helper.trim().to_ascii_lowercase().as_str(),
         "builtin" | "sparsekernel:builtin" | "openclaw:sparsekernel:builtin"
+    )
+}
+
+fn is_builtin_firewall_hard_egress_helper(helper: &str) -> bool {
+    matches!(
+        helper.trim().to_ascii_lowercase().as_str(),
+        "builtin-firewall"
+            | "builtin:firewall"
+            | "sparsekernel:builtin-firewall"
+            | "openclaw:sparsekernel:builtin-firewall"
     )
 }
 
@@ -3116,6 +3131,46 @@ mod tests {
         let audit = db.list_audit(1).unwrap();
         assert_eq!(audit[0].action, "network_policy.hard_egress_unavailable");
         assert_eq!(audit[0].object_id.as_deref(), Some("public_web"));
+    }
+
+    #[test]
+    fn sandbox_builtin_firewall_helper_fails_closed_in_daemon_core() {
+        let _guard = env_lock();
+        let (_dir, db) = temp_db();
+        let previous = env::var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS").ok();
+        let previous_helper = env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER").ok();
+        let previous_helper_args =
+            env::var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS").ok();
+        env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", "1");
+        env::set_var(
+            "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER",
+            "builtin-firewall",
+        );
+        env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS");
+        let result = LocalSandboxBroker { db: &db }.allocate_sandbox(
+            None,
+            None,
+            "public_web",
+            Some("local/no_isolation"),
+        );
+        match previous {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
+        }
+        match previous_helper {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER"),
+        }
+        match previous_helper_args {
+            Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS", value),
+            None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS"),
+        }
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(
+            "builtin firewall manager is available only in the local OpenClaw sandbox broker"
+        ));
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "network_policy.hard_egress_unavailable");
     }
 
     #[test]

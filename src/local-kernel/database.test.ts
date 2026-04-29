@@ -9,6 +9,7 @@ import {
 import {
   accountSandboxForRun,
   accountSandboxForRunEffective,
+  buildBuiltinFirewallEgressPlan,
   buildSandboxProcessEnv,
   buildSandboxSpawnPlan,
   checkTrustZoneNetworkUrl,
@@ -863,6 +864,114 @@ describe("local runtime kernel database", () => {
         delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
       } else {
         process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS = previousHelperArgs;
+      }
+    }
+  });
+
+  it("builds scoped linux firewall plans from IP allowlists and loopback proxies", () => {
+    const plan = buildBuiltinFirewallEgressPlan({
+      allocationId: "sandbox_test",
+      backend: "local/no_isolation",
+      policy: {
+        trustZoneId: "public_web",
+        backend: "local/no_isolation",
+        networkPolicy: {
+          id: "public_web_default",
+          defaultAction: "allow",
+          allowPrivateNetwork: false,
+          allowedHosts: ["203.0.113.10", "2001:db8::/32"],
+          proxyRef: "http://127.0.0.1:8080",
+        },
+      },
+      env: {
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM: "linux_iptables",
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE: "uid:4242",
+        OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED: "1",
+      } as NodeJS.ProcessEnv,
+    });
+    expect(plan.platform).toBe("linux_iptables");
+    expect(plan.scope).toEqual({ kind: "uid", value: "4242" });
+    expect(plan.allowedCidrs).toEqual([
+      "127.0.0.0/8",
+      "2001:db8::/32",
+      "203.0.113.10/32",
+      "::1/128",
+    ]);
+    expect(plan.commands.map((entry) => entry.command)).toEqual(
+      expect.arrayContaining(["iptables", "ip6tables"]),
+    );
+    expect(plan.commands.some((entry) => entry.args.includes("--uid-owner"))).toBe(true);
+    expect(plan.releaseCommands.length).toBeGreaterThan(0);
+  });
+
+  it("rejects firewall plans that cannot be expressed as a host firewall allowlist", () => {
+    expect(() =>
+      buildBuiltinFirewallEgressPlan({
+        allocationId: "sandbox_test",
+        backend: "local/no_isolation",
+        policy: {
+          trustZoneId: "public_web",
+          backend: "local/no_isolation",
+          networkPolicy: {
+            id: "public_web_default",
+            defaultAction: "allow",
+            allowPrivateNetwork: false,
+            allowedHosts: ["example.com"],
+          },
+        },
+        env: {
+          OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM: "linux_iptables",
+          OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE: "uid:4242",
+          OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED: "1",
+        } as NodeJS.ProcessEnv,
+      }),
+    ).toThrow(/IP\/CIDR allowed_hosts/);
+  });
+
+  it("fails closed for builtin firewall hard egress without explicit host mutation", () => {
+    const envNames = [
+      "OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER",
+      "OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED",
+      "OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY",
+    ];
+    const previous = new Map(envNames.map((name) => [name, process.env[name]]));
+    process.env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS = "1";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER = "builtin-firewall";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_PLATFORM = "linux_iptables";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE = "uid:4242";
+    process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_SCOPE_DEDICATED = "1";
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_FIREWALL_APPLY;
+    try {
+      const db = openTempDb();
+      db.db
+        .prepare("UPDATE network_policies SET proxy_ref = ? WHERE id = 'public_web_default'")
+        .run("http://127.0.0.1:8080");
+      const broker = new LocalSandboxBroker(db);
+      expect(() =>
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "public_web",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toThrow(/will not mutate the host firewall/);
+      const audit = db.db
+        .prepare("SELECT action, payload_json FROM audit_log ORDER BY id DESC LIMIT 1")
+        .get() as { action: string; payload_json: string };
+      expect(audit.action).toBe("network_policy.hard_egress_unavailable");
+      expect(JSON.parse(audit.payload_json).reason).toMatch(/will not mutate the host firewall/);
+    } finally {
+      for (const name of envNames) {
+        const value = previous.get(name);
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
       }
     }
   });

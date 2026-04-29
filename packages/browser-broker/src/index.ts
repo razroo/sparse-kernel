@@ -184,6 +184,7 @@ export type SparseKernelBrowserActRequest =
       targetId?: string;
       doubleClick?: boolean;
       button?: string;
+      modifiers?: string[];
       delayMs?: number;
       timeoutMs?: number;
     }
@@ -1916,7 +1917,10 @@ async function dispatchCdpMouseAction(
   request: Extract<SparseKernelBrowserActRequest, { kind: "click" | "clickCoords" | "hover" }>,
   point: CdpActionPoint,
 ): Promise<void> {
-  const modifiers = request.kind === "click" ? resolveCdpInputModifiers(request.modifiers) : 0;
+  const modifiers =
+    request.kind === "click" || request.kind === "clickCoords"
+      ? resolveCdpInputModifiers(request.modifiers)
+      : 0;
   await context.connection.command(
     "Input.dispatchMouseEvent",
     {

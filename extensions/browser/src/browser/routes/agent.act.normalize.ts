@@ -125,6 +125,11 @@ export function normalizeActRequest(
       if (buttonRaw && !button) {
         throw new Error("clickCoords button must be left|right|middle");
       }
+      const modifiersRaw = toStringArray(body.modifiers) ?? [];
+      const parsedModifiers = parseClickModifiers(modifiersRaw);
+      if (parsedModifiers.error) {
+        throw new Error(parsedModifiers.error);
+      }
       const doubleClick = toBoolean(body.doubleClick);
       const delayMs = normalizeActBoundedNonNegativeMs(
         toNumber(body.delayMs),
@@ -140,6 +145,7 @@ export function normalizeActRequest(
         ...(targetId ? { targetId } : {}),
         ...(doubleClick !== undefined ? { doubleClick } : {}),
         ...(button ? { button } : {}),
+        ...(parsedModifiers.modifiers ? { modifiers: parsedModifiers.modifiers } : {}),
         ...(delayMs !== undefined ? { delayMs } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       };

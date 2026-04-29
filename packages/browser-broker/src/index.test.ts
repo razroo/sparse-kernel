@@ -1190,6 +1190,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       x: 10,
       y: 20,
       doubleClick: true,
+      modifiers: ["Alt"],
     });
     await broker.actContext(context.ledger_context.id, {
       kind: "scrollIntoView",
@@ -1231,6 +1232,10 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     expect(transport.sent).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ method: "Input.dispatchMouseEvent" }),
+        expect.objectContaining({
+          method: "Input.dispatchMouseEvent",
+          params: expect.objectContaining({ type: "mousePressed", modifiers: 1 }),
+        }),
         expect.objectContaining({
           method: "Runtime.evaluate",
           params: expect.objectContaining({

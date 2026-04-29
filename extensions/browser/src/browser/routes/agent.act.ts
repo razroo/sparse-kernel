@@ -290,6 +290,9 @@ function getExistingSessionUnsupportedMessage(action: BrowserActRequest): string
       }
       return null;
     case "clickCoords":
+      if (Array.isArray(action.modifiers) && action.modifiers.length > 0) {
+        return EXISTING_SESSION_LIMITS.act.clickButtonOrModifiers;
+      }
       return null;
     case "type":
       if (action.selector) {

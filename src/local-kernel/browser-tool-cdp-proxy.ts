@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
   SparseKernelClient,
   type SparseKernelArtifactSubject,
 } from "../../packages/sparsekernel-client/src/index.js";
+import { exportArtifactToLocalFile } from "../../packages/sparsekernel-client/src/node-artifacts.js";
 import type { SparseKernelBrowserProxyRequest } from "./browser-tool-proxy.js";
 
 export type SparseKernelBrowserToolCdpProxyInput = {
@@ -209,13 +210,13 @@ export async function createSparseKernelBrowserToolCdpProxy(
         subject: input.subject,
         timeout_ms: request.timeoutMs,
       });
-      const artifactBytes = await client.readArtifact({
-        id: result.artifact.id,
-        subject: input.subject,
-      });
       const extension = format === "jpeg" ? "jpg" : "png";
       const path = join(tempDir, `${result.artifact.sha256}.${extension}`);
-      await writeFile(path, Buffer.from(artifactBytes.content_base64, "base64"));
+      await exportArtifactToLocalFile(client, {
+        id: result.artifact.id,
+        destinationPath: path,
+        subject: input.subject,
+      });
       return {
         ok: true,
         path,
@@ -236,12 +237,12 @@ export async function createSparseKernelBrowserToolCdpProxy(
         retention_policy: "debug",
         subject: input.subject,
       });
-      const artifactBytes = await client.readArtifact({
+      const path = join(tempDir, `${result.artifact.sha256}.pdf`);
+      await exportArtifactToLocalFile(client, {
         id: result.artifact.id,
+        destinationPath: path,
         subject: input.subject,
       });
-      const path = join(tempDir, `${result.artifact.sha256}.pdf`);
-      await writeFile(path, Buffer.from(artifactBytes.content_base64, "base64"));
       return {
         ok: true,
         path,
@@ -405,6 +406,7 @@ function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActR
         targetId: readString(value.targetId),
         doubleClick: value.doubleClick === true,
         button: readString(value.button),
+        modifiers: readStringArray(value.modifiers),
         delayMs: readNumber(value.delayMs),
         timeoutMs: readNumber(value.timeoutMs),
       } as const;

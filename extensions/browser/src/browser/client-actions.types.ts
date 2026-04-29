@@ -23,6 +23,7 @@ export type BrowserActRequest =
       targetId?: string;
       doubleClick?: boolean;
       button?: string;
+      modifiers?: string[];
       delayMs?: number;
       timeoutMs?: number;
     }

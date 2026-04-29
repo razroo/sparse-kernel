@@ -599,6 +599,7 @@ export async function clickCoordsViaPlaywright(opts: {
   y: number;
   doubleClick?: boolean;
   button?: "left" | "right" | "middle";
+  modifiers?: Array<"Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift">;
   delayMs?: number;
   timeoutMs?: number;
   ssrfPolicy?: SsrFPolicy;
@@ -607,11 +608,21 @@ export async function clickCoordsViaPlaywright(opts: {
   const previousUrl = page.url();
   await assertInteractionNavigationCompletedSafely({
     action: async () => {
-      await page.mouse.click(opts.x, opts.y, {
-        button: opts.button,
-        clickCount: opts.doubleClick ? 2 : 1,
-        delay: resolveBoundedDelayMs(opts.delayMs, "clickCoords delayMs", ACT_MAX_CLICK_DELAY_MS),
-      });
+      const modifiers = normalizeMouseKeyboardModifiers(opts.modifiers);
+      for (const modifier of modifiers) {
+        await page.keyboard.down(modifier);
+      }
+      try {
+        await page.mouse.click(opts.x, opts.y, {
+          button: opts.button,
+          clickCount: opts.doubleClick ? 2 : 1,
+          delay: resolveBoundedDelayMs(opts.delayMs, "clickCoords delayMs", ACT_MAX_CLICK_DELAY_MS),
+        });
+      } finally {
+        for (const modifier of [...modifiers].reverse()) {
+          await page.keyboard.up(modifier);
+        }
+      }
     },
     cdpUrl: opts.cdpUrl,
     page,
@@ -619,6 +630,20 @@ export async function clickCoordsViaPlaywright(opts: {
     ssrfPolicy: opts.ssrfPolicy,
     targetId: opts.targetId,
   });
+}
+
+function normalizeMouseKeyboardModifiers(
+  modifiers: Array<"Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift"> | undefined,
+): Array<"Alt" | "Control" | "Meta" | "Shift"> {
+  const normalized = new Set<"Alt" | "Control" | "Meta" | "Shift">();
+  for (const modifier of modifiers ?? []) {
+    if (modifier === "ControlOrMeta") {
+      normalized.add(process.platform === "darwin" ? "Meta" : "Control");
+    } else {
+      normalized.add(modifier);
+    }
+  }
+  return [...normalized];
 }
 
 export async function hoverViaPlaywright(opts: {
@@ -1281,6 +1306,9 @@ async function executeSingleAction(
         y: action.y,
         doubleClick: action.doubleClick,
         button: action.button as "left" | "right" | "middle" | undefined,
+        modifiers: action.modifiers as Array<
+          "Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift"
+        >,
         delayMs: action.delayMs,
         timeoutMs: action.timeoutMs,
         ssrfPolicy,

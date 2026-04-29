@@ -123,6 +123,10 @@ function requiresNonBundledPluginSubprocess(raw: string | undefined): boolean {
   return normalized === "untrusted" || normalized === "non-bundled" || normalized === "non_bundled";
 }
 
+function hasDefaultPluginSubprocessWorker(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND?.trim());
+}
+
 export function pluginToolRequiresSubprocess(
   meta: PluginToolMeta | undefined,
   env: NodeJS.ProcessEnv,
@@ -141,6 +145,9 @@ export function pluginToolRequiresSubprocess(
   }
   if (meta.processBoundary === "in_process") {
     return false;
+  }
+  if (meta.origin !== "bundled" && hasDefaultPluginSubprocessWorker(env)) {
+    return true;
   }
   return (
     requiresNonBundledPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_TRUST_DEFAULT) &&

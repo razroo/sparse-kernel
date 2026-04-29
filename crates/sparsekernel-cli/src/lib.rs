@@ -411,6 +411,26 @@ fn artifact_export_root(artifact_root: &Path) -> PathBuf {
         .unwrap_or_else(|| artifact_root.join(".exports"))
 }
 
+fn base64_artifact_compat_disabled() -> bool {
+    matches!(
+        env::var("SPARSEKERNEL_ARTIFACT_BASE64")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("0" | "false" | "off" | "disabled" | "deny")
+    ) || matches!(
+        env::var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
 fn canonical_child_path(root: &Path, raw_path: &str) -> Result<PathBuf, Box<dyn Error>> {
     fs::create_dir_all(root)?;
     let canonical_root = root.canonicalize()?;
@@ -830,6 +850,11 @@ pub fn handle_api_request_with_artifact_root(
         }
         ("POST", "/artifacts/create") => {
             let input: CreateArtifactRequest = parse_body(body)?;
+            if base64_artifact_compat_disabled() && input.content_base64.is_some() {
+                return Err(
+                    "base64 artifact create is disabled; use /artifacts/import-file".into(),
+                );
+            }
             let bytes = decode_artifact_content(&input)?;
             if let Some(subject) = &input.subject {
                 require_artifact_capability(db, subject, None, "write")?;
@@ -888,6 +913,9 @@ pub fn handle_api_request_with_artifact_root(
             }
         }
         ("POST", "/artifacts/read") => {
+            if base64_artifact_compat_disabled() {
+                return Err("base64 artifact read is disabled; use /artifacts/export-file".into());
+            }
             let input: ArtifactAccessRequest = parse_body(body)?;
             if let Some(subject) = &input.subject {
                 require_artifact_capability(db, subject, Some(&input.id), "read")?;
@@ -1025,7 +1053,13 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn json_call(db: &mut SparseKernelDb, method: &str, url: &str, body: Value) -> Value {
         handle_api_request(
@@ -1648,5 +1682,66 @@ mod tests {
             Some(root.path()),
         );
         assert!(outside.is_err());
+    }
+
+    #[test]
+    fn artifact_api_can_disable_base64_compatibility() {
+        let _guard = env_lock();
+        let previous_disable = env::var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS").ok();
+        let previous_mode = env::var("SPARSEKERNEL_ARTIFACT_BASE64").ok();
+        env::set_var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS", "1");
+        env::remove_var("SPARSEKERNEL_ARTIFACT_BASE64");
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let create = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/create",
+            serde_json::to_string(&json!({
+                "content_base64": BASE64_STANDARD.encode(b"blocked"),
+            }))
+            .unwrap()
+            .as_bytes(),
+            Some(root.path()),
+        );
+        let text = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/create",
+            serde_json::to_string(&json!({
+                "content_text": "allowed text",
+                "mime_type": "text/plain",
+            }))
+            .unwrap()
+            .as_bytes(),
+            Some(root.path()),
+        )
+        .unwrap()
+        .body;
+        let read = handle_api_request_with_artifact_root(
+            &mut db,
+            "POST",
+            "/artifacts/read",
+            serde_json::to_string(&json!({ "id": text["id"] }))
+                .unwrap()
+                .as_bytes(),
+            Some(root.path()),
+        );
+        match previous_disable {
+            Some(value) => env::set_var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS", value),
+            None => env::remove_var("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS"),
+        }
+        match previous_mode {
+            Some(value) => env::set_var("SPARSEKERNEL_ARTIFACT_BASE64", value),
+            None => env::remove_var("SPARSEKERNEL_ARTIFACT_BASE64"),
+        }
+        assert!(create
+            .unwrap_err()
+            .to_string()
+            .contains("base64 artifact create is disabled"));
+        assert!(read
+            .unwrap_err()
+            .to_string()
+            .contains("base64 artifact read is disabled"));
     }
 }

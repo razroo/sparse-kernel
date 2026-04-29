@@ -9,6 +9,7 @@ use sparsekernel_core::{
     GrantCapabilityInput, LedgerToolBroker, ListBrowserObservationsInput, ListBrowserTargetsInput,
     LocalSandboxBroker, MockBrowserBroker, RecordBrowserObservationInput, RecordBrowserTargetInput,
     SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
+    SPARSEKERNEL_PROTOCOL_VERSION,
 };
 use std::error::Error;
 use std::net::ToSocketAddrs;
@@ -429,6 +430,16 @@ pub fn handle_api_request_with_artifact_root(
                 "ok": true,
                 "service": "sparsekerneld",
                 "version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": SPARSEKERNEL_PROTOCOL_VERSION,
+                "schema_version": db.schema_version()?,
+                "features": [
+                    "ledger.v1",
+                    "tasks.v1",
+                    "artifacts.v1",
+                    "capabilities.v1",
+                    "browser-broker.v1",
+                    "sandbox-broker.v1"
+                ],
             }),
         },
         ("GET", "/status") => ApiReply {
@@ -889,6 +900,20 @@ mod tests {
         )
         .unwrap()
         .body
+    }
+
+    #[test]
+    fn health_reports_protocol_and_schema_version() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let health = json_call(&mut db, "GET", "/health", json!({}));
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["service"], "sparsekerneld");
+        assert_eq!(health["protocol_version"], SPARSEKERNEL_PROTOCOL_VERSION);
+        assert_eq!(health["schema_version"], db.schema_version().unwrap());
+        assert!(health["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tasks.v1")));
     }
 
     #[test]

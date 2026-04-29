@@ -44,7 +44,7 @@ Small machines can keep many logical agents parked in durable state, but they ca
 
 ## Local API
 
-The v0 daemon exposes localhost JSON endpoints for health/status, session upsert/list, transcript event append/list, task enqueue/claim-by-id/claim-next/heartbeat/complete/fail, expired lease release, tool-call create/start/complete/fail/list, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, sandbox allocate/release, capability grant/check/list/revoke, task listing, and audit listing. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
+The v0 daemon exposes localhost JSON endpoints for health/status, session upsert/list, transcript event append/list, task enqueue/claim-by-id/claim-next/heartbeat/complete/fail, expired lease release, tool-call create/start/complete/fail/list, artifact create/read/metadata, browser context acquire/release/list, loopback CDP endpoint probing, sandbox allocate/release, capability grant/check/list/revoke, task listing, and audit listing. `/health` advertises `protocol_version`, `schema_version`, and feature strings so clients can reject incompatible daemon protocols before making state-changing calls. The TypeScript client uses those endpoints instead of opening the SQLite file directly.
 
 The API is intentionally narrow. Agents and adapters should call the daemon or typed core APIs; they should not read or mutate the ledger with raw SQL.
 

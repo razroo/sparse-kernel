@@ -21,6 +21,15 @@ paths:
                   ok: { type: boolean }
                   service: { type: string }
                   version: { type: string }
+                  protocol_version:
+                    type: string
+                    description: SparseKernel local API protocol version. Clients should require a compatible major.
+                  schema_version:
+                    type: integer
+                    description: Current SQLite ledger schema version.
+                  features:
+                    type: array
+                    items: { type: string }
   /status:
     get:
       operationId: status

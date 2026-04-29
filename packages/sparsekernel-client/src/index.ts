@@ -3,10 +3,15 @@ export type SparseKernelClientOptions = {
   fetchImpl?: typeof fetch;
 };
 
+export const SPARSEKERNEL_PROTOCOL_VERSION = "2026-04-29.v1";
+
 export type SparseKernelHealth = {
   ok: boolean;
   service: string;
   version: string;
+  protocol_version?: string;
+  schema_version?: number;
+  features?: string[];
 };
 
 export type SparseKernelInspect = {
@@ -389,6 +394,21 @@ export type SparseKernelCapabilityCheckInput = {
   audit_denied?: boolean;
 };
 
+function protocolMajor(version: string): string {
+  const trimmed = version.trim();
+  const match = /(?:^|[._-])v?(\d+)$/i.exec(trimmed);
+  return match?.[1] ?? trimmed;
+}
+
+export function isSparseKernelProtocolCompatible(
+  health: Pick<SparseKernelHealth, "protocol_version">,
+): boolean {
+  if (!health.protocol_version) {
+    return true;
+  }
+  return protocolMajor(health.protocol_version) === protocolMajor(SPARSEKERNEL_PROTOCOL_VERSION);
+}
+
 export class SparseKernelClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -400,6 +420,18 @@ export class SparseKernelClient {
 
   async health(): Promise<SparseKernelHealth> {
     return await this.getJson<SparseKernelHealth>("/health");
+  }
+
+  async assertCompatible(): Promise<SparseKernelHealth> {
+    const health = await this.health();
+    if (!isSparseKernelProtocolCompatible(health)) {
+      throw new Error(
+        `SparseKernel protocol mismatch: client ${SPARSEKERNEL_PROTOCOL_VERSION}, daemon ${
+          health.protocol_version ?? "unknown"
+        }`,
+      );
+    }
+    return health;
   }
 
   async status(): Promise<SparseKernelInspect> {

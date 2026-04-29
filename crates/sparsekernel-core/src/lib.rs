@@ -14,6 +14,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 2;
+pub const SPARSEKERNEL_PROTOCOL_VERSION: &str = "2026-04-29.v1";
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_0002: &str =
     include_str!("../../../migrations/0002_browser_targets_observations.sql");

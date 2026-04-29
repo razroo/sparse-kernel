@@ -354,6 +354,46 @@ describe("session store lock (Promise chain mutex)", () => {
     }
   });
 
+  it("can make SQLite strict without falling back to legacy session files", async () => {
+    const key = "agent:main:sqlite-strict";
+    const { dir, storePath } = await makeTmpStore({
+      [key]: { sessionId: "legacy-only", updatedAt: Date.now() },
+    });
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const previousMode = process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+    process.env.OPENCLAW_STATE_DIR = path.join(dir, "state");
+    process.env.OPENCLAW_RUNTIME_SESSION_STORE = "sqlite-strict";
+    try {
+      expect(loadSessionStore(storePath, { skipCache: true })).toEqual({});
+
+      await updateSessionStore(
+        storePath,
+        (store) => {
+          store[key] = {
+            sessionId: "ledger-session",
+            updatedAt: Date.parse("2026-01-01T00:00:00.000Z"),
+          };
+        },
+        { skipMaintenance: true },
+      );
+
+      expect(loadSessionStore(storePath, { skipCache: true })[key]?.sessionId).toBe(
+        "ledger-session",
+      );
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      if (previousMode === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SESSION_STORE = previousMode;
+      }
+    }
+  });
+
   it("multiple consecutive errors do not permanently poison the queue", async () => {
     const key = "agent:main:multi-err";
     const { storePath } = await makeTmpStore({

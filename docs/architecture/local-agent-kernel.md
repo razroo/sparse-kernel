@@ -141,7 +141,7 @@ openclaw sessions export --session <session-id> --format jsonl
 
 Import is additive and idempotent for already-imported transcript events. It does not delete or rewrite `sessions.json` or transcript files.
 
-Session metadata writes are mirrored into the runtime ledger by default. Set `OPENCLAW_RUNTIME_SESSION_STORE=sqlite` to make the runtime ledger the primary session metadata store; set `OPENCLAW_RUNTIME_SESSION_STORE=off` to disable mirroring. Strict SQLite mode writes the ledger first and still attempts legacy JSON output for compatibility. Failed ledger writes are hard failures; failed legacy JSON writes are warnings because SQLite is authoritative in this mode.
+Session metadata writes are mirrored into the runtime ledger by default. Set `OPENCLAW_RUNTIME_SESSION_STORE=sqlite` to make the runtime ledger the primary session metadata store while retaining legacy file fallback for stores that have not been imported yet. Set `OPENCLAW_RUNTIME_SESSION_STORE=sqlite-strict` to make the runtime ledger authoritative for reads as well; missing ledger rows return an empty store instead of reading `sessions.json`. Set `OPENCLAW_RUNTIME_SESSION_STORE=off` to disable mirroring. SQLite primary modes write the ledger first and still attempt legacy JSON output for compatibility. Failed ledger writes are hard failures; failed legacy JSON writes are warnings because SQLite is authoritative in these modes.
 
 ## Current limitations
 

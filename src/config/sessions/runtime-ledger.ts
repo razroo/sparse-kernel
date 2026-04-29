@@ -4,7 +4,7 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { DEFAULT_AGENT_ID, normalizeAgentId } from "../../routing/session-key.js";
 import type { SessionEntry } from "./types.js";
 
-export type RuntimeSessionStoreMode = "off" | "dual" | "sqlite";
+export type RuntimeSessionStoreMode = "off" | "dual" | "sqlite" | "sqlite-strict";
 
 const SESSION_STORE_MODE_ENV = "OPENCLAW_RUNTIME_SESSION_STORE";
 const log = createSubsystemLogger("sessions/runtime-ledger");
@@ -52,6 +52,9 @@ export function resolveRuntimeSessionStoreMode(
   if (raw === "off" || raw === "0" || raw === "false") {
     return "off";
   }
+  if (raw === "sqlite-strict" || raw === "strict-sqlite" || raw === "strict") {
+    return "sqlite-strict";
+  }
   if (raw === "sqlite" || raw === "on" || raw === "1" || raw === "true") {
     return "sqlite";
   }
@@ -59,7 +62,8 @@ export function resolveRuntimeSessionStoreMode(
 }
 
 export function isRuntimeSessionStorePrimary(env: NodeJS.ProcessEnv = process.env): boolean {
-  return resolveRuntimeSessionStoreMode(env) === "sqlite";
+  const mode = resolveRuntimeSessionStoreMode(env);
+  return mode === "sqlite" || mode === "sqlite-strict";
 }
 
 function buildSessionStoreLedgerEntries(params: {
@@ -113,12 +117,16 @@ export function loadSessionStoreFromRuntimeLedger(
   storePath: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, SessionEntry> | undefined {
-  if (resolveRuntimeSessionStoreMode(env) !== "sqlite") {
+  const mode = resolveRuntimeSessionStoreMode(env);
+  if (mode !== "sqlite" && mode !== "sqlite-strict") {
     return undefined;
   }
   const db = openLocalKernelDatabase({ env });
   try {
     const store = db.loadSessionEntriesForStore(path.resolve(storePath));
+    if (!store && mode === "sqlite-strict") {
+      return {};
+    }
     return store as Record<string, SessionEntry> | undefined;
   } finally {
     db.close();

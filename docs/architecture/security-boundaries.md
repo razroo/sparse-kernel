@@ -17,7 +17,7 @@ SparseKernel security claims must be precise.
 - Docker is one sandbox backend, not the default mental model.
 - `local/no_isolation` is only for trusted operations and accounting.
 - The local/no-isolation sandbox command runner schedules and audits trusted commands behind a lease, but it does not confine process, filesystem, or network access.
-- The bwrap and minijail command runners use the installed backend binaries when available, but their exact isolation depends on host kernel support and the broker-selected bind policy.
+- The bwrap and minijail command runners use the installed backend binaries when available, but their exact isolation depends on host kernel support and the broker-selected bind policy. Isolated command backends receive a sanitized environment by default; plugin or sandbox callers must pass required worker environment explicitly.
 - SparseKernel network policy checks, including DNS-aware hostname resolution, are broker-side request guards unless backed by a real proxy, firewall, sandbox, or VM boundary.
 - Browser proxy-required mode configures SparseKernel-owned native browser processes with a loopback proxy and denies unverified external CDP endpoints; it does not control arbitrary host processes.
 - Docker command execution requires an explicit image and disables container networking by default, but its isolation is only the host Docker daemon's isolation; it is not a per-agent security model.

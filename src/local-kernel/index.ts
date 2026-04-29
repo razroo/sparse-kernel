@@ -62,6 +62,7 @@ export type {
   SandboxSpawnPlan,
 } from "./sandbox-broker.js";
 export {
+  buildSandboxProcessEnv,
   buildSandboxSpawnPlan,
   isSandboxBackendAvailable,
   runSandboxSpawnPlan,

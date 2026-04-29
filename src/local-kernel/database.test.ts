@@ -9,6 +9,7 @@ import {
 import {
   accountSandboxForRun,
   accountSandboxForRunEffective,
+  buildSandboxProcessEnv,
   buildSandboxSpawnPlan,
   checkTrustZoneNetworkUrl,
   checkTrustZoneNetworkUrlWithDns,
@@ -556,6 +557,36 @@ describe("local runtime kernel database", () => {
         stdin: "worker-input",
       }),
     ).resolves.toMatchObject({ exitCode: 0, stdout: "worker-input", timedOut: false });
+  });
+
+  it("does not leak host environment into isolated sandbox command backends", () => {
+    const previous = process.env.OPENCLAW_TEST_SECRET_TOKEN;
+    process.env.OPENCLAW_TEST_SECRET_TOKEN = "should-not-leak";
+    try {
+      expect(buildSandboxProcessEnv({ backend: "bwrap" })).not.toHaveProperty(
+        "OPENCLAW_TEST_SECRET_TOKEN",
+      );
+      expect(
+        buildSandboxProcessEnv({
+          backend: "minijail",
+          env: { EXPLICIT_WORKER_ENV: "ok" },
+        }),
+      ).toMatchObject({
+        HOME: "/tmp",
+        TMPDIR: "/tmp",
+        EXPLICIT_WORKER_ENV: "ok",
+      });
+      expect(buildSandboxProcessEnv({ backend: "local/no_isolation" })).toHaveProperty(
+        "OPENCLAW_TEST_SECRET_TOKEN",
+        "should-not-leak",
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.OPENCLAW_TEST_SECRET_TOKEN;
+      } else {
+        process.env.OPENCLAW_TEST_SECRET_TOKEN = previous;
+      }
+    }
   });
 
   it("persists sandbox backend metadata across broker instances", async () => {

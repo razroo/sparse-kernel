@@ -232,6 +232,35 @@ function validDockerEnvName(name: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
 }
 
+function readHostEnv(name: string): string | undefined {
+  const value = process.env[name];
+  return value?.trim() ? value : undefined;
+}
+
+export function buildSandboxProcessEnv(params: {
+  backend: SandboxBackendKind;
+  env?: Record<string, string>;
+}): NodeJS.ProcessEnv {
+  if (params.backend === "local/no_isolation") {
+    return params.env ? { ...process.env, ...params.env } : process.env;
+  }
+  const base: NodeJS.ProcessEnv = {
+    PATH: readHostEnv("PATH") ?? "/usr/local/bin:/usr/bin:/bin",
+    HOME: "/tmp",
+    TMPDIR: "/tmp",
+    LANG: readHostEnv("LANG") ?? "C.UTF-8",
+  };
+  if (params.backend === "docker") {
+    for (const name of ["DOCKER_HOST", "DOCKER_CONTEXT", "XDG_RUNTIME_DIR"]) {
+      const value = readHostEnv(name);
+      if (value) {
+        base[name] = value;
+      }
+    }
+  }
+  return { ...base, ...(params.env ?? {}) };
+}
+
 export function buildSandboxSpawnPlan(params: {
   backend: SandboxBackendKind;
   command: string;
@@ -371,7 +400,7 @@ export async function runSandboxSpawnPlan(
   return await new Promise<SandboxCommandResult>((resolve, reject) => {
     const child = spawn(request.spawnPlan.command, request.spawnPlan.args, {
       cwd: request.backend === "local/no_isolation" ? request.cwd : undefined,
-      env: request.env ? { ...process.env, ...request.env } : process.env,
+      env: buildSandboxProcessEnv({ backend: request.backend, env: request.env }),
       stdio: [request.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     let timedOut = false;

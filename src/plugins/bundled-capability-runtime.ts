@@ -485,6 +485,7 @@ export function loadBundledCapabilityRuntimeRegistry(params: {
           factory: () => tool,
           names: [tool.name],
           optional: false,
+          origin: record.origin,
           source: record.source,
           rootDir: record.rootDir,
         })),

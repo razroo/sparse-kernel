@@ -29,6 +29,7 @@ import type {
   OpenClawPluginCliCommandDescriptor,
   OpenClawPluginCliRegistrar,
   OpenClawPluginCommandDefinition,
+  OpenClawPluginToolOptions,
   OpenClawPluginGatewayRuntimeScopeSurface,
   OpenClawGatewayDiscoveryService,
   OpenClawPluginHttpRouteAuth,
@@ -59,6 +60,9 @@ export type PluginToolRegistration = {
   factory: OpenClawPluginToolFactory;
   names: string[];
   optional: boolean;
+  origin: PluginOrigin;
+  processBoundary?: OpenClawPluginToolOptions["processBoundary"];
+  subprocess?: OpenClawPluginToolOptions["subprocess"];
   source: string;
   rootDir?: string;
 };

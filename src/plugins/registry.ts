@@ -117,6 +117,7 @@ import type {
   OpenClawPluginService,
   OpenClawPluginToolContext,
   OpenClawPluginToolFactory,
+  OpenClawPluginToolOptions,
   PluginHookHandlerMap,
   PluginHookName,
   PluginHookRegistration as TypedPluginHookRegistration,
@@ -387,7 +388,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
   const registerTool = (
     record: PluginRecord,
     tool: AnyAgentTool | OpenClawPluginToolFactory,
-    opts?: { name?: string; names?: string[]; optional?: boolean },
+    opts?: OpenClawPluginToolOptions,
   ) => {
     if (pluginsWithChannelRegistrationConflict.has(record.id)) {
       return;
@@ -411,6 +412,9 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
       factory,
       names: normalized,
       optional,
+      origin: record.origin,
+      ...(opts?.processBoundary ? { processBoundary: opts.processBoundary } : {}),
+      ...(opts?.subprocess ? { subprocess: opts.subprocess } : {}),
       source: record.source,
       rootDir: record.rootDir,
     });

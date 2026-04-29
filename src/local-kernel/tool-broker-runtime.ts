@@ -17,7 +17,7 @@ import {
 import {
   CapabilityToolBroker,
   isSandboxCommandToolName,
-  requiresPluginSubprocess,
+  pluginToolRequiresSubprocess,
   resolvePluginSandboxConfig,
   resolvePluginSubprocessPlan,
   type PluginSubprocessPlan,
@@ -304,16 +304,13 @@ function wrapDaemonPluginSubprocessTools(
   capabilityExpiresAt: string,
 ): AnyAgentTool[] {
   const env = input.env ?? process.env;
-  const strictPluginBoundary =
-    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
-    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS);
   return input.tools.map((tool) => {
     const pluginMeta = getPluginToolMeta(tool);
     if (!pluginMeta) {
       return tool;
     }
     const plan = resolvePluginSubprocessPlan(pluginMeta);
-    if (!plan && !strictPluginBoundary) {
+    if (!plan && !pluginToolRequiresSubprocess(pluginMeta, env)) {
       return tool;
     }
     return {

@@ -38,10 +38,35 @@ export type OpenClawPluginToolFactory = (
   ctx: OpenClawPluginToolContext,
 ) => AnyAgentTool | AnyAgentTool[] | null | undefined;
 
+export type OpenClawPluginToolSubprocessOptions = {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  timeoutMs?: number;
+  sandbox?: {
+    trustZoneId?: string;
+    backend?:
+      | "local/no_isolation"
+      | "docker"
+      | "bwrap"
+      | "minijail"
+      | "ssh"
+      | "openshell"
+      | "vm"
+      | "other";
+    dockerImage?: string;
+    requireIsolated?: boolean;
+    maxRuntimeMs?: number;
+    maxBytesOut?: number;
+  };
+};
+
 export type OpenClawPluginToolOptions = {
   name?: string;
   names?: string[];
   optional?: boolean;
+  processBoundary?: "in_process" | "subprocess_required";
+  subprocess?: OpenClawPluginToolSubprocessOptions;
 };
 
 export type OpenClawPluginHookOptions = {

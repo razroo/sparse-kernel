@@ -26,6 +26,7 @@ SparseKernel security claims must be precise.
 - Persisted lease metadata records the selected backend and policy intent; it is audit/accounting state, not isolation by itself.
 - Untrusted plugins must not get ambient host authority.
 - The subprocess-required plugin mode runs explicit JSON workers through the sandbox broker. It auto-selects an available isolated backend when possible, but it still only becomes suitable for untrusted code when the selected backend is a real isolation backend; `local/no_isolation` is blocked by default for plugin subprocess workers and should only be enabled for trusted local workers.
+- Plugin tool `processBoundary: "subprocess_required"` and `OPENCLAW_RUNTIME_PLUGIN_TRUST_DEFAULT=untrusted` are fail-closed controls for brokered tool execution; they do not make existing in-process plugin initialization safe.
 - Secrets should be referenced, not stored as plaintext in SQLite.
 
 Capabilities are the v0 policy primitive. They are intentionally simple: subject, resource, action, optional constraints, optional expiry. Denied sensitive checks are audit-logged.

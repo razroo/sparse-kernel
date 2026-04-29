@@ -2,6 +2,7 @@ import { normalizeToolName } from "../agents/tool-policy.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { applyTestPluginDefaults, normalizePluginsConfig } from "./config-state.js";
 import { resolveRuntimePluginRegistry, type PluginLoadOptions } from "./loader.js";
+import type { PluginOrigin } from "./plugin-origin.types.js";
 import {
   getActivePluginRegistry,
   getActivePluginRegistryKey,
@@ -11,33 +12,15 @@ import {
   buildPluginRuntimeLoadOptions,
   resolvePluginRuntimeLoadContext,
 } from "./runtime/load-context.js";
+import type { OpenClawPluginToolOptions } from "./tool-types.js";
 import type { OpenClawPluginToolContext } from "./types.js";
 
 export type PluginToolMeta = {
   pluginId: string;
   optional: boolean;
-  subprocess?: {
-    command: string;
-    args?: string[];
-    cwd?: string;
-    timeoutMs?: number;
-    sandbox?: {
-      trustZoneId?: string;
-      backend?:
-        | "local/no_isolation"
-        | "docker"
-        | "bwrap"
-        | "minijail"
-        | "ssh"
-        | "openshell"
-        | "vm"
-        | "other";
-      dockerImage?: string;
-      requireIsolated?: boolean;
-      maxRuntimeMs?: number;
-      maxBytesOut?: number;
-    };
-  };
+  origin?: PluginOrigin;
+  processBoundary?: OpenClawPluginToolOptions["processBoundary"];
+  subprocess?: OpenClawPluginToolOptions["subprocess"];
 };
 
 const pluginToolMeta = new WeakMap<AnyAgentTool, PluginToolMeta>();
@@ -245,6 +228,9 @@ export function resolvePluginTools(params: {
       pluginToolMeta.set(tool, {
         pluginId: entry.pluginId,
         optional: entry.optional,
+        origin: entry.origin,
+        ...(entry.processBoundary ? { processBoundary: entry.processBoundary } : {}),
+        ...(entry.subprocess ? { subprocess: entry.subprocess } : {}),
       });
       tools.push(tool);
     }

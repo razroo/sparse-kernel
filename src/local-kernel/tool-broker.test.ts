@@ -426,6 +426,74 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("fails closed when plugin tool metadata requires a subprocess boundary", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "plugin_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("plugin_tool");
+      setPluginToolMeta(rawTool, {
+        pluginId: "community-plugin",
+        optional: false,
+        processBoundary: "subprocess_required",
+      });
+      const broker = new CapabilityToolBroker(db);
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-plugin-boundary", {})).rejects.toThrow(
+        /out-of-process execution/,
+      );
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining(["plugin_tool.subprocess_required", "tool_call.failed"]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("can require subprocess boundaries for non-bundled plugin tools", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "plugin_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("plugin_tool");
+      setPluginToolMeta(rawTool, {
+        pluginId: "workspace-plugin",
+        optional: false,
+        origin: "workspace",
+      });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_RUNTIME_PLUGIN_TRUST_DEFAULT: "untrusted" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-untrusted-plugin", {})).rejects.toThrow(
+        /out-of-process execution/,
+      );
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining(["plugin_tool.subprocess_required", "tool_call.failed"]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it("auto-selects an available isolated backend for plugin subprocess workers", () => {
     expect(
       resolvePluginSandboxConfig({

@@ -118,6 +118,36 @@ export function requiresPluginSubprocess(raw: string | undefined): boolean {
   );
 }
 
+function requiresNonBundledPluginSubprocess(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "untrusted" || normalized === "non-bundled" || normalized === "non_bundled";
+}
+
+export function pluginToolRequiresSubprocess(
+  meta: PluginToolMeta | undefined,
+  env: NodeJS.ProcessEnv,
+): boolean {
+  if (!meta) {
+    return false;
+  }
+  if (
+    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
+    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS)
+  ) {
+    return true;
+  }
+  if (meta.processBoundary === "subprocess_required") {
+    return true;
+  }
+  if (meta.processBoundary === "in_process") {
+    return false;
+  }
+  return (
+    requiresNonBundledPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_TRUST_DEFAULT) &&
+    meta.origin !== "bundled"
+  );
+}
+
 export type PluginSubprocessPlan = NonNullable<PluginToolMeta["subprocess"]>;
 
 export type PluginSandboxConfig = {
@@ -345,12 +375,7 @@ export class CapabilityToolBroker {
         }
         const env = this.options.env ?? process.env;
         const pluginSubprocessPlan = resolvePluginSubprocessPlan(pluginMeta);
-        if (
-          pluginMeta &&
-          (requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
-            requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS)) &&
-          !pluginSubprocessPlan
-        ) {
+        if (pluginMeta && pluginToolRequiresSubprocess(pluginMeta, env) && !pluginSubprocessPlan) {
           const err = new Error(
             `Plugin tool ${tool.name} from ${pluginMeta.pluginId} requires out-of-process execution, but no subprocess worker is configured.`,
           );

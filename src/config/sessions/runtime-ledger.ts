@@ -16,6 +16,13 @@ function dateFromEpochMs(value: number | undefined): string | undefined {
     : undefined;
 }
 
+function dateFromTranscriptTimestamp(value: string | number | undefined): string | undefined {
+  if (typeof value === "string") {
+    return value;
+  }
+  return dateFromEpochMs(value);
+}
+
 function inferSessionStatus(entry: SessionEntry): string {
   if (entry.status === "running") {
     return "running";
@@ -174,6 +181,35 @@ export function appendTranscriptMessageToRuntimeLedger(params: {
   message: { role: string; timestamp?: number };
   env?: NodeJS.ProcessEnv;
 }): void {
+  appendTranscriptEntryToRuntimeLedger({
+    storePath: params.storePath,
+    sessionKey: params.sessionKey,
+    agentId: params.agentId,
+    entry: params.entry,
+    transcriptEntryId: params.messageId,
+    transcriptEntry: {
+      type: "message",
+      id: params.messageId,
+      message: params.message,
+    },
+    env: params.env,
+  });
+}
+
+export function appendTranscriptEntryToRuntimeLedger(params: {
+  storePath: string;
+  sessionKey: string;
+  agentId?: string;
+  entry: SessionEntry;
+  transcriptEntryId: string;
+  transcriptEntry: {
+    id?: string;
+    type?: string;
+    timestamp?: string;
+    message?: { role?: string; timestamp?: string | number };
+  };
+  env?: NodeJS.ProcessEnv;
+}): void {
   const env = params.env ?? process.env;
   const mode = resolveRuntimeSessionStoreMode(env);
   if (mode === "off") {
@@ -199,20 +235,19 @@ export function appendTranscriptMessageToRuntimeLedger(params: {
     });
     db.appendTranscriptEvent({
       sessionId: params.entry.sessionId,
-      role: params.message.role,
-      eventType: "message",
-      content: {
-        type: "message",
-        id: params.messageId,
-        message: params.message,
-      },
-      createdAt: dateFromEpochMs(params.message.timestamp),
+      role: params.transcriptEntry.message?.role ?? "system",
+      eventType: params.transcriptEntry.type ?? "entry",
+      content: params.transcriptEntry,
+      createdAt:
+        typeof params.transcriptEntry.timestamp === "string"
+          ? params.transcriptEntry.timestamp
+          : dateFromTranscriptTimestamp(params.transcriptEntry.message?.timestamp),
     });
   } catch (err) {
     if (mode === "sqlite" || mode === "sqlite-strict") {
       throw err;
     }
-    const warningKey = `${storePath}:${params.messageId}:${
+    const warningKey = `${storePath}:${params.transcriptEntryId}:${
       err instanceof Error ? err.message : String(err)
     }`;
     if (!warnedMirrorFailures.has(warningKey)) {

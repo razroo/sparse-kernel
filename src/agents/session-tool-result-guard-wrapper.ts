@@ -1,5 +1,12 @@
+import path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { SessionManager } from "@mariozechner/pi-coding-agent";
+import {
+  appendTranscriptEntryToRuntimeLedger,
+  isRuntimeSessionStorePrimary,
+} from "../config/sessions/runtime-ledger.js";
+import { loadSessionStore, normalizeStoreSessionKey } from "../config/sessions/store.js";
+import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { redactSensitiveText } from "../logging/redact.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
@@ -16,6 +23,8 @@ export type GuardedSessionManager = SessionManager & {
   /** Clear pending tool calls without persisting synthetic tool results. Idempotent. */
   clearPendingToolResults?: () => void;
 };
+
+type SessionManagerEntry = NonNullable<ReturnType<SessionManager["getEntry"]>>;
 
 function redactTranscriptText(value: string, cfg?: OpenClawConfig): string {
   if (cfg?.logging?.redactSensitive === "off") {
@@ -171,7 +180,97 @@ export function guardSessionManager(
           })
         : undefined,
   });
+  installRuntimeLedgerAppendBridge(sessionManager as GuardedSessionManager, opts);
   (sessionManager as GuardedSessionManager).flushPendingToolResults = guard.flushPendingToolResults;
   (sessionManager as GuardedSessionManager).clearPendingToolResults = guard.clearPendingToolResults;
   return sessionManager as GuardedSessionManager;
+}
+
+function installRuntimeLedgerAppendBridge(
+  sessionManager: GuardedSessionManager,
+  opts:
+    | {
+        agentId?: string;
+        sessionKey?: string;
+      }
+    | undefined,
+): void {
+  const wrapped = sessionManager as GuardedSessionManager & {
+    __openclawRuntimeLedgerAppendBridge?: boolean;
+  };
+  if (wrapped.__openclawRuntimeLedgerAppendBridge) {
+    return;
+  }
+  wrapped.__openclawRuntimeLedgerAppendBridge = true;
+  const target = sessionManager as unknown as Record<string, unknown>;
+  for (const name of [
+    "appendMessage",
+    "appendThinkingLevelChange",
+    "appendModelChange",
+    "appendCompaction",
+    "appendCustomEntry",
+    "appendSessionInfo",
+    "appendCustomMessageEntry",
+    "appendLabelChange",
+    "branchWithSummary",
+  ]) {
+    const original = target[name];
+    if (typeof original !== "function") {
+      continue;
+    }
+    target[name] = (...args: unknown[]) => {
+      const entryId = original.apply(sessionManager, args) as unknown;
+      if (typeof entryId === "string") {
+        mirrorRuntimeLedgerAppend(sessionManager, opts, entryId);
+      }
+      return entryId;
+    };
+  }
+}
+
+function mirrorRuntimeLedgerAppend(
+  sessionManager: GuardedSessionManager,
+  opts:
+    | {
+        agentId?: string;
+        sessionKey?: string;
+      }
+    | undefined,
+  entryId: string,
+): void {
+  const sessionKey = opts?.sessionKey?.trim();
+  if (!sessionKey) {
+    return;
+  }
+  const sessionFile = sessionManager.getSessionFile();
+  if (!sessionFile) {
+    return;
+  }
+  const storePath = path.join(path.dirname(sessionFile), "sessions.json");
+  const store = loadSessionStore(storePath, { skipCache: true });
+  const normalizedKey = normalizeStoreSessionKey(sessionKey);
+  const sessionEntry = (store[normalizedKey] ?? store[sessionKey]) as SessionEntry | undefined;
+  if (!sessionEntry?.sessionId) {
+    if (isRuntimeSessionStorePrimary()) {
+      throw new Error(
+        `SparseKernel transcript ledger append failed: unknown sessionKey ${sessionKey}`,
+      );
+    }
+    return;
+  }
+  const transcriptEntry = sessionManager.getEntry(entryId) as SessionManagerEntry | null;
+  if (!transcriptEntry) {
+    if (isRuntimeSessionStorePrimary()) {
+      throw new Error(`SparseKernel transcript ledger append failed: missing entry ${entryId}`);
+    }
+    return;
+  }
+  appendTranscriptEntryToRuntimeLedger({
+    storePath,
+    sessionKey,
+    agentId: opts?.agentId,
+    entry: sessionEntry,
+    transcriptEntryId: entryId,
+    transcriptEntry,
+  });
 }

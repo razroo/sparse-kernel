@@ -1,6 +1,11 @@
 import { createServer, request as httpRequest, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { LocalKernelDatabase } from "./database.js";
+import {
+  ensureSupervisedEgressProxy,
+  listSupervisedEgressProxies,
+  stopSupervisedEgressProxy,
+} from "./egress-proxy-supervisor.js";
 import { startLoopbackEgressProxy } from "./egress-proxy.js";
 
 const servers: Server[] = [];
@@ -65,6 +70,28 @@ describe("SparseKernel loopback egress proxy", () => {
       );
     } finally {
       await proxy.close();
+      db.close();
+    }
+  });
+
+  it("supervises proxies and attaches proxy_ref to the trust zone", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      const proxy = await ensureSupervisedEgressProxy({
+        db,
+        trustZoneId: "public_web",
+      });
+      expect(proxy.proxyRef).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
+      expect(db.getNetworkPolicyForTrustZone("public_web")?.proxyRef).toBe(proxy.proxyRef);
+      expect(listSupervisedEgressProxies()).toEqual(
+        expect.arrayContaining([expect.objectContaining({ trustZoneId: "public_web" })]),
+      );
+      await expect(
+        stopSupervisedEgressProxy({ db, trustZoneId: "public_web", clearProxyRef: true }),
+      ).resolves.toBe(true);
+      expect(db.getNetworkPolicyForTrustZone("public_web")?.proxyRef).toBeUndefined();
+    } finally {
+      await stopSupervisedEgressProxy({ db, trustZoneId: "public_web" }).catch(() => false);
       db.close();
     }
   });

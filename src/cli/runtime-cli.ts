@@ -9,10 +9,14 @@ import {
   runtimeBudgetSetCommand,
   runtimeDoctorCommand,
   runtimeEgressProxyCommand,
+  runtimeEgressProxyListCommand,
+  runtimeEgressProxyStopCommand,
   runtimeInspectCommand,
   runtimeLeasesCommand,
   runtimeMaintainCommand,
   runtimeMigrateCommand,
+  runtimeNetworkProxySetCommand,
+  runtimeNetworkProxyShowCommand,
   runtimePruneCommand,
   runtimeRecoverCommand,
   runtimeSessionsCommand,
@@ -81,6 +85,10 @@ export function registerRuntimeCli(program: Command) {
             "Start a loopback policy-enforcing egress proxy.",
           ],
           [
+            "openclaw runtime network-proxy set --trust-zone public_web --proxy-ref http://127.0.0.1:8888/",
+            "Attach a loopback proxy reference to a trust-zone network policy.",
+          ],
+          [
             "openclaw runtime maintain --run-due --schedule-every 1h",
             "Run scheduled runtime maintenance when due.",
           ],
@@ -130,6 +138,8 @@ export function registerRuntimeCli(program: Command) {
     .option("--trust-zone <id>", "Trust zone id", "public_web")
     .option("--host <host>", "Loopback bind host", "127.0.0.1")
     .option("--port <port>", "Bind port (0 chooses a free port)", "0")
+    .option("--attach", "Attach the started proxy_ref to the trust zone", false)
+    .option("--supervised", "Start through the in-process SparseKernel proxy supervisor", false)
     .option("--json", "Output JSON startup payload", false)
     .action(
       createRunner((opts) =>
@@ -138,6 +148,99 @@ export function registerRuntimeCli(program: Command) {
             trustZone: opts.trustZone as string | undefined,
             host: opts.host as string | undefined,
             port: opts.port as string | undefined,
+            attach: Boolean(opts.attach),
+            supervised: Boolean(opts.supervised),
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  const egressProxies = runtime
+    .command("egress-proxies")
+    .description("Inspect or stop supervised SparseKernel egress proxies");
+
+  egressProxies
+    .command("list")
+    .description("List supervised egress proxies in this process")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeEgressProxyListCommand({ json: Boolean(opts.json) }, defaultRuntime),
+      ),
+    );
+
+  egressProxies
+    .command("stop")
+    .description("Stop a supervised egress proxy in this process")
+    .option("--trust-zone <id>", "Trust zone id", "public_web")
+    .option("--clear", "Clear trust-zone proxy_ref after stopping", false)
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeEgressProxyStopCommand(
+          {
+            trustZone: opts.trustZone as string | undefined,
+            clear: Boolean(opts.clear),
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  const networkProxy = runtime
+    .command("network-proxy")
+    .description("Attach or inspect trust-zone network proxy references");
+
+  networkProxy
+    .command("set")
+    .description("Attach proxy_ref to a trust-zone network policy")
+    .option("--trust-zone <id>", "Trust zone id", "public_web")
+    .requiredOption("--proxy-ref <url>", "Loopback proxy URL")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeNetworkProxySetCommand(
+          {
+            trustZone: opts.trustZone as string | undefined,
+            proxyRef: opts.proxyRef as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  networkProxy
+    .command("clear")
+    .description("Clear proxy_ref from a trust-zone network policy")
+    .option("--trust-zone <id>", "Trust zone id", "public_web")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeNetworkProxySetCommand(
+          {
+            trustZone: opts.trustZone as string | undefined,
+            clear: true,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  networkProxy
+    .command("show")
+    .description("Show a trust-zone network proxy reference")
+    .option("--trust-zone <id>", "Trust zone id", "public_web")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeNetworkProxyShowCommand(
+          {
+            trustZone: opts.trustZone as string | undefined,
             json: Boolean(opts.json),
           },
           defaultRuntime,

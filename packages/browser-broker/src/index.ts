@@ -105,6 +105,7 @@ export type CaptureScreenshotArtifactInput = {
 export type CaptureDownloadArtifactInput = {
   url: string;
   mime_type?: string;
+  filename?: string;
   retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
   subject?: SparseKernelArtifactSubject;
   timeout_ms?: number;
@@ -251,6 +252,8 @@ export type SparseKernelBrowserActRequest =
       stopOnError?: boolean;
     }
   | { kind: "reload"; targetId?: string; timeoutMs?: number }
+  | { kind: "goBack"; targetId?: string; timeoutMs?: number }
+  | { kind: "goForward"; targetId?: string; timeoutMs?: number }
   | { kind: "close"; targetId?: string };
 
 export type SparseKernelBrowserFormField = {
@@ -551,19 +554,30 @@ export class SparseKernelCdpBrowserBroker {
       subject: input.subject,
     });
     const sourceUrl = readString(complete.params.url) ?? input.url;
+    const filename =
+      input.filename ??
+      readString(beginEvent.params.suggestedFilename) ??
+      sanitizeDownloadName(input.url);
+    const totalBytes = readNumber(complete.params.totalBytes);
+    const receivedBytes = readNumber(complete.params.receivedBytes);
     this.recordObservation(context, context.target_id, "browser_artifact.created", {
       artifactId: artifact.id,
       artifactType: "download",
       sha256: artifact.sha256,
       sourceUrl,
-      filename: readString(beginEvent.params.suggestedFilename),
+      filename,
+      guid,
+      ...(totalBytes !== undefined ? { totalBytes } : {}),
+      ...(receivedBytes !== undefined ? { receivedBytes } : {}),
+      sizeBytes: artifact.size_bytes,
+      mimeType: artifact.mime_type,
     });
     return {
       context_id: contextId,
       target_id: context.target_id,
       artifact,
       artifact_type: "download",
-      filename: readString(beginEvent.params.suggestedFilename),
+      filename,
       source_url: sourceUrl,
     };
   }
@@ -1041,6 +1055,11 @@ export class SparseKernelCdpBrowserBroker {
         await this.reloadContext(context, request.timeoutMs);
         return { ok: true, targetId: context.target_id, kind: request.kind };
       }
+      case "goBack":
+      case "goForward": {
+        await this.navigateHistory(context, request.kind === "goBack" ? -1 : 1, request.timeoutMs);
+        return { ok: true, targetId: context.target_id, kind: request.kind };
+      }
       case "batch": {
         const results: Array<{ ok: boolean; kind: string; error?: string }> = [];
         for (const action of request.actions.slice(0, 100)) {
@@ -1252,6 +1271,48 @@ export class SparseKernelCdpBrowserBroker {
     await context.connection.command("Page.reload", {}, context.page_session_id, timeoutMs);
     await load.catch(() => {});
     const tab = await this.describeContextTab(context);
+    this.recordTarget(context, context.target_id, {
+      url: tab.url,
+      title: tab.title,
+      status: "active",
+    });
+  }
+
+  private async navigateHistory(
+    context: LiveBrowserContext,
+    delta: -1 | 1,
+    timeoutMs = 10_000,
+  ): Promise<void> {
+    const history = await context.connection.command<{
+      currentIndex: number;
+      entries: Array<{ id: number; url?: string }>;
+    }>("Page.getNavigationHistory", {}, context.page_session_id, timeoutMs);
+    const nextIndex = history.currentIndex + delta;
+    const entry = history.entries[nextIndex];
+    if (!entry) {
+      throw new Error(
+        delta < 0 ? "No previous browser history entry." : "No next browser history entry.",
+      );
+    }
+    if (entry.url) {
+      assertUrlAllowedByOrigins(entry.url, context.allowed_origins, "history navigation");
+    }
+    const load = context.connection.waitForEvent(
+      "Page.loadEventFired",
+      (event) => event.sessionId === context.page_session_id,
+      timeoutMs,
+    );
+    await context.connection.command(
+      "Page.navigateToHistoryEntry",
+      { entryId: entry.id },
+      context.page_session_id,
+      timeoutMs,
+    );
+    await load.catch(() => {});
+    const tab = await this.describeContextTab(context);
+    if (tab.url) {
+      assertUrlAllowedByOrigins(tab.url, context.allowed_origins, "history navigation");
+    }
     this.recordTarget(context, context.target_id, {
       url: tab.url,
       title: tab.title,
@@ -2250,6 +2311,23 @@ function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function sanitizeDownloadName(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const last = parsed.pathname.split("/").filter(Boolean).pop();
+    if (last) {
+      return last.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128) || "download.bin";
+    }
+  } catch {
+    // Fall through to a generic artifact name.
+  }
+  return "download.bin";
+}
+
 function requiredString(value: unknown, field: string): string {
   const text = readString(value);
   if (!text) {
@@ -2767,14 +2845,20 @@ function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kin
   };
   const isVisible = (node) => {
     if (!node?.isConnected) return false;
+    if (node.closest?.("[hidden],[aria-hidden='true'],[inert]")) return false;
     const style = getComputedStyle(node);
-    if (style.visibility === "hidden" || style.display === "none" || style.pointerEvents === "none") return false;
+    if (style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) return false;
     const rect = rectSnapshot(node);
     return rect.width > 0 && rect.height > 0 && node.getClientRects().length > 0;
   };
   const isEnabled = (node) => {
     if (node.disabled === true) return false;
     if (node.getAttribute?.("aria-disabled") === "true") return false;
+    const disabledFieldset = node.closest?.("fieldset[disabled]");
+    if (disabledFieldset) {
+      const firstLegend = disabledFieldset.querySelector("legend");
+      if (!firstLegend || !firstLegend.contains(node)) return false;
+    }
     return true;
   };
   const isEditable = (node) => {
@@ -2787,11 +2871,13 @@ function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kin
     return false;
   };
   const receivesCenterHit = (node) => {
+    if (getComputedStyle(node).pointerEvents === "none") return false;
     const rect = node.getBoundingClientRect();
     const x = Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(window.innerWidth - 1, 0));
     const y = Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(window.innerHeight - 1, 0));
     const hit = document.elementFromPoint(x, y);
-    return !hit || hit === node || node.contains(hit);
+    if (!hit) return false;
+    return hit === node || node.contains(hit) || hit.closest?.("label")?.contains(node);
   };
   const isStable = async (node) => {
     const first = rectSnapshot(node);

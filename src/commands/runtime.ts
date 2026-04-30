@@ -14,9 +14,13 @@ import {
   inspectSparseKernelRuntime,
   inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
+  ensureSupervisedEgressProxy,
+  listSupervisedEgressProxies,
   openLocalKernelDatabase,
   recoverEmbeddedRunTasks,
+  resolveNetworkPolicyProxyRef,
   startLoopbackEgressProxy,
+  stopSupervisedEgressProxy,
   sweepNativeBrowserProcesses,
 } from "../local-kernel/index.js";
 import type { RuntimeRetentionPolicy } from "../local-kernel/index.js";
@@ -106,7 +110,14 @@ export async function runtimeDoctorCommand(
 }
 
 export async function runtimeEgressProxyCommand(
-  opts: { trustZone?: string; host?: string; port?: string; json?: boolean },
+  opts: {
+    trustZone?: string;
+    host?: string;
+    port?: string;
+    attach?: boolean;
+    supervised?: boolean;
+    json?: boolean;
+  },
   runtime: RuntimeEnv,
 ): Promise<void> {
   const trustZoneId = opts.trustZone?.trim() || "public_web";
@@ -119,6 +130,20 @@ export async function runtimeEgressProxyCommand(
   const db = openLocalKernelDatabase();
   let proxy: Awaited<ReturnType<typeof startLoopbackEgressProxy>> | undefined;
   try {
+    if (opts.supervised) {
+      const record = await ensureSupervisedEgressProxy({
+        db,
+        trustZoneId,
+        host: opts.host,
+        port,
+      });
+      if (opts.json) {
+        writeRuntimeJson(runtime, { ok: true, supervised: true, proxy: record });
+      } else {
+        runtime.log(`SparseKernel supervised egress proxy for ${trustZoneId}: ${record.proxyRef}`);
+      }
+      return;
+    }
     proxy = await startLoopbackEgressProxy({
       db,
       trustZoneId,
@@ -133,10 +158,25 @@ export async function runtimeEgressProxyCommand(
       objectId: trustZoneId,
       payload: { url: proxy.url },
     });
+    if (opts.attach) {
+      db.attachNetworkPolicyProxyToTrustZone({
+        trustZoneId,
+        proxyRef: proxy.url,
+        actor: { type: "operator" },
+      });
+    }
     if (opts.json) {
-      writeRuntimeJson(runtime, { ok: true, trustZoneId, proxyUrl: proxy.url });
+      writeRuntimeJson(runtime, {
+        ok: true,
+        trustZoneId,
+        proxyUrl: proxy.url,
+        attached: opts.attach === true,
+      });
     } else {
       runtime.log(`SparseKernel egress proxy listening for ${trustZoneId}: ${proxy.url}`);
+      if (opts.attach) {
+        runtime.log(`Attached proxy_ref to trust zone ${trustZoneId}.`);
+      }
     }
     await new Promise<void>((resolve) => {
       const stop = () => {
@@ -157,6 +197,120 @@ export async function runtimeEgressProxyCommand(
         objectId: trustZoneId,
       });
     }
+    db.close();
+  }
+}
+
+export async function runtimeEgressProxyListCommand(
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const proxies = listSupervisedEgressProxies();
+  if (opts.json) {
+    writeRuntimeJson(runtime, { proxies });
+    return;
+  }
+  if (proxies.length === 0) {
+    runtime.log("No supervised SparseKernel egress proxies are running in this process.");
+    return;
+  }
+  for (const proxy of proxies) {
+    runtime.log(`${proxy.trustZoneId} proxy=${proxy.proxyRef} started=${proxy.startedAt}`);
+  }
+}
+
+export async function runtimeEgressProxyStopCommand(
+  opts: { trustZone?: string; clear?: boolean; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const trustZoneId = opts.trustZone?.trim() || "public_web";
+  const db = openLocalKernelDatabase();
+  try {
+    const stopped = await stopSupervisedEgressProxy({
+      db,
+      trustZoneId,
+      clearProxyRef: opts.clear,
+    });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ok: true, trustZoneId, stopped });
+      return;
+    }
+    runtime.log(
+      stopped
+        ? `Stopped supervised SparseKernel egress proxy for ${trustZoneId}.`
+        : `No supervised SparseKernel egress proxy was running for ${trustZoneId}.`,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeNetworkProxySetCommand(
+  opts: { trustZone?: string; proxyRef?: string; clear?: boolean; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const trustZoneId = opts.trustZone?.trim() || "public_web";
+  const rawProxyRef = opts.clear ? null : opts.proxyRef?.trim();
+  if (!opts.clear) {
+    const decision = resolveNetworkPolicyProxyRef(rawProxyRef ?? undefined);
+    if (!decision.ok) {
+      runtime.error(`Invalid --proxy-ref: ${decision.reason}`);
+      runtime.exit(1);
+      return;
+    }
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    let result;
+    try {
+      result = db.attachNetworkPolicyProxyToTrustZone({
+        trustZoneId,
+        proxyRef: rawProxyRef,
+        actor: { type: "operator" },
+      });
+    } catch (err) {
+      runtime.error(formatErrorMessage(err));
+      runtime.exit(1);
+      return;
+    }
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ok: true, ...result });
+      return;
+    }
+    runtime.log(
+      rawProxyRef
+        ? `Attached proxy_ref to trust zone ${trustZoneId}: ${rawProxyRef}`
+        : `Cleared proxy_ref for trust zone ${trustZoneId}.`,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeNetworkProxyShowCommand(
+  opts: { trustZone?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const trustZoneId = opts.trustZone?.trim() || "public_web";
+  const db = openLocalKernelDatabase();
+  try {
+    const trustZone = db.getTrustZone(trustZoneId);
+    const networkPolicy = db.getNetworkPolicyForTrustZone(trustZoneId);
+    if (opts.json) {
+      writeRuntimeJson(runtime, { trustZone, networkPolicy });
+      return;
+    }
+    if (!trustZone) {
+      runtime.error(`Unknown trust zone: ${trustZoneId}`);
+      runtime.exit(1);
+      return;
+    }
+    runtime.log(
+      `${trustZoneId} networkPolicy=${trustZone.networkPolicyId ?? "-"} proxy_ref=${
+        networkPolicy?.proxyRef ?? "-"
+      }`,
+    );
+  } finally {
     db.close();
   }
 }

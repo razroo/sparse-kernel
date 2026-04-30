@@ -869,6 +869,35 @@ describe("local runtime kernel database", () => {
     }
   });
 
+  it("attaches loopback proxy refs to trust-zone network policies", () => {
+    const root = tempRoot();
+    const db = openTempDb(root);
+    try {
+      const attached = db.attachNetworkPolicyProxyToTrustZone({
+        trustZoneId: "public_web",
+        proxyRef: "http://127.0.0.1:18080/",
+      });
+      expect(attached.networkPolicy.proxyRef).toBe("http://127.0.0.1:18080/");
+      expect(db.getNetworkPolicyForTrustZone("public_web")?.proxyRef).toBe(
+        "http://127.0.0.1:18080/",
+      );
+      db.attachNetworkPolicyProxyToTrustZone({
+        trustZoneId: "public_web",
+        proxyRef: null,
+      });
+      expect(db.getNetworkPolicyForTrustZone("public_web")?.proxyRef).toBeUndefined();
+      const audit = db.listAudit({ limit: 10 }).map((entry) => entry.action);
+      expect(audit).toEqual(
+        expect.arrayContaining([
+          "network_policy.proxy_ref_attached",
+          "network_policy.proxy_ref_cleared",
+        ]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it("builds scoped linux firewall plans from IP allowlists and loopback proxies", () => {
     const plan = buildBuiltinFirewallEgressPlan({
       allocationId: "sandbox_test",
@@ -1347,12 +1376,27 @@ describe("local runtime kernel database", () => {
       backend: "bwrap",
       command: "node",
       args: ["-v"],
+      cwd: "/work",
       env: { EXPLICIT_WORKER_ENV: "ok" },
+      isolationProfile: "readonly_workspace",
       resolveCommand: () => "bwrap",
     });
     expect(bwrapPlan.args).toEqual(
       expect.arrayContaining(["--clearenv", "--setenv", "EXPLICIT_WORKER_ENV", "ok"]),
     );
+    expect(bwrapPlan.args).toEqual(expect.arrayContaining(["--tmpfs", "/home"]));
+    expect(bwrapPlan.args).toEqual(expect.arrayContaining(["--ro-bind", "/work", "/work"]));
+    expect(bwrapPlan.isolation).toContain("profile=readonly_workspace");
+
+    const minijailPlan = buildSandboxSpawnPlan({
+      backend: "minijail",
+      command: "node",
+      args: ["-v"],
+      isolationProfile: "plugin_untrusted",
+      resolveCommand: () => "minijail0",
+    });
+    expect(minijailPlan.args.slice(0, 2)).toEqual(["-p", "-v"]);
+    expect(minijailPlan.isolation).toContain("profile=plugin_untrusted");
 
     expect(() =>
       buildSandboxSpawnPlan({

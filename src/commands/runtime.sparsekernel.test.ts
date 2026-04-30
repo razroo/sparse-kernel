@@ -12,6 +12,8 @@ import {
   runtimeDoctorCommand,
   runtimeLeasesCommand,
   runtimeMaintainCommand,
+  runtimeNetworkProxySetCommand,
+  runtimeNetworkProxyShowCommand,
   runtimeRecoverCommand,
   runtimeSessionsCommand,
   runtimeTasksCommand,
@@ -274,6 +276,55 @@ describe("SparseKernel runtime commands", () => {
       }),
       2,
     );
+  });
+
+  it("attaches and shows trust-zone network proxy refs", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const setRuntime = makeRuntime();
+      await runtimeNetworkProxySetCommand(
+        {
+          trustZone: "public_web",
+          proxyRef: "http://127.0.0.1:18080/",
+          json: true,
+        },
+        setRuntime,
+      );
+      expect(setRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ok: true,
+          networkPolicy: expect.objectContaining({
+            proxyRef: "http://127.0.0.1:18080/",
+          }),
+        }),
+        2,
+      );
+
+      const showRuntime = makeRuntime();
+      await runtimeNetworkProxyShowCommand({ trustZone: "public_web", json: true }, showRuntime);
+      expect(showRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          networkPolicy: expect.objectContaining({
+            proxyRef: "http://127.0.0.1:18080/",
+          }),
+        }),
+        2,
+      );
+
+      const clearRuntime = makeRuntime();
+      await runtimeNetworkProxySetCommand(
+        {
+          trustZone: "public_web",
+          clear: true,
+          json: true,
+        },
+        clearRuntime,
+      );
+      const clearPayload = vi.mocked(clearRuntime.writeJson).mock.calls[0]?.[0] as {
+        networkPolicy?: { proxyRef?: string };
+      };
+      expect(clearPayload.networkPolicy?.proxyRef).toBeUndefined();
+    });
   });
 
   it("reports runtime doctor checks and acceptance lanes", async () => {

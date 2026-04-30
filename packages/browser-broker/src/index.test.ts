@@ -118,6 +118,8 @@ class FakeCdpTransport implements CdpTransport {
   private currentUrl = "about:blank";
   private readonly targetUrls = new Map<string, string>();
   private readonly sessionTargets = new Map<string, string>();
+  private historyEntries: Array<{ id: number; url: string }> = [{ id: 1, url: "about:blank" }];
+  private historyIndex = 0;
   private nextActionNavigationUrl: string | undefined;
   private nextActionNewTarget: { targetId: string; url: string } | undefined;
 
@@ -168,6 +170,27 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { frameId: "frame-1" });
         this.handleNavigate(String(message.params?.url ?? ""), message.sessionId);
         break;
+      case "Page.getNavigationHistory":
+        this.respond(message.id, {
+          currentIndex: this.historyIndex,
+          entries: this.historyEntries,
+        });
+        break;
+      case "Page.navigateToHistoryEntry": {
+        const entryId = Number(message.params?.entryId);
+        const index = this.historyEntries.findIndex((entry) => entry.id === entryId);
+        if (index < 0) {
+          this.respondError(message.id, "history entry not found");
+          break;
+        }
+        this.historyIndex = index;
+        this.respond(message.id, {});
+        this.emitFrameNavigation(
+          this.historyEntries[index]?.url ?? "about:blank",
+          message.sessionId,
+        );
+        break;
+      }
       case "Page.reload":
         this.respond(message.id, {});
         setTimeout(() => {
@@ -377,6 +400,11 @@ class FakeCdpTransport implements CdpTransport {
 
   private handleNavigate(url: string, sessionId = "session-1"): void {
     this.currentUrl = url;
+    this.historyEntries = [
+      ...this.historyEntries.slice(0, this.historyIndex + 1),
+      { id: this.historyEntries.length + 1, url },
+    ];
+    this.historyIndex = this.historyEntries.length - 1;
     const targetId = this.sessionTargets.get(sessionId) ?? "target-1";
     this.targetUrls.set(targetId, url);
     if (url.endsWith("/download")) {
@@ -402,6 +430,8 @@ class FakeCdpTransport implements CdpTransport {
                 guid: "download-guid",
                 state: "completed",
                 url,
+                receivedBytes: 13,
+                totalBytes: 13,
               },
             });
           });
@@ -624,6 +654,20 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       mime_type: "text/plain",
       retention_policy: "durable",
     });
+    expect(kernel.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          observation_type: "browser_artifact.created",
+          payload: expect.objectContaining({
+            artifactType: "download",
+            filename: "report.txt",
+            guid: "download-guid",
+            totalBytes: 13,
+            receivedBytes: 13,
+          }),
+        }),
+      ]),
+    );
   });
 
   it("stores printed PDFs as SparseKernel artifacts", async () => {
@@ -863,10 +907,15 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
     const reloaded = await broker.actContext(context.ledger_context.id, {
       kind: "reload",
     });
+    await broker.navigateContext(context.ledger_context.id, { url: "https://example.com/next" });
+    const back = await broker.actContext(context.ledger_context.id, { kind: "goBack" });
+    const forward = await broker.actContext(context.ledger_context.id, { kind: "goForward" });
 
     expect(clicked).toMatchObject({ ok: true, targetId: "target-1", kind: "click" });
     expect(pressed).toMatchObject({ ok: true, targetId: "target-1", kind: "press" });
     expect(reloaded).toMatchObject({ ok: true, targetId: "target-1", kind: "reload" });
+    expect(back).toMatchObject({ ok: true, targetId: "target-1", kind: "goBack" });
+    expect(forward).toMatchObject({ ok: true, targetId: "target-1", kind: "goForward" });
     expect(transport.sent).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -881,6 +930,8 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
           }),
         }),
         expect.objectContaining({ method: "Page.reload" }),
+        expect.objectContaining({ method: "Page.getNavigationHistory" }),
+        expect.objectContaining({ method: "Page.navigateToHistoryEntry" }),
       ]),
     );
   });

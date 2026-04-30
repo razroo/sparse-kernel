@@ -11,10 +11,13 @@ use sparsekernel_core::{
     SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
     SPARSEKERNEL_PROTOCOL_VERSION,
 };
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::net::ToSocketAddrs;
+use std::net::{TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::time::Duration;
 use std::{env, io};
 use tiny_http::{Header, Response, Server};
 
@@ -193,15 +196,22 @@ pub fn run_daemon(listen: &str) -> Result<(), Box<dyn Error>> {
     let server = Server::http(addr)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
     eprintln!("sparsekerneld listening on http://{addr}");
+    let mut daemon_state = DaemonState::default();
     for mut request in server.incoming_requests() {
         let mut body = Vec::new();
         request.as_reader().read_to_end(&mut body)?;
         let mut db = SparseKernelDb::open_default()?;
-        let response =
-            match handle_api_request(&mut db, request.method().as_str(), request.url(), &body) {
-                Ok(reply) => json_response_with_status(&reply.body, reply.status_code)?,
-                Err(err) => json_response_with_status(&json!({ "error": err.to_string() }), 400)?,
-            };
+        let response = match handle_api_request_with_daemon_state(
+            &mut db,
+            request.method().as_str(),
+            request.url(),
+            &body,
+            None,
+            &mut daemon_state,
+        ) {
+            Ok(reply) => json_response_with_status(&reply.body, reply.status_code)?,
+            Err(err) => json_response_with_status(&json!({ "error": err.to_string() }), 400)?,
+        };
         request.respond(response)?;
     }
     Ok(())
@@ -211,6 +221,18 @@ pub fn run_daemon(listen: &str) -> Result<(), Box<dyn Error>> {
 pub struct ApiReply {
     pub status_code: u16,
     pub body: Value,
+}
+
+#[derive(Default)]
+pub struct DaemonState {
+    egress_proxies: HashMap<String, SupervisedEgressProxyProcess>,
+}
+
+struct SupervisedEgressProxyProcess {
+    trust_zone_id: String,
+    proxy_ref: String,
+    pid: u32,
+    child: Child,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +362,32 @@ struct ListTranscriptEventsRequest {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TrustZoneNetworkPolicyRequest {
+    trust_zone_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachTrustZoneProxyRequest {
+    trust_zone_id: String,
+    proxy_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartEgressProxyRequest {
+    trust_zone_id: String,
+    host: Option<String>,
+    port: Option<u16>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StopEgressProxyRequest {
+    trust_zone_id: String,
+    clear_proxy_ref: Option<bool>,
+}
+
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Box<dyn Error>> {
     if body.is_empty() {
         return Err("request body is required".into());
@@ -353,7 +401,8 @@ pub fn handle_api_request(
     url: &str,
     body: &[u8],
 ) -> Result<ApiReply, Box<dyn Error>> {
-    handle_api_request_with_artifact_root(db, method, url, body, None)
+    let mut daemon_state = DaemonState::default();
+    handle_api_request_with_daemon_state(db, method, url, body, None, &mut daemon_state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,12 +595,187 @@ fn require_artifact_capability(
     .into())
 }
 
+fn normalize_proxy_host(host: Option<String>) -> Result<String, Box<dyn Error>> {
+    let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+    match host.as_str() {
+        "127.0.0.1" | "localhost" | "::1" => Ok(host),
+        _ => Err("egress proxy supervisor only binds loopback hosts".into()),
+    }
+}
+
+fn allocate_proxy_port(host: &str, port: Option<u16>) -> Result<u16, Box<dyn Error>> {
+    if let Some(port) = port {
+        return Ok(port);
+    }
+    let listener = TcpListener::bind((host, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn default_proxy_command_args(trust_zone_id: &str, host: &str, port: u16) -> Vec<String> {
+    vec![
+        "runtime".to_string(),
+        "egress-proxy".to_string(),
+        "--trust-zone".to_string(),
+        trust_zone_id.to_string(),
+        "--host".to_string(),
+        host.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--attach".to_string(),
+        "--json".to_string(),
+    ]
+}
+
+fn proxy_command_args(input: &StartEgressProxyRequest, host: &str, port: u16) -> Vec<String> {
+    input
+        .args
+        .clone()
+        .unwrap_or_else(|| default_proxy_command_args(&input.trust_zone_id, host, port))
+        .into_iter()
+        .map(|arg| {
+            arg.replace("{trust_zone}", &input.trust_zone_id)
+                .replace("{host}", host)
+                .replace("{port}", &port.to_string())
+        })
+        .collect()
+}
+
+fn start_supervised_egress_proxy(
+    db: &mut SparseKernelDb,
+    daemon_state: &mut DaemonState,
+    input: StartEgressProxyRequest,
+) -> Result<Value, Box<dyn Error>> {
+    prune_exited_egress_proxies(daemon_state);
+    if let Some(existing) = daemon_state.egress_proxies.get(&input.trust_zone_id) {
+        return Ok(json!({
+            "trust_zone_id": existing.trust_zone_id,
+            "proxy_ref": existing.proxy_ref,
+            "pid": existing.pid,
+            "already_running": true,
+        }));
+    }
+    let host = normalize_proxy_host(input.host.clone())?;
+    let port = allocate_proxy_port(&host, input.port)?;
+    let proxy_ref = format!("http://{host}:{port}/");
+    let command = input
+        .command
+        .clone()
+        .or_else(|| env::var("SPARSEKERNEL_EGRESS_PROXY_COMMAND").ok())
+        .unwrap_or_else(|| "openclaw".to_string());
+    let args = proxy_command_args(&input, &host, port);
+    let mut child = ProcessCommand::new(&command)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = child.id();
+    std::thread::sleep(Duration::from_millis(100));
+    if let Some(status) = child.try_wait()? {
+        return Err(format!("egress proxy command exited during startup: {status}").into());
+    }
+    db.attach_network_policy_proxy_to_trust_zone(&input.trust_zone_id, Some(proxy_ref.clone()))?;
+    db.record_audit(AuditInput {
+        actor_type: Some("runtime".to_string()),
+        actor_id: None,
+        action: "egress_proxy.daemon_supervised_started".to_string(),
+        object_type: Some("trust_zone".to_string()),
+        object_id: Some(input.trust_zone_id.clone()),
+        payload: Some(json!({
+            "proxyRef": proxy_ref,
+            "pid": pid,
+            "command": command,
+            "args": args,
+        })),
+    })?;
+    daemon_state.egress_proxies.insert(
+        input.trust_zone_id.clone(),
+        SupervisedEgressProxyProcess {
+            trust_zone_id: input.trust_zone_id.clone(),
+            proxy_ref: proxy_ref.clone(),
+            pid,
+            child,
+        },
+    );
+    Ok(json!({
+        "trust_zone_id": input.trust_zone_id,
+        "proxy_ref": proxy_ref,
+        "pid": pid,
+        "already_running": false,
+    }))
+}
+
+fn stop_supervised_egress_proxy(
+    db: &mut SparseKernelDb,
+    daemon_state: &mut DaemonState,
+    input: StopEgressProxyRequest,
+) -> Result<Value, Box<dyn Error>> {
+    let Some(mut process) = daemon_state.egress_proxies.remove(&input.trust_zone_id) else {
+        return Ok(json!({ "trust_zone_id": input.trust_zone_id, "stopped": false }));
+    };
+    let _ = process.child.kill();
+    let _ = process.child.wait();
+    if input.clear_proxy_ref.unwrap_or(false) {
+        db.attach_network_policy_proxy_to_trust_zone(&input.trust_zone_id, None)?;
+    }
+    db.record_audit(AuditInput {
+        actor_type: Some("runtime".to_string()),
+        actor_id: None,
+        action: "egress_proxy.daemon_supervised_stopped".to_string(),
+        object_type: Some("trust_zone".to_string()),
+        object_id: Some(input.trust_zone_id.clone()),
+        payload: Some(json!({
+            "pid": process.pid,
+            "clearProxyRef": input.clear_proxy_ref.unwrap_or(false),
+        })),
+    })?;
+    Ok(json!({
+        "trust_zone_id": input.trust_zone_id,
+        "proxy_ref": process.proxy_ref,
+        "pid": process.pid,
+        "stopped": true,
+    }))
+}
+
+fn list_supervised_egress_proxies(daemon_state: &mut DaemonState) -> Value {
+    prune_exited_egress_proxies(daemon_state);
+    json!(daemon_state
+        .egress_proxies
+        .values()
+        .map(|process| {
+            json!({
+                "trust_zone_id": process.trust_zone_id,
+                "proxy_ref": process.proxy_ref,
+                "pid": process.pid,
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+fn prune_exited_egress_proxies(daemon_state: &mut DaemonState) {
+    daemon_state
+        .egress_proxies
+        .retain(|_, process| matches!(process.child.try_wait(), Ok(None)));
+}
+
 pub fn handle_api_request_with_artifact_root(
     db: &mut SparseKernelDb,
     method: &str,
     url: &str,
     body: &[u8],
     artifact_root: Option<&Path>,
+) -> Result<ApiReply, Box<dyn Error>> {
+    let mut daemon_state = DaemonState::default();
+    handle_api_request_with_daemon_state(db, method, url, body, artifact_root, &mut daemon_state)
+}
+
+pub fn handle_api_request_with_daemon_state(
+    db: &mut SparseKernelDb,
+    method: &str,
+    url: &str,
+    body: &[u8],
+    artifact_root: Option<&Path>,
+    daemon_state: &mut DaemonState,
 ) -> Result<ApiReply, Box<dyn Error>> {
     let reply = match (method, url) {
         ("GET", "/health") => ApiReply {
@@ -577,6 +801,43 @@ pub fn handle_api_request_with_artifact_root(
             status_code: 200,
             body: serde_json::to_value(db.inspect()?)?,
         },
+        ("POST", "/trust-zones/network-policy") => {
+            let input: TrustZoneNetworkPolicyRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(
+                    db.network_policy_for_trust_zone(&input.trust_zone_id)?,
+                )?,
+            }
+        }
+        ("POST", "/trust-zones/proxy-ref") => {
+            let input: AttachTrustZoneProxyRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.attach_network_policy_proxy_to_trust_zone(
+                    &input.trust_zone_id,
+                    input.proxy_ref,
+                )?)?,
+            }
+        }
+        ("GET", "/egress-proxies") => ApiReply {
+            status_code: 200,
+            body: list_supervised_egress_proxies(daemon_state),
+        },
+        ("POST", "/egress-proxies/start") => {
+            let input: StartEgressProxyRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: start_supervised_egress_proxy(db, daemon_state, input)?,
+            }
+        }
+        ("POST", "/egress-proxies/stop") => {
+            let input: StopEgressProxyRequest = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: stop_supervised_egress_proxy(db, daemon_state, input)?,
+            }
+        }
         ("GET", "/tasks") => ApiReply {
             status_code: 200,
             body: serde_json::to_value(db.list_tasks(100)?)?,
@@ -1102,6 +1363,28 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    struct EnvRestore {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn remove(name: &'static str) -> Self {
+            let previous = env::var(name).ok();
+            env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(self.name, value),
+                None => env::remove_var(self.name),
+            }
+        }
+    }
+
     fn json_call(db: &mut SparseKernelDb, method: &str, url: &str, body: Value) -> Value {
         handle_api_request(
             db,
@@ -1143,6 +1426,30 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("tasks.v1")));
+    }
+
+    #[test]
+    fn trust_zone_proxy_api_attaches_and_reads_policy() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let attached = json_call(
+            &mut db,
+            "POST",
+            "/trust-zones/proxy-ref",
+            json!({
+                "trust_zone_id": "public_web",
+                "proxy_ref": "http://127.0.0.1:18080/",
+            }),
+        );
+        assert_eq!(attached["network_policy_id"], "public_web_default");
+        assert_eq!(attached["proxy_ref"], "http://127.0.0.1:18080/");
+
+        let policy = json_call(
+            &mut db,
+            "POST",
+            "/trust-zones/network-policy",
+            json!({ "trust_zone_id": "public_web" }),
+        );
+        assert_eq!(policy["proxy_ref"], "http://127.0.0.1:18080/");
     }
 
     #[test]
@@ -1560,6 +1867,10 @@ mod tests {
 
     #[test]
     fn artifact_api_creates_reads_and_checks_access() {
+        let _guard = env_lock();
+        let _disable_base64 = EnvRestore::remove("SPARSEKERNEL_DISABLE_BASE64_ARTIFACTS");
+        let _base64_mode = EnvRestore::remove("SPARSEKERNEL_ARTIFACT_BASE64");
+        let _base64_limit = EnvRestore::remove("SPARSEKERNEL_ARTIFACT_BASE64_MAX_BYTES");
         let mut db = SparseKernelDb::open(":memory:").unwrap();
         let root = tempfile::tempdir().unwrap();
         db.grant_capability(GrantCapabilityInput {

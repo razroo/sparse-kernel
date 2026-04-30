@@ -678,6 +678,13 @@ export class LocalKernelDatabase {
     return row ? toNetworkPolicy(row) : undefined;
   }
 
+  getTrustZone(id: string): TrustZoneRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM trust_zones WHERE id = ?").get(id) as
+      | TrustZoneRow
+      | undefined;
+    return row ? toTrustZone(row) : undefined;
+  }
+
   upsertNetworkPolicy(input: NetworkPolicyInput): NetworkPolicyRecord {
     const now = input.createdAt ?? nowIso();
     this.db
@@ -722,6 +729,54 @@ export class LocalKernelDatabase {
       throw new Error(`Failed to upsert network policy ${input.id}`);
     }
     return toNetworkPolicy(row);
+  }
+
+  attachNetworkPolicyProxyToTrustZone(input: {
+    trustZoneId: string;
+    proxyRef?: string | null;
+    actor?: KernelActor;
+    createdAt?: string;
+  }): { trustZone: TrustZoneRecord; networkPolicy: NetworkPolicyRecord } {
+    const now = input.createdAt ?? nowIso();
+    return this.withTransaction(() => {
+      const zoneRow = this.db
+        .prepare("SELECT * FROM trust_zones WHERE id = ?")
+        .get(input.trustZoneId) as TrustZoneRow | undefined;
+      if (!zoneRow) {
+        throw new Error(`Unknown trust zone: ${input.trustZoneId}`);
+      }
+      const policyId = optionalText(zoneRow.network_policy_id) ?? `${input.trustZoneId}_policy`;
+      if (!optionalText(zoneRow.network_policy_id)) {
+        this.db
+          .prepare("UPDATE trust_zones SET network_policy_id = ? WHERE id = ?")
+          .run(policyId, input.trustZoneId);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO network_policies(
+            id, default_action, allow_private_network, allowed_hosts_json, denied_cidrs_json, proxy_ref, created_at
+          ) VALUES(?, 'deny', 0, ?, NULL, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            proxy_ref=excluded.proxy_ref`,
+        )
+        .run(policyId, jsonToText([]), input.proxyRef ?? null, now);
+      this.recordAudit({
+        actor: input.actor ?? { type: "operator" },
+        action: input.proxyRef
+          ? "network_policy.proxy_ref_attached"
+          : "network_policy.proxy_ref_cleared",
+        objectType: "trust_zone",
+        objectId: input.trustZoneId,
+        payload: { networkPolicyId: policyId, proxyRef: input.proxyRef ?? null },
+        createdAt: now,
+      });
+      const trustZone = this.getTrustZone(input.trustZoneId);
+      const networkPolicy = this.getNetworkPolicyForTrustZone(input.trustZoneId);
+      if (!trustZone || !networkPolicy) {
+        throw new Error(`Failed to attach network policy proxy for ${input.trustZoneId}`);
+      }
+      return { trustZone, networkPolicy };
+    });
   }
 
   updateTrustZoneLimits(input: {

@@ -57,6 +57,12 @@ export type {
 export { startLoopbackEgressProxy } from "./egress-proxy.js";
 export type { LoopbackEgressProxyHandle, LoopbackEgressProxyOptions } from "./egress-proxy.js";
 export {
+  ensureSupervisedEgressProxy,
+  listSupervisedEgressProxies,
+  stopSupervisedEgressProxy,
+} from "./egress-proxy-supervisor.js";
+export type { SupervisedEgressProxyRecord } from "./egress-proxy-supervisor.js";
+export {
   createSparseKernelPluginWorkerHandler,
   runSparseKernelPluginWorker,
 } from "./plugin-worker-harness.js";
@@ -103,6 +109,7 @@ export type {
   SandboxCommandResult,
   SandboxBroker,
   HardEgressEnforcementSnapshot,
+  SandboxIsolationProfileId,
   SandboxPolicySnapshot,
   SandboxSpawnCommandRequest,
   SandboxSpawnPlan,

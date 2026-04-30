@@ -93,4 +93,39 @@ describe("SparseKernelClient protocol compatibility", () => {
       },
     ]);
   });
+
+  it("calls trust-zone proxy and supervised egress APIs", async () => {
+    const requests: Array<{ path: string; body?: unknown }> = [];
+    const fetchImpl = vi.fn(async (input, init) => {
+      const url = new URL(String(input));
+      requests.push({
+        path: url.pathname,
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      if (url.pathname === "/egress-proxies") {
+        return Response.json([]);
+      }
+      return Response.json({
+        trust_zone_id: "public_web",
+        network_policy_id: "public_web_default",
+        proxy_ref: "http://127.0.0.1:18080/",
+      });
+    }) as unknown as typeof fetch;
+    const client = new SparseKernelClient({ fetchImpl });
+
+    await client.attachTrustZoneProxyRef({
+      trust_zone_id: "public_web",
+      proxy_ref: "http://127.0.0.1:18080/",
+    });
+    await client.startEgressProxy({ trust_zone_id: "public_web", port: 18080 });
+    await client.egressProxies();
+    await client.stopEgressProxy({ trust_zone_id: "public_web", clear_proxy_ref: true });
+
+    expect(requests.map((request) => request.path)).toEqual([
+      "/trust-zones/proxy-ref",
+      "/egress-proxies/start",
+      "/egress-proxies",
+      "/egress-proxies/stop",
+    ]);
+  });
 });

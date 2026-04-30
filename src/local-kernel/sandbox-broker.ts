@@ -22,6 +22,14 @@ export type SandboxBackendKind =
   | "vm"
   | "other";
 
+export type SandboxIsolationProfileId =
+  | "trusted_local"
+  | "web_brokered"
+  | "readonly_workspace"
+  | "rw_workspace"
+  | "code_execution"
+  | "plugin_untrusted";
+
 export type SandboxAllocationRequest = {
   taskId: string;
   agentId?: string;
@@ -29,6 +37,7 @@ export type SandboxAllocationRequest = {
   requirements?: {
     backend?: SandboxBackendKind;
     dockerImage?: string;
+    isolationProfile?: SandboxIsolationProfileId;
     maxRuntimeMs?: number;
     maxBytesOut?: number;
     maxTokens?: number;
@@ -62,6 +71,7 @@ export type DockerSandboxPolicy = {
 export type SandboxPolicySnapshot = {
   trustZoneId: string;
   backend: SandboxBackendKind;
+  isolationProfile?: SandboxIsolationProfileId;
   filesystemPolicy?: unknown;
   maxProcesses?: number;
   maxMemoryMb?: number;
@@ -234,15 +244,23 @@ function resolveSandboxPolicySnapshot(params: {
   db: LocalKernelDatabase;
   trustZoneId: string;
   backend: SandboxBackendKind;
+  requestedProfile?: SandboxIsolationProfileId;
 }): SandboxPolicySnapshot {
   const zone = params.db.listTrustZones().find((entry) => entry.id === params.trustZoneId);
   const networkPolicy = params.db.getNetworkPolicyForTrustZone(params.trustZoneId);
   const proxyDecision = resolveNetworkPolicyProxyRef(networkPolicy?.proxyRef);
   const dockerNetworkMode =
     networkPolicy?.defaultAction === "allow" && proxyDecision.ok ? "bridge" : "none";
+  const isolationProfile =
+    params.requestedProfile ??
+    resolveSandboxIsolationProfile({
+      trustZoneId: params.trustZoneId,
+      filesystemPolicy: zone?.filesystemPolicy,
+    });
   return {
     trustZoneId: params.trustZoneId,
     backend: params.backend,
+    isolationProfile,
     ...(zone?.filesystemPolicy !== undefined ? { filesystemPolicy: zone.filesystemPolicy } : {}),
     ...(zone?.maxProcesses !== undefined ? { maxProcesses: zone.maxProcesses } : {}),
     ...(zone?.maxMemoryMb !== undefined ? { maxMemoryMb: zone.maxMemoryMb } : {}),
@@ -270,6 +288,49 @@ function resolveSandboxPolicySnapshot(params: {
       tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"],
     },
   };
+}
+
+function resolveSandboxIsolationProfile(params: {
+  trustZoneId: string;
+  filesystemPolicy?: unknown;
+}): SandboxIsolationProfileId {
+  switch (params.trustZoneId) {
+    case "public_web":
+    case "authenticated_web":
+    case "user_browser_profile":
+      return "web_brokered";
+    case "local_files_readonly":
+      return "readonly_workspace";
+    case "local_files_rw":
+      return "rw_workspace";
+    case "code_execution":
+      return "code_execution";
+    case "plugin_untrusted":
+      return "plugin_untrusted";
+    default:
+      return readFilesystemMode(params.filesystemPolicy) === "readwrite"
+        ? "rw_workspace"
+        : "trusted_local";
+  }
+}
+
+function profileAllowsWorkspaceWrite(profile: SandboxIsolationProfileId): boolean {
+  return profile === "rw_workspace" || profile === "code_execution";
+}
+
+function minijailProfileArgs(profile: SandboxIsolationProfileId): string[] {
+  const profileEnvName = `OPENCLAW_RUNTIME_MINIJAIL_${profile
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")}_FLAGS`;
+  return [
+    "-p",
+    "-v",
+    ...readJsonOrWhitespaceArgs(
+      process.env.OPENCLAW_RUNTIME_MINIJAIL_HARDENED_FLAGS,
+      "OPENCLAW_RUNTIME_MINIJAIL_HARDENED_FLAGS",
+    ),
+    ...readJsonOrWhitespaceArgs(process.env[profileEnvName], profileEnvName),
+  ];
 }
 
 function readFilesystemMode(policy: unknown): string {
@@ -715,9 +776,12 @@ export function buildSandboxSpawnPlan(params: {
   stdin?: boolean;
   dockerImage?: string;
   dockerPolicy?: DockerSandboxPolicy;
+  isolationProfile?: SandboxIsolationProfileId;
+  filesystemPolicy?: unknown;
   resolveCommand?: CommandResolver;
 }): SandboxSpawnPlan {
   const resolveCommand = params.resolveCommand ?? firstAvailableCommand;
+  const isolationProfile = params.isolationProfile ?? "trusted_local";
   switch (params.backend) {
     case "local/no_isolation":
       return {
@@ -742,7 +806,13 @@ export function buildSandboxSpawnPlan(params: {
         "/dev",
         "--tmpfs",
         "/tmp",
+        "--tmpfs",
+        "/home",
+        "--dir",
+        "/home/openclaw",
       ];
+      env.HOME = "/home/openclaw";
+      env.TMPDIR = "/tmp";
       for (const [name, value] of Object.entries(env)) {
         if (value !== undefined && validDockerEnvName(name)) {
           args.push("--setenv", name, value);
@@ -754,13 +824,14 @@ export function buildSandboxSpawnPlan(params: {
         }
       }
       if (params.cwd) {
-        args.push("--bind", params.cwd, params.cwd, "--chdir", params.cwd);
+        const bindFlag = profileAllowsWorkspaceWrite(isolationProfile) ? "--bind" : "--ro-bind";
+        args.push(bindFlag, params.cwd, params.cwd, "--chdir", params.cwd);
       }
       args.push("--", params.command, ...params.args);
       return {
         command: binary,
         args,
-        isolation: describeSandboxBackend(params.backend),
+        isolation: `${describeSandboxBackend(params.backend)}; profile=${isolationProfile}`,
       };
     }
     case "minijail": {
@@ -768,10 +839,11 @@ export function buildSandboxSpawnPlan(params: {
       if (!binary) {
         throw new Error("Sandbox backend unavailable: minijail");
       }
+      const profileArgs = minijailProfileArgs(isolationProfile);
       return {
         command: binary,
-        args: ["-p", "-v", "--", params.command, ...params.args],
-        isolation: describeSandboxBackend(params.backend),
+        args: [...profileArgs, "--", params.command, ...params.args],
+        isolation: `${describeSandboxBackend(params.backend)}; profile=${isolationProfile}`,
       };
     }
     case "docker": {
@@ -834,7 +906,7 @@ export function buildSandboxSpawnPlan(params: {
       return {
         command: binary,
         args,
-        isolation: describeSandboxBackend(params.backend),
+        isolation: `${describeSandboxBackend(params.backend)}; profile=${isolationProfile}`,
       };
     }
     case "ssh":
@@ -947,6 +1019,7 @@ export class LocalSandboxBroker implements SandboxBroker {
       db: this.db,
       trustZoneId: request.trustZoneId,
       backend,
+      requestedProfile: request.requirements?.isolationProfile,
     });
     let hardEgress: HardEgressEnforcementSnapshot | undefined;
     let workerIdentity: SandboxWorkerIdentitySnapshot | undefined;
@@ -1203,6 +1276,8 @@ export class LocalSandboxBroker implements SandboxBroker {
           metadata.dockerImage ??
           process.env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE,
         dockerPolicy: metadata.policy?.docker,
+        isolationProfile: metadata.policy?.isolationProfile,
+        filesystemPolicy: metadata.policy?.filesystemPolicy,
       });
     } catch (error) {
       this.db.recordAudit({

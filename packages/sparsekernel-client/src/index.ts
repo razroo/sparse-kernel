@@ -20,6 +20,30 @@ export type SparseKernelInspect = {
   counts: Record<string, number>;
 };
 
+export type SparseKernelNetworkPolicy = {
+  id: string;
+  default_action: "allow" | "deny" | string;
+  allow_private_network: boolean;
+  allowed_hosts?: string[];
+  denied_cidrs?: string[];
+  proxy_ref?: string | null;
+  created_at: string;
+};
+
+export type SparseKernelTrustZoneProxyAttachment = {
+  trust_zone_id: string;
+  network_policy_id: string;
+  proxy_ref?: string | null;
+};
+
+export type SparseKernelSupervisedEgressProxy = {
+  trust_zone_id: string;
+  proxy_ref: string;
+  pid?: number;
+  already_running?: boolean;
+  stopped?: boolean;
+};
+
 export type SparseKernelTask = {
   id: string;
   agent_id?: string | null;
@@ -452,6 +476,46 @@ export class SparseKernelClient {
 
   async status(): Promise<SparseKernelInspect> {
     return await this.getJson<SparseKernelInspect>("/status");
+  }
+
+  async trustZoneNetworkPolicy(input: {
+    trust_zone_id: string;
+  }): Promise<SparseKernelNetworkPolicy | null> {
+    return await this.postJson<SparseKernelNetworkPolicy | null>(
+      "/trust-zones/network-policy",
+      input,
+    );
+  }
+
+  async attachTrustZoneProxyRef(input: {
+    trust_zone_id: string;
+    proxy_ref?: string | null;
+  }): Promise<SparseKernelTrustZoneProxyAttachment> {
+    return await this.postJson<SparseKernelTrustZoneProxyAttachment>(
+      "/trust-zones/proxy-ref",
+      input,
+    );
+  }
+
+  async egressProxies(): Promise<SparseKernelSupervisedEgressProxy[]> {
+    return await this.getJson<SparseKernelSupervisedEgressProxy[]>("/egress-proxies");
+  }
+
+  async startEgressProxy(input: {
+    trust_zone_id: string;
+    host?: string | null;
+    port?: number | null;
+    command?: string | null;
+    args?: string[];
+  }): Promise<SparseKernelSupervisedEgressProxy> {
+    return await this.postJson<SparseKernelSupervisedEgressProxy>("/egress-proxies/start", input);
+  }
+
+  async stopEgressProxy(input: {
+    trust_zone_id: string;
+    clear_proxy_ref?: boolean;
+  }): Promise<SparseKernelSupervisedEgressProxy> {
+    return await this.postJson<SparseKernelSupervisedEgressProxy>("/egress-proxies/stop", input);
   }
 
   async tasks(): Promise<SparseKernelTask[]> {

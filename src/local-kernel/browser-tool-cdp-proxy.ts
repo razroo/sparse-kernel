@@ -493,6 +493,8 @@ function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActR
         targetId: readString(value.targetId),
       } as const;
     case "reload":
+    case "goBack":
+    case "goForward":
       return {
         kind,
         targetId: readString(value.targetId),

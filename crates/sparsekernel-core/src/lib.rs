@@ -418,6 +418,24 @@ pub struct SandboxAllocationRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkPolicyRecord {
+    pub id: String,
+    pub default_action: String,
+    pub allow_private_network: bool,
+    pub allowed_hosts: Vec<String>,
+    pub denied_cidrs: Vec<String>,
+    pub proxy_ref: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustZoneProxyAttachmentRecord {
+    pub trust_zone_id: String,
+    pub network_policy_id: String,
+    pub proxy_ref: Option<String>,
+}
+
 pub struct SparseKernelDb {
     conn: Connection,
     path: PathBuf,
@@ -575,6 +593,84 @@ impl SparseKernelDb {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(SparseKernelError::from)
+    }
+
+    pub fn network_policy_for_trust_zone(
+        &self,
+        trust_zone_id: &str,
+    ) -> Result<Option<NetworkPolicyRecord>> {
+        self.conn
+            .query_row(
+                "SELECT np.id, np.default_action, np.allow_private_network, np.allowed_hosts_json, np.denied_cidrs_json, np.proxy_ref, np.created_at
+                 FROM trust_zones tz
+                 JOIN network_policies np ON np.id = tz.network_policy_id
+                 WHERE tz.id = ?",
+                params![trust_zone_id],
+                network_policy_from_row,
+            )
+            .optional()
+            .map_err(SparseKernelError::from)
+    }
+
+    pub fn attach_network_policy_proxy_to_trust_zone(
+        &mut self,
+        trust_zone_id: &str,
+        proxy_ref: Option<String>,
+    ) -> Result<TrustZoneProxyAttachmentRecord> {
+        let trust_zone_id = trust_zone_id.trim();
+        if trust_zone_id.is_empty() {
+            return Err(SparseKernelError::Invalid(
+                "trust_zone_id is required".to_string(),
+            ));
+        }
+        if let Some(proxy_ref) = proxy_ref.as_deref() {
+            validate_loopback_proxy_ref(proxy_ref)?;
+        }
+        let existing_policy_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT network_policy_id FROM trust_zones WHERE id = ?",
+                params![trust_zone_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| SparseKernelError::NotFound(format!("trust zone {trust_zone_id}")))?;
+        let policy_id = existing_policy_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("{trust_zone_id}_policy"));
+        let now = now_iso();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE trust_zones SET network_policy_id = ? WHERE id = ? AND network_policy_id IS NULL",
+            params![policy_id, trust_zone_id],
+        )?;
+        tx.execute(
+            "INSERT INTO network_policies(
+                id, default_action, allow_private_network, allowed_hosts_json, denied_cidrs_json, proxy_ref, created_at
+             ) VALUES(?, 'deny', 0, '[]', NULL, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET proxy_ref = excluded.proxy_ref",
+            params![policy_id, proxy_ref, now],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+             VALUES('runtime', NULL, ?, 'trust_zone', ?, ?, ?)",
+            params![
+                if proxy_ref.is_some() {
+                    "network_policy.proxy_ref_attached"
+                } else {
+                    "network_policy.proxy_ref_cleared"
+                },
+                trust_zone_id,
+                json!({ "networkPolicyId": policy_id, "proxyRef": proxy_ref }).to_string(),
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(TrustZoneProxyAttachmentRecord {
+            trust_zone_id: trust_zone_id.to_string(),
+            network_policy_id: policy_id,
+            proxy_ref,
+        })
     }
 
     pub fn ensure_agent(&self, id: &str) -> Result<()> {
@@ -1761,6 +1857,58 @@ fn browser_observation_from_row(
         payload: parse_json(row.get(4)?),
         created_at: row.get(5)?,
     })
+}
+
+fn network_policy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkPolicyRecord> {
+    Ok(NetworkPolicyRecord {
+        id: row.get(0)?,
+        default_action: row.get(1)?,
+        allow_private_network: row.get::<_, i64>(2)? != 0,
+        allowed_hosts: parse_json_string_array(row.get(3)?),
+        denied_cidrs: parse_json_string_array(row.get(4)?),
+        proxy_ref: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn parse_json_string_array(raw: Option<String>) -> Vec<String> {
+    parse_json(raw)
+        .and_then(|value| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn validate_loopback_proxy_ref(proxy_ref: &str) -> Result<()> {
+    let trimmed = proxy_ref.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(SparseKernelError::Invalid(
+            "proxy_ref must be an absolute URL".to_string(),
+        ));
+    };
+    if !matches!(scheme, "http" | "https" | "socks5") {
+        return Err(SparseKernelError::Invalid(
+            "proxy_ref scheme must be http, https, or socks5".to_string(),
+        ));
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Err(SparseKernelError::Invalid(
+            "proxy_ref must point at a loopback host".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub struct ArtifactStore<'a> {

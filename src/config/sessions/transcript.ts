@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { SessionManager } from "@mariozechner/pi-coding-agent";
@@ -10,7 +11,10 @@ import {
   resolveSessionFilePathOptions,
   resolveSessionTranscriptPath,
 } from "./paths.js";
-import { appendTranscriptMessageToRuntimeLedger } from "./runtime-ledger.js";
+import {
+  appendTranscriptMessageToRuntimeLedger,
+  isRuntimeSessionStorePrimary,
+} from "./runtime-ledger.js";
 import { resolveAndPersistSessionFile } from "./session-file.js";
 import { loadSessionStore, normalizeStoreSessionKey } from "./store.js";
 import { parseSessionThreadInfo } from "./thread-info.js";
@@ -278,6 +282,25 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
     ...params.message,
     ...(explicitIdempotencyKey ? { idempotencyKey: explicitIdempotencyKey } : {}),
   } as Parameters<SessionManager["appendMessage"]>[0];
+  if (isRuntimeSessionStorePrimary()) {
+    const messageId = await appendPrimaryRuntimeTranscriptMessage({
+      storePath,
+      sessionKey,
+      agentId: params.agentId,
+      entry: runtimeEntry,
+      sessionFile,
+      message,
+    });
+    emitAssistantTranscriptUpdate({
+      updateMode: params.updateMode,
+      sessionFile,
+      sessionKey,
+      message,
+      messageId,
+    });
+    return { ok: true, sessionFile, messageId };
+  }
+
   const { SessionManager } = await loadPiCodingAgentModule();
   const sessionManager = SessionManager.open(sessionFile);
   const messageId = sessionManager.appendMessage(message);
@@ -290,17 +313,108 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
     message,
   });
 
+  emitAssistantTranscriptUpdate({
+    updateMode: params.updateMode,
+    sessionFile,
+    sessionKey,
+    message,
+    messageId,
+  });
+  return { ok: true, sessionFile, messageId };
+}
+
+function emitAssistantTranscriptUpdate(params: {
+  updateMode: SessionTranscriptUpdateMode | undefined;
+  sessionFile: string;
+  sessionKey: string;
+  message: Parameters<SessionManager["appendMessage"]>[0];
+  messageId: string;
+}): void {
   switch (params.updateMode ?? "inline") {
     case "inline":
-      emitSessionTranscriptUpdate({ sessionFile, sessionKey, message, messageId });
+      emitSessionTranscriptUpdate({
+        sessionFile: params.sessionFile,
+        sessionKey: params.sessionKey,
+        message: params.message,
+        messageId: params.messageId,
+      });
       break;
     case "file-only":
-      emitSessionTranscriptUpdate(sessionFile);
+      emitSessionTranscriptUpdate(params.sessionFile);
       break;
     case "none":
       break;
   }
-  return { ok: true, sessionFile, messageId };
+}
+
+async function appendPrimaryRuntimeTranscriptMessage(params: {
+  storePath: string;
+  sessionKey: string;
+  agentId?: string;
+  entry: SessionEntry;
+  sessionFile: string;
+  message: Parameters<SessionManager["appendMessage"]>[0];
+}): Promise<string> {
+  const summary = await readTranscriptEntrySummary(params.sessionFile);
+  const messageId = generateTranscriptEntryId(summary.ids);
+  appendTranscriptMessageToRuntimeLedger({
+    storePath: params.storePath,
+    sessionKey: params.sessionKey,
+    agentId: params.agentId,
+    entry: params.entry,
+    messageId,
+    message: params.message,
+  });
+  const line = {
+    type: "message",
+    id: messageId,
+    ...(summary.latestEntryId ? { parentId: summary.latestEntryId } : {}),
+    timestamp: new Date().toISOString(),
+    message: params.message,
+  };
+  await fs.promises.appendFile(params.sessionFile, `${JSON.stringify(line)}\n`, "utf-8");
+  return messageId;
+}
+
+async function readTranscriptEntrySummary(transcriptPath: string): Promise<{
+  ids: Set<string>;
+  latestEntryId?: string;
+}> {
+  const ids = new Set<string>();
+  let latestEntryId: string | undefined;
+  try {
+    const raw = await fs.promises.readFile(transcriptPath, "utf-8");
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(line) as { type?: unknown; id?: unknown };
+        if (typeof parsed.id !== "string" || !parsed.id) {
+          continue;
+        }
+        ids.add(parsed.id);
+        if (parsed.type !== "session") {
+          latestEntryId = parsed.id;
+        }
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    return { ids };
+  }
+  return { ids, ...(latestEntryId ? { latestEntryId } : {}) };
+}
+
+function generateTranscriptEntryId(existingIds: Set<string>): string {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const id = randomUUID().slice(0, 8);
+    if (!existingIds.has(id)) {
+      return id;
+    }
+  }
+  throw new Error("Failed to allocate unique transcript message id");
 }
 
 async function transcriptHasIdempotencyKey(

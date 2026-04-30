@@ -1343,6 +1343,17 @@ describe("local runtime kernel database", () => {
   });
 
   it("builds explicit Docker sandbox command plans without host fallback", () => {
+    const bwrapPlan = buildSandboxSpawnPlan({
+      backend: "bwrap",
+      command: "node",
+      args: ["-v"],
+      env: { EXPLICIT_WORKER_ENV: "ok" },
+      resolveCommand: () => "bwrap",
+    });
+    expect(bwrapPlan.args).toEqual(
+      expect.arrayContaining(["--clearenv", "--setenv", "EXPLICIT_WORKER_ENV", "ok"]),
+    );
+
     expect(() =>
       buildSandboxSpawnPlan({
         backend: "docker",

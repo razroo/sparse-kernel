@@ -1,5 +1,8 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { LocalKernelDatabase } from "../../local-kernel/database.js";
 import * as transcriptEvents from "../../sessions/transcript-events.js";
 import { resolveSessionTranscriptPathInDir } from "./paths.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
@@ -333,6 +336,53 @@ describe("appendAssistantMessageToSessionTranscript", () => {
           textSignature: JSON.stringify({ v: 1, id: "item_final", phase: "final_answer" }),
         },
       ]);
+    }
+  });
+
+  it("writes assistant transcript messages to SQLite before legacy JSONL in primary mode", async () => {
+    writeTranscriptStore();
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-transcript-ledger-"));
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const previousMode = process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    process.env.OPENCLAW_RUNTIME_SESSION_STORE = "sqlite";
+    try {
+      const result = await appendExactAssistantMessageToSessionTranscript({
+        sessionKey,
+        storePath: fixture.storePath(),
+        message: createExactAssistantMessage({ text: "Ledger primary" }),
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+      const db = new LocalKernelDatabase();
+      try {
+        const events = db.listTranscriptEvents(sessionId);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ role: "assistant", eventType: "message" });
+        expect(events[0]?.content).toMatchObject({
+          type: "message",
+          id: result.messageId,
+          message: expect.objectContaining({ role: "assistant" }),
+        });
+      } finally {
+        db.close();
+      }
+      const lines = fs.readFileSync(result.sessionFile, "utf-8").trim().split("\n");
+      expect(JSON.parse(lines[1]).id).toBe(result.messageId);
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      if (previousMode === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SESSION_STORE = previousMode;
+      }
+      fs.rmSync(stateDir, { recursive: true, force: true });
     }
   });
 

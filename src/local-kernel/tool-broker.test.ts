@@ -904,7 +904,7 @@ describe("CapabilityToolBroker", () => {
         action: "allocate",
       });
       const broker = new CapabilityToolBroker(db, {
-        env: { OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC: "1" } as NodeJS.ProcessEnv,
+        env: {} as NodeJS.ProcessEnv,
       });
       const tool = broker.wrapTool(
         {
@@ -928,6 +928,7 @@ describe("CapabilityToolBroker", () => {
       await expect(
         tool.execute("call-exec", {
           argv: [process.execPath, "-e", "process.stdout.write('sandboxed')"],
+          backend: "local/no_isolation",
           maxOutputBytes: 1024,
         }),
       ).resolves.toMatchObject({
@@ -942,6 +943,51 @@ describe("CapabilityToolBroker", () => {
           "sandbox.released",
           "tool_call.completed",
         ]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("allows brokered exec routing to be explicitly disabled for compatibility", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.upsertSession({ id: "session-a", agentId: "main" });
+      db.grantCapability({
+        subjectType: "run",
+        subjectId: "run-a",
+        resourceType: "tool",
+        resourceId: "exec",
+        action: "invoke",
+      });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC: "off" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(
+        {
+          name: "exec",
+          label: "Exec",
+          description: "test",
+          parameters: Type.Object({}),
+          execute: async () => ({
+            content: [{ type: "text", text: "ambient-compatible" }],
+            details: {},
+          }),
+        } as AnyAgentTool,
+        {
+          agentId: "main",
+          sessionId: "session-a",
+          subject: { subjectType: "run", subjectId: "run-a" },
+          runId: "run-a",
+        },
+      );
+
+      await expect(tool.execute("call-exec-off", {})).resolves.toMatchObject({
+        content: [{ type: "text", text: "ambient-compatible" }],
+      });
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).not.toContain(
+        "sandbox.allocated",
       );
     } finally {
       db.close();

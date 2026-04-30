@@ -492,6 +492,12 @@ function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActR
         height: readNumber(value.height) ?? 720,
         targetId: readString(value.targetId),
       } as const;
+    case "reload":
+      return {
+        kind,
+        targetId: readString(value.targetId),
+        timeoutMs: readNumber(value.timeoutMs),
+      } as const;
     case "batch":
       return {
         kind,
@@ -501,6 +507,8 @@ function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActR
         targetId: readString(value.targetId),
         stopOnError: value.stopOnError === false ? false : undefined,
       } as const;
+    case "close":
+      return { kind, targetId: readString(value.targetId) } as const;
     default:
       throw new Error(`SparseKernel CDP browser proxy does not support act kind: ${kind ?? ""}`);
   }

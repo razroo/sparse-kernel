@@ -11,10 +11,12 @@ import {
   buildWorkerIdentityProvisionPlan,
   exportSessionAsJsonl,
   importLegacySessionStore,
+  inspectSparseKernelRuntime,
   inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
   openLocalKernelDatabase,
   recoverEmbeddedRunTasks,
+  startLoopbackEgressProxy,
   sweepNativeBrowserProcesses,
 } from "../local-kernel/index.js";
 import type { RuntimeRetentionPolicy } from "../local-kernel/index.js";
@@ -69,6 +71,92 @@ export async function runtimeInspectCommand(
       runtime.log(`${table}: ${count}`);
     }
   } finally {
+    db.close();
+  }
+}
+
+export async function runtimeDoctorCommand(
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const db = openLocalKernelDatabase();
+  try {
+    const report = inspectSparseKernelRuntime({ db });
+    if (opts.json) {
+      writeRuntimeJson(runtime, report);
+      return;
+    }
+    runtime.log(`SparseKernel runtime doctor: ${report.ok ? "ok" : "attention needed"}`);
+    runtime.log(`Schema version: ${report.schemaVersion}`);
+    runtime.log(`Tool broker: ${report.toolBrokerMode}`);
+    runtime.log(`Session store: ${report.sessionStoreMode}`);
+    for (const check of report.checks) {
+      runtime.log(`${check.status.toUpperCase()} ${check.id}: ${check.summary}`);
+      if (check.remediation) {
+        runtime.log(`  ${check.remediation}`);
+      }
+    }
+    runtime.log("Acceptance lanes:");
+    for (const lane of report.acceptanceLanes) {
+      runtime.log(`  ${lane.id} [${lane.platform}/${lane.status}]: ${lane.command}`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeEgressProxyCommand(
+  opts: { trustZone?: string; host?: string; port?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const trustZoneId = opts.trustZone?.trim() || "public_web";
+  const port = opts.port ? Number.parseInt(opts.port, 10) : 0;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    runtime.error("--port must be an integer from 0 to 65535");
+    runtime.exit(1);
+    return;
+  }
+  const db = openLocalKernelDatabase();
+  let proxy: Awaited<ReturnType<typeof startLoopbackEgressProxy>> | undefined;
+  try {
+    proxy = await startLoopbackEgressProxy({
+      db,
+      trustZoneId,
+      host: opts.host,
+      port,
+      actor: { type: "operator" },
+    });
+    db.recordAudit({
+      actor: { type: "operator" },
+      action: "egress_proxy.started",
+      objectType: "trust_zone",
+      objectId: trustZoneId,
+      payload: { url: proxy.url },
+    });
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ok: true, trustZoneId, proxyUrl: proxy.url });
+    } else {
+      runtime.log(`SparseKernel egress proxy listening for ${trustZoneId}: ${proxy.url}`);
+    }
+    await new Promise<void>((resolve) => {
+      const stop = () => {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+        resolve();
+      };
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
+    });
+  } finally {
+    if (proxy) {
+      await proxy.close();
+      db.recordAudit({
+        actor: { type: "operator" },
+        action: "egress_proxy.stopped",
+        objectType: "trust_zone",
+        objectId: trustZoneId,
+      });
+    }
     db.close();
   }
 }

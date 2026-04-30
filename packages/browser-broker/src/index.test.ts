@@ -168,6 +168,16 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { frameId: "frame-1" });
         this.handleNavigate(String(message.params?.url ?? ""), message.sessionId);
         break;
+      case "Page.reload":
+        this.respond(message.id, {});
+        setTimeout(() => {
+          this.emit({
+            method: "Page.loadEventFired",
+            params: {},
+            sessionId: message.sessionId,
+          });
+        }, 0);
+        break;
       case "Runtime.evaluate":
         this.respondRuntimeEvaluate(message);
         break;
@@ -850,9 +860,13 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       key: "Enter",
       modifiers: ["ControlOrMeta"],
     });
+    const reloaded = await broker.actContext(context.ledger_context.id, {
+      kind: "reload",
+    });
 
     expect(clicked).toMatchObject({ ok: true, targetId: "target-1", kind: "click" });
     expect(pressed).toMatchObject({ ok: true, targetId: "target-1", kind: "press" });
+    expect(reloaded).toMatchObject({ ok: true, targetId: "target-1", kind: "reload" });
     expect(transport.sent).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -866,6 +880,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
             modifiers: process.platform === "darwin" ? 4 : 2,
           }),
         }),
+        expect.objectContaining({ method: "Page.reload" }),
       ]),
     );
   });

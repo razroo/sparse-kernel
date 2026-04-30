@@ -150,7 +150,7 @@ export function mirrorSessionStoreToRuntimeLedger(params: {
       env,
     });
   } catch (err) {
-    if (mode === "sqlite") {
+    if (mode === "sqlite" || mode === "sqlite-strict") {
       throw err;
     }
     const storePath = path.resolve(params.storePath);
@@ -209,7 +209,7 @@ export function appendTranscriptMessageToRuntimeLedger(params: {
       createdAt: dateFromEpochMs(params.message.timestamp),
     });
   } catch (err) {
-    if (mode === "sqlite") {
+    if (mode === "sqlite" || mode === "sqlite-strict") {
       throw err;
     }
     const warningKey = `${storePath}:${params.messageId}:${

@@ -7,6 +7,8 @@ import {
   runtimeBrowserTargetsCommand,
   runtimeBudgetCommand,
   runtimeBudgetSetCommand,
+  runtimeDoctorCommand,
+  runtimeEgressProxyCommand,
   runtimeInspectCommand,
   runtimeLeasesCommand,
   runtimeMaintainCommand,
@@ -73,6 +75,11 @@ export function registerRuntimeCli(program: Command) {
             "openclaw runtime worker-identities --count 4 --json",
             "Plan broker-managed SparseKernel worker identities.",
           ],
+          ["openclaw runtime doctor", "Check SparseKernel runtime readiness."],
+          [
+            "openclaw runtime egress-proxy --trust-zone public_web",
+            "Start a loopback policy-enforcing egress proxy.",
+          ],
           [
             "openclaw runtime maintain --run-due --schedule-every 1h",
             "Run scheduled runtime maintenance when due.",
@@ -107,6 +114,35 @@ export function registerRuntimeCli(program: Command) {
     .option("--json", "Output JSON", false)
     .action(
       createRunner((opts) => runtimeInspectCommand({ json: Boolean(opts.json) }, defaultRuntime)),
+    );
+
+  runtime
+    .command("doctor")
+    .description("Inspect SparseKernel runtime readiness and acceptance lanes")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) => runtimeDoctorCommand({ json: Boolean(opts.json) }, defaultRuntime)),
+    );
+
+  runtime
+    .command("egress-proxy")
+    .description("Start a loopback trust-zone egress proxy")
+    .option("--trust-zone <id>", "Trust zone id", "public_web")
+    .option("--host <host>", "Loopback bind host", "127.0.0.1")
+    .option("--port <port>", "Bind port (0 chooses a free port)", "0")
+    .option("--json", "Output JSON startup payload", false)
+    .action(
+      createRunner((opts) =>
+        runtimeEgressProxyCommand(
+          {
+            trustZone: opts.trustZone as string | undefined,
+            host: opts.host as string | undefined,
+            port: opts.port as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
     );
 
   runtime

@@ -250,6 +250,7 @@ export type SparseKernelBrowserActRequest =
       targetId?: string;
       stopOnError?: boolean;
     }
+  | { kind: "reload"; targetId?: string; timeoutMs?: number }
   | { kind: "close"; targetId?: string };
 
 export type SparseKernelBrowserFormField = {
@@ -1036,6 +1037,10 @@ export class SparseKernelCdpBrowserBroker {
           context.page_session_id,
         );
         return { ok: true, targetId: context.target_id, kind: request.kind };
+      case "reload": {
+        await this.reloadContext(context, request.timeoutMs);
+        return { ok: true, targetId: context.target_id, kind: request.kind };
+      }
       case "batch": {
         const results: Array<{ ok: boolean; kind: string; error?: string }> = [];
         for (const action of request.actions.slice(0, 100)) {
@@ -1233,6 +1238,22 @@ export class SparseKernelCdpBrowserBroker {
     const tab = await this.describeContextTab(context);
     this.recordTarget(context, context.target_id, {
       url: tab.url ?? url,
+      title: tab.title,
+      status: "active",
+    });
+  }
+
+  private async reloadContext(context: LiveBrowserContext, timeoutMs = 10_000): Promise<void> {
+    const load = context.connection.waitForEvent(
+      "Page.loadEventFired",
+      (event) => event.sessionId === context.page_session_id,
+      timeoutMs,
+    );
+    await context.connection.command("Page.reload", {}, context.page_session_id, timeoutMs);
+    await load.catch(() => {});
+    const tab = await this.describeContextTab(context);
+    this.recordTarget(context, context.target_id, {
+      url: tab.url,
       title: tab.title,
       status: "active",
     });

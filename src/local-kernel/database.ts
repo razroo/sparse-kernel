@@ -27,6 +27,7 @@ import type {
   KernelSessionInput,
   KernelSessionRecord,
   KernelTaskRecord,
+  NetworkPolicyInput,
   NetworkPolicyRecord,
   ResourceLeaseRecord,
   RuntimeRetentionPolicy,
@@ -675,6 +676,52 @@ export class LocalKernelDatabase {
       )
       .get(trustZoneId) as NetworkPolicyRow | undefined;
     return row ? toNetworkPolicy(row) : undefined;
+  }
+
+  upsertNetworkPolicy(input: NetworkPolicyInput): NetworkPolicyRecord {
+    const now = input.createdAt ?? nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO network_policies(
+          id, default_action, allow_private_network, allowed_hosts_json, denied_cidrs_json, proxy_ref, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          default_action=excluded.default_action,
+          allow_private_network=excluded.allow_private_network,
+          allowed_hosts_json=excluded.allowed_hosts_json,
+          denied_cidrs_json=excluded.denied_cidrs_json,
+          proxy_ref=excluded.proxy_ref`,
+      )
+      .run(
+        input.id,
+        input.defaultAction,
+        input.allowPrivateNetwork ? 1 : 0,
+        jsonToText(input.allowedHosts ?? []),
+        jsonToText(input.deniedCidrs),
+        input.proxyRef ?? null,
+        now,
+      );
+    this.recordAudit({
+      actor: input.actor ?? { type: "runtime" },
+      action: "network_policy.upserted",
+      objectType: "network_policy",
+      objectId: input.id,
+      payload: {
+        defaultAction: input.defaultAction,
+        allowPrivateNetwork: input.allowPrivateNetwork ?? false,
+        allowedHosts: input.allowedHosts ?? [],
+        deniedCidrs: input.deniedCidrs,
+        proxyRef: input.proxyRef,
+      },
+      createdAt: now,
+    });
+    const row = this.db.prepare("SELECT * FROM network_policies WHERE id = ?").get(input.id) as
+      | NetworkPolicyRow
+      | undefined;
+    if (!row) {
+      throw new Error(`Failed to upsert network policy ${input.id}`);
+    }
+    return toNetworkPolicy(row);
   }
 
   updateTrustZoneLimits(input: {

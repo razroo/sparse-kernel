@@ -730,10 +730,12 @@ export function buildSandboxSpawnPlan(params: {
       if (!binary) {
         throw new Error("Sandbox backend unavailable: bwrap");
       }
+      const env = buildSandboxProcessEnv({ backend: "bwrap", env: params.env });
       const args = [
         "--die-with-parent",
         "--unshare-all",
         "--new-session",
+        "--clearenv",
         "--proc",
         "/proc",
         "--dev",
@@ -741,6 +743,11 @@ export function buildSandboxSpawnPlan(params: {
         "--tmpfs",
         "/tmp",
       ];
+      for (const [name, value] of Object.entries(env)) {
+        if (value !== undefined && validDockerEnvName(name)) {
+          args.push("--setenv", name, value);
+        }
+      }
       for (const path of ["/usr", "/bin", "/lib", "/lib64", "/etc"]) {
         if (fs.existsSync(path)) {
           args.push("--ro-bind", path, path);

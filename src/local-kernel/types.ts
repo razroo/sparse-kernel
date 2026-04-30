@@ -315,3 +315,14 @@ export type NetworkPolicyRecord = {
   proxyRef?: string;
   createdAt: string;
 };
+
+export type NetworkPolicyInput = {
+  id: string;
+  defaultAction: "allow" | "deny";
+  allowPrivateNetwork?: boolean;
+  allowedHosts?: string[];
+  deniedCidrs?: string[];
+  proxyRef?: string;
+  createdAt?: string;
+  actor?: KernelActor;
+};

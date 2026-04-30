@@ -9,6 +9,7 @@ import {
   runtimeArtifactAccessCommand,
   runtimeArtifactSummaryCommand,
   runtimeBrowserPoolsCommand,
+  runtimeDoctorCommand,
   runtimeLeasesCommand,
   runtimeMaintainCommand,
   runtimeRecoverCommand,
@@ -273,5 +274,27 @@ describe("SparseKernel runtime commands", () => {
       }),
       2,
     );
+  });
+
+  it("reports runtime doctor checks and acceptance lanes", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const runtime = makeRuntime();
+      await runtimeDoctorCommand({ json: true }, runtime);
+      expect(runtime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          schemaVersion: expect.any(Number),
+          checks: expect.arrayContaining([
+            expect.objectContaining({ id: "ledger.schema", status: "pass" }),
+            expect.objectContaining({ id: "tools.broker" }),
+          ]),
+          acceptanceLanes: expect.arrayContaining([
+            expect.objectContaining({ id: "ledger-and-leases" }),
+            expect.objectContaining({ id: "egress-proxy" }),
+          ]),
+        }),
+        2,
+      );
+    });
   });
 });

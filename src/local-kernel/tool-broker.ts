@@ -26,6 +26,7 @@ const DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS: SandboxBackendKind[] = [
   "minijail",
   "docker",
 ];
+const DEFAULT_COMMAND_SANDBOX_BACKENDS: SandboxBackendKind[] = ["bwrap", "minijail", "docker"];
 const PLUGIN_SANDBOX_BACKENDS = new Set<SandboxBackendKind>([
   "local/no_isolation",
   "docker",
@@ -106,6 +107,11 @@ function isTruthyBrowserFlag(raw: string | undefined): boolean {
 function isTruthyToolFlag(raw: string | undefined): boolean {
   const normalized = raw?.trim().toLowerCase();
   return normalized === "on" || normalized === "1" || normalized === "true";
+}
+
+function isFalsyToolFlag(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "off" || normalized === "0" || normalized === "false";
 }
 
 export function requiresPluginSubprocess(raw: string | undefined): boolean {
@@ -357,6 +363,54 @@ export function resolvePluginSandboxConfig(params: {
 export function isSandboxCommandToolName(name: string): boolean {
   const normalized = name.trim().toLowerCase();
   return normalized === "exec" || normalized === "bash" || normalized === "shell";
+}
+
+function shouldBrokerSandboxCommand(env: NodeJS.ProcessEnv): boolean {
+  if (isFalsyToolFlag(env.OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC)) {
+    return false;
+  }
+  return true;
+}
+
+function resolveCommandSandboxBackend(params: {
+  record: Record<string, unknown>;
+  env: NodeJS.ProcessEnv;
+}): SandboxBackendKind {
+  const explicit = readPluginSandboxBackend(
+    typeof params.record.backend === "string" ? params.record.backend : undefined,
+    "tool params",
+  );
+  if (explicit) {
+    return explicit;
+  }
+  const envBackend = readPluginSandboxBackend(
+    params.env.OPENCLAW_RUNTIME_TOOL_SANDBOX_BACKEND ??
+      params.env.OPENCLAW_SPARSEKERNEL_TOOL_SANDBOX_BACKEND,
+    "environment",
+  );
+  if (envBackend) {
+    return envBackend;
+  }
+  const dockerImage =
+    typeof params.record.dockerImage === "string"
+      ? params.record.dockerImage.trim()
+      : (params.env.OPENCLAW_RUNTIME_TOOL_DOCKER_IMAGE ??
+        params.env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE);
+  for (const backend of readPluginSandboxBackendCandidates(
+    params.env.OPENCLAW_RUNTIME_TOOL_SANDBOX_BACKENDS ??
+      params.env.OPENCLAW_SPARSEKERNEL_TOOL_SANDBOX_BACKENDS,
+  )) {
+    if (!DEFAULT_COMMAND_SANDBOX_BACKENDS.includes(backend)) {
+      continue;
+    }
+    if (backend === "docker" && !dockerImage?.trim()) {
+      continue;
+    }
+    if (isSandboxBackendAvailable(backend)) {
+      return backend;
+    }
+  }
+  return "local/no_isolation";
 }
 
 function wrapBrowserProcessRelease(
@@ -941,7 +995,7 @@ export class CapabilityToolBroker {
     if (
       !context.agentId ||
       !isSandboxCommandToolName(tool.name) ||
-      !isTruthyToolFlag(env.OPENCLAW_RUNTIME_TOOL_SANDBOX_EXEC)
+      !shouldBrokerSandboxCommand(env)
     ) {
       return null;
     }
@@ -969,10 +1023,11 @@ export class CapabilityToolBroker {
       : tool.name === "bash" || tool.name === "shell"
         ? "bash"
         : rawCommand;
-    const backend: SandboxBackendKind =
-      typeof record.backend === "string" && record.backend.trim()
-        ? (record.backend.trim() as SandboxBackendKind)
-        : "local/no_isolation";
+    const backend = resolveCommandSandboxBackend({ record, env });
+    const dockerImage =
+      typeof record.dockerImage === "string"
+        ? record.dockerImage
+        : (env.OPENCLAW_RUNTIME_TOOL_DOCKER_IMAGE ?? env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE);
     const broker = new LocalSandboxBroker(this.db);
     const allocation = broker.allocateSandbox({
       taskId: context.taskId ?? context.runId ?? context.sessionId ?? `tool:${tool.name}`,
@@ -980,7 +1035,7 @@ export class CapabilityToolBroker {
       trustZoneId: "code_execution",
       requirements: {
         backend,
-        dockerImage: typeof record.dockerImage === "string" ? record.dockerImage : undefined,
+        dockerImage,
         maxRuntimeMs:
           typeof record.timeoutMs === "number" && Number.isFinite(record.timeoutMs)
             ? record.timeoutMs
@@ -995,7 +1050,7 @@ export class CapabilityToolBroker {
       const result = await broker.runCommand({
         allocationId: allocation.id,
         backend,
-        dockerImage: typeof record.dockerImage === "string" ? record.dockerImage : undefined,
+        dockerImage,
         command,
         args,
         cwd: typeof record.cwd === "string" ? record.cwd : undefined,

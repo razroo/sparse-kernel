@@ -54,6 +54,24 @@ export type {
   WorkerIdentityProvisionPlatform,
   WorkerIdentityProvisionPlan,
 } from "./worker-identity-provision.js";
+export { startLoopbackEgressProxy } from "./egress-proxy.js";
+export type { LoopbackEgressProxyHandle, LoopbackEgressProxyOptions } from "./egress-proxy.js";
+export {
+  createSparseKernelPluginWorkerHandler,
+  runSparseKernelPluginWorker,
+} from "./plugin-worker-harness.js";
+export type {
+  SparseKernelPluginWorkerRequest,
+  SparseKernelPluginWorkerStreams,
+  SparseKernelPluginWorkerTool,
+} from "./plugin-worker-harness.js";
+export { inspectSparseKernelRuntime, sparseKernelAcceptanceLanes } from "./runtime-doctor.js";
+export type {
+  SparseKernelAcceptanceLane,
+  SparseKernelDoctorCheck,
+  SparseKernelDoctorReport,
+  SparseKernelDoctorStatus,
+} from "./runtime-doctor.js";
 export {
   compactLedgerContent,
   materializeEmbeddedRunInKernel,

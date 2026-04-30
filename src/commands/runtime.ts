@@ -923,6 +923,7 @@ export async function runtimeBudgetCommand(
       }
     }
     const result = {
+      resourceBudgets: db.getResourceBudgetSnapshot(),
       trustZones: db.listTrustZones(),
       usage: db.summarizeUsage({ since }),
     };
@@ -931,6 +932,9 @@ export async function runtimeBudgetCommand(
       return;
     }
     runtime.log("Trust-zone budgets:");
+    runtime.log(
+      `Small-VM defaults: activeSteps=${result.resourceBudgets.activeAgentStepsMax} modelCalls=${result.resourceBudgets.modelCallsInFlightMax} filePatchJobs=${result.resourceBudgets.filePatchJobsMax} testJobs=${result.resourceBudgets.testJobsMax} browserContexts=${result.resourceBudgets.browserContextsMax} heavySandboxes=${result.resourceBudgets.heavySandboxesMax}`,
+    );
     for (const zone of result.trustZones) {
       runtime.log(
         `${zone.id}: backend=${zone.sandboxBackend} maxProcesses=${zone.maxProcesses ?? "-"} maxMemoryMb=${zone.maxMemoryMb ?? "-"} maxRuntimeSeconds=${zone.maxRuntimeSeconds ?? "-"}`,

@@ -240,6 +240,12 @@ type RuntimeInfoRow = {
   updated_at: string;
 };
 
+type TaskBudgetKind =
+  | "active_agent_steps"
+  | "model_calls_in_flight"
+  | "file_patch_jobs"
+  | "test_jobs";
+
 class ResourceLeaseBudgetError extends Error {
   constructor(
     message: string,
@@ -286,8 +292,56 @@ function optionalText(value: string | null | undefined): string | undefined {
   return value?.trim() ? value : undefined;
 }
 
+function readIntegerText(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value?.trim() ?? "", 10);
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback;
+}
+
 function changes(result: { changes?: number | bigint }): number {
   return numberFromSql(result.changes) ?? 0;
+}
+
+function taskBudgetKind(kind: string): TaskBudgetKind {
+  const normalized = kind.trim().toLowerCase();
+  if (
+    normalized.includes("model") ||
+    normalized.includes("llm") ||
+    normalized.includes("completion")
+  ) {
+    return "model_calls_in_flight";
+  }
+  if (
+    normalized.includes("file_patch") ||
+    normalized.includes("patch") ||
+    normalized.includes("write_file")
+  ) {
+    return "file_patch_jobs";
+  }
+  if (
+    normalized.includes("test") ||
+    normalized.includes("vitest") ||
+    normalized.includes("check")
+  ) {
+    return "test_jobs";
+  }
+  return "active_agent_steps";
+}
+
+function taskBudgetRuntimeInfoKey(kind: TaskBudgetKind): string {
+  return `resource_budget.${kind}_max`;
+}
+
+function taskBudgetDefault(kind: TaskBudgetKind): number {
+  switch (kind) {
+    case "active_agent_steps":
+      return 100;
+    case "model_calls_in_flight":
+      return 50;
+    case "file_patch_jobs":
+      return 16;
+    case "test_jobs":
+      return 4;
+  }
 }
 
 function ensureRuntimeDbPermissions(dbPath: string, env: NodeJS.ProcessEnv): void {
@@ -657,6 +711,24 @@ export class LocalKernelDatabase {
           .all(`${prefix}%`) as RuntimeInfoRow[])
       : (this.db.prepare("SELECT * FROM runtime_info ORDER BY key ASC").all() as RuntimeInfoRow[]);
     return rows.map((row) => ({ key: row.key, value: row.value, updatedAt: row.updated_at }));
+  }
+
+  getResourceBudgetSnapshot(): Record<string, number> {
+    return {
+      logicalAgentsMax: this.readRuntimeInfoInteger("resource_budget.logical_agents_max", 500),
+      activeAgentStepsMax: this.readRuntimeInfoInteger(
+        "resource_budget.active_agent_steps_max",
+        100,
+      ),
+      modelCallsInFlightMax: this.readRuntimeInfoInteger(
+        "resource_budget.model_calls_in_flight_max",
+        50,
+      ),
+      filePatchJobsMax: this.readRuntimeInfoInteger("resource_budget.file_patch_jobs_max", 16),
+      testJobsMax: this.readRuntimeInfoInteger("resource_budget.test_jobs_max", 4),
+      browserContextsMax: this.readRuntimeInfoInteger("resource_budget.browser_contexts_max", 2),
+      heavySandboxesMax: this.readRuntimeInfoInteger("resource_budget.heavy_sandboxes_max", 1),
+    };
   }
 
   listTrustZones(): TrustZoneRecord[] {
@@ -1290,6 +1362,21 @@ export class LocalKernelDatabase {
       if (!row) {
         return null;
       }
+      const budgetDenial = this.resolveTaskClaimBudgetDenial({
+        kind: row.kind,
+        workerId: input.workerId,
+      });
+      if (budgetDenial) {
+        this.recordAudit({
+          actor: { type: "worker", id: input.workerId },
+          action: "task.claim_denied_resource_budget",
+          objectType: "task",
+          objectId: row.id,
+          payload: budgetDenial,
+          createdAt: now,
+        });
+        return null;
+      }
       const updated = changes(
         this.db
           .prepare(
@@ -1319,6 +1406,27 @@ export class LocalKernelDatabase {
     const now = input.now ?? nowIso();
     const leaseUntil = futureIso(now, input.leaseMs ?? 60_000);
     return this.withTransaction(() => {
+      const row = this.db
+        .prepare("SELECT id, kind, status FROM tasks WHERE id = ?")
+        .get(input.taskId) as Pick<TaskRow, "id" | "kind" | "status"> | undefined;
+      if (!row || row.status !== "queued") {
+        return null;
+      }
+      const budgetDenial = this.resolveTaskClaimBudgetDenial({
+        kind: row.kind,
+        workerId: input.workerId,
+      });
+      if (budgetDenial) {
+        this.recordAudit({
+          actor: { type: "worker", id: input.workerId },
+          action: "task.claim_denied_resource_budget",
+          objectType: "task",
+          objectId: input.taskId,
+          payload: budgetDenial,
+          createdAt: now,
+        });
+        return null;
+      }
       const updated = changes(
         this.db
           .prepare(
@@ -1342,6 +1450,65 @@ export class LocalKernelDatabase {
       });
       return this.getTask(input.taskId) ?? null;
     });
+  }
+
+  private resolveTaskClaimBudgetDenial(input: {
+    kind: string;
+    workerId: string;
+  }): Record<string, unknown> | undefined {
+    const globalLimit = this.readRuntimeInfoInteger(
+      taskBudgetRuntimeInfoKey("active_agent_steps"),
+      taskBudgetDefault("active_agent_steps"),
+    );
+    const globalActive = this.countRunningTasksForBudget("active_agent_steps");
+    if (globalActive >= globalLimit) {
+      return {
+        kind: input.kind,
+        workerId: input.workerId,
+        budget: "active_agent_steps",
+        active: globalActive,
+        limit: globalLimit,
+      };
+    }
+    const budgetKind = taskBudgetKind(input.kind);
+    if (budgetKind === "active_agent_steps") {
+      return undefined;
+    }
+    const limit = this.readRuntimeInfoInteger(
+      taskBudgetRuntimeInfoKey(budgetKind),
+      taskBudgetDefault(budgetKind),
+    );
+    const active = this.countRunningTasksForBudget(budgetKind);
+    if (active < limit) {
+      return undefined;
+    }
+    return {
+      kind: input.kind,
+      workerId: input.workerId,
+      budget: budgetKind,
+      active,
+      limit,
+    };
+  }
+
+  private countRunningTasksForBudget(kind: TaskBudgetKind): number {
+    if (kind === "active_agent_steps") {
+      const row = this.db
+        .prepare("SELECT COUNT(*) AS count FROM tasks WHERE status = 'running'")
+        .get() as CountRow;
+      return Number(row.count);
+    }
+    const rows = this.db.prepare("SELECT kind FROM tasks WHERE status = 'running'").all() as Array<
+      Pick<TaskRow, "kind">
+    >;
+    return rows.filter((row) => taskBudgetKind(row.kind) === kind).length;
+  }
+
+  private readRuntimeInfoInteger(key: string, fallback: number): number {
+    const row = this.db.prepare("SELECT value FROM runtime_info WHERE key = ?").get(key) as
+      | Pick<RuntimeInfoRow, "value">
+      | undefined;
+    return readIntegerText(row?.value, fallback);
   }
 
   heartbeatTask(taskId: string, workerId: string, leaseMs = 60_000, now = nowIso()): boolean {

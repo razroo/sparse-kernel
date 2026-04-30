@@ -128,4 +128,21 @@ describe("SparseKernelClient protocol compatibility", () => {
       "/egress-proxies/stop",
     ]);
   });
+
+  it("calls sandbox backend probe API", async () => {
+    const fetchImpl = vi.fn(async (input) => {
+      expect(new URL(String(input)).pathname).toBe("/sandbox/backends/probe");
+      return Response.json([
+        {
+          backend: "bwrap",
+          available: true,
+          command: "bwrap",
+          hard_boundary: true,
+        },
+      ]);
+    }) as unknown as typeof fetch;
+    await expect(new SparseKernelClient({ fetchImpl }).probeSandboxBackends()).resolves.toEqual([
+      expect.objectContaining({ backend: "bwrap", available: true }),
+    ]);
+  });
 });

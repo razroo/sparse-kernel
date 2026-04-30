@@ -335,9 +335,15 @@ describe("SparseKernel runtime commands", () => {
       expect(runtime.writeJson).toHaveBeenCalledWith(
         expect.objectContaining({
           schemaVersion: expect.any(Number),
+          resourceBudgets: expect.objectContaining({
+            activeAgentStepsMax: 100,
+            browserContextsMax: 2,
+          }),
           checks: expect.arrayContaining([
             expect.objectContaining({ id: "ledger.schema", status: "pass" }),
+            expect.objectContaining({ id: "sessions.transcript_compat" }),
             expect.objectContaining({ id: "tools.broker" }),
+            expect.objectContaining({ id: "scheduler.resource_budgets", status: "pass" }),
           ]),
           acceptanceLanes: expect.arrayContaining([
             expect.objectContaining({ id: "ledger-and-leases" }),

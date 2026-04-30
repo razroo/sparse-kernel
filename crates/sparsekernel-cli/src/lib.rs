@@ -4,12 +4,12 @@ use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
-    probe_browser_endpoint, AppendTranscriptEventInput, ArtifactStore, AuditInput, BrowserBroker,
-    CapabilityCheck, CompleteToolCallInput, CreateToolCallInput, EnqueueTaskInput,
-    GrantCapabilityInput, LedgerToolBroker, ListBrowserObservationsInput, ListBrowserTargetsInput,
-    LocalSandboxBroker, MockBrowserBroker, RecordBrowserObservationInput, RecordBrowserTargetInput,
-    SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
-    SPARSEKERNEL_PROTOCOL_VERSION,
+    probe_browser_endpoint, probe_sandbox_backends, AppendTranscriptEventInput, ArtifactStore,
+    AuditInput, BrowserBroker, CapabilityCheck, CompleteToolCallInput, CreateToolCallInput,
+    EnqueueTaskInput, GrantCapabilityInput, LedgerToolBroker, ListBrowserObservationsInput,
+    ListBrowserTargetsInput, LocalSandboxBroker, MockBrowserBroker, RecordBrowserObservationInput,
+    RecordBrowserTargetInput, SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker,
+    UpsertSessionInput, SPARSEKERNEL_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -1312,7 +1312,8 @@ pub fn handle_api_request_with_daemon_state(
                     "artifacts.file-transfer.v1",
                     "capabilities.v1",
                     "browser-broker.v1",
-                    "sandbox-broker.v1"
+                    "sandbox-broker.v1",
+                    "sandbox-backends.probe.v1"
                 ],
             }),
         },
@@ -1621,6 +1622,10 @@ pub fn handle_api_request_with_daemon_state(
                 body: json!({ "released": broker.release_sandbox(&input.allocation_id)? }),
             }
         }
+        ("GET", "/sandbox/backends/probe") => ApiReply {
+            status_code: 200,
+            body: serde_json::to_value(probe_sandbox_backends())?,
+        },
         ("POST", "/leases/release-expired") => {
             let input: ReleaseExpiredLeasesRequest = if body.is_empty() {
                 ReleaseExpiredLeasesRequest { now: None }
@@ -2427,6 +2432,17 @@ mod tests {
             json!({ "allocation_id": allocation_id }),
         );
         assert_eq!(released["released"], true);
+    }
+
+    #[test]
+    fn sandbox_probe_api_reports_backend_boundaries() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let probes = handle_api_request(&mut db, "GET", "/sandbox/backends/probe", &[])
+            .unwrap()
+            .body;
+        assert!(probes.as_array().unwrap().iter().any(|probe| {
+            probe["backend"] == "local/no_isolation" && probe["hard_boundary"] == false
+        }));
     }
 
     #[test]

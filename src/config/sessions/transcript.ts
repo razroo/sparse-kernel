@@ -15,13 +15,17 @@ import {
 import {
   appendTranscriptMessageToRuntimeLedger,
   isRuntimeSessionStorePrimary,
-  resolveRuntimeSessionStoreMode,
+  resolveRuntimeTranscriptCompatMode,
+  type RuntimeTranscriptCompatMode,
 } from "./runtime-ledger.js";
 import { resolveAndPersistSessionFile } from "./session-file.js";
 import { loadSessionStore, normalizeStoreSessionKey } from "./store.js";
 import { parseSessionThreadInfo } from "./thread-info.js";
 import { resolveMirroredTranscriptText } from "./transcript-mirror.js";
 import type { SessionEntry } from "./types.js";
+
+export { resolveRuntimeTranscriptCompatMode };
+export type { RuntimeTranscriptCompatMode };
 
 let piCodingAgentModulePromise: Promise<typeof import("@mariozechner/pi-coding-agent")> | null =
   null;
@@ -58,26 +62,10 @@ export type SessionTranscriptAppendResult =
   | { ok: false; reason: string };
 
 export type SessionTranscriptUpdateMode = "inline" | "file-only" | "none";
-export type RuntimeTranscriptCompatMode = "jsonl" | "ledger-only";
 
 export type SessionTranscriptAssistantMessage = Parameters<SessionManager["appendMessage"]>[0] & {
   role: "assistant";
 };
-
-const RUNTIME_TRANSCRIPT_COMPAT_ENV = "OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT";
-
-export function resolveRuntimeTranscriptCompatMode(
-  env: NodeJS.ProcessEnv = process.env,
-): RuntimeTranscriptCompatMode {
-  const raw = env[RUNTIME_TRANSCRIPT_COMPAT_ENV]?.trim().toLowerCase();
-  if (raw === "ledger-only" || raw === "ledger" || raw === "sqlite" || raw === "off") {
-    return "ledger-only";
-  }
-  if (raw === "jsonl" || raw === "legacy" || raw === "compat" || raw === "on") {
-    return "jsonl";
-  }
-  return resolveRuntimeSessionStoreMode(env) === "sqlite-strict" ? "ledger-only" : "jsonl";
-}
 
 export type LatestAssistantTranscriptText = {
   id?: string;

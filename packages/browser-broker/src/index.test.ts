@@ -1381,10 +1381,58 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       )?.params.expression ?? "";
     expect(actionExpression).toContain("waitForActionTarget");
     expect(actionExpression).toContain("const timeoutMs = 1234");
-    expect(actionExpression).toContain("document.querySelector(selector)");
+    expect(actionExpression).toContain("queryRoot().querySelector(selector)");
     expect(actionExpression).toContain("getBoundingClientRect");
     expect(actionExpression).toContain("aria-disabled");
     expect(actionExpression).toContain("elementFromPoint");
+  });
+
+  it("scopes brokered actions to same-origin frames when a frame selector is provided", async () => {
+    const kernel = new FakeKernel();
+    const transport = new FakeCdpTransport();
+    const broker = new SparseKernelCdpBrowserBroker({
+      kernel,
+      fetchImpl: async () =>
+        Response.json({
+          webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test",
+        }),
+      transportFactory: async () => transport,
+    });
+
+    const context = await broker.acquireContext({
+      trust_zone_id: "public_web",
+      cdp_endpoint: "http://127.0.0.1:9222",
+      initial_url: "https://example.com/",
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "click",
+      selector: "#inside-frame",
+      frameSelector: "iframe[name='editor']",
+      timeoutMs: 1_234,
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "evaluate",
+      selector: "#inside-frame",
+      frameSelector: "iframe[name='editor']",
+      fn: "(node) => node.textContent",
+    });
+
+    const expressions = transport.sent
+      .filter(
+        (message): message is { method: string; params: { expression: string } } =>
+          typeof message === "object" &&
+          message !== null &&
+          (message as { method?: unknown }).method === "Runtime.evaluate" &&
+          typeof (message as { params?: { expression?: unknown } }).params?.expression === "string",
+      )
+      .map((message) => message.params.expression);
+    expect(expressions).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("const frameSelector = \"iframe[name='editor']\""),
+        expect.stringContaining("frame.contentDocument"),
+        expect.stringContaining("queryRoot().querySelector(selector)"),
+      ]),
+    );
   });
 
   it("waits for CDP network idle instead of treating document load as enough", async () => {

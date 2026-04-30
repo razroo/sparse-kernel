@@ -126,6 +126,17 @@ export function requiresPluginSubprocess(raw: string | undefined): boolean {
 
 function requiresNonBundledPluginSubprocess(raw: string | undefined): boolean {
   const normalized = raw?.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  if (
+    normalized === "trusted" ||
+    normalized === "bundled" ||
+    normalized === "in-process" ||
+    normalized === "in_process"
+  ) {
+    return false;
+  }
   return normalized === "untrusted" || normalized === "non-bundled" || normalized === "non_bundled";
 }
 
@@ -157,7 +168,7 @@ export function pluginToolRequiresSubprocess(
   }
   return (
     requiresNonBundledPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_TRUST_DEFAULT) &&
-    meta.origin !== "bundled"
+    (meta.origin === "workspace" || meta.origin === "global" || meta.origin === "config")
   );
 }
 
@@ -617,7 +628,7 @@ export class CapabilityToolBroker {
         subject: input.context.subject,
       },
     });
-    const broker = new LocalSandboxBroker(this.db);
+    const broker = new LocalSandboxBroker(this.db, { env });
     const allocation = broker.allocateSandbox({
       taskId:
         input.context.taskId ??
@@ -629,6 +640,7 @@ export class CapabilityToolBroker {
       requirements: {
         backend: sandboxConfig.backend,
         dockerImage: sandboxConfig.dockerImage,
+        isolationProfile: sandboxConfig.requireIsolated ? undefined : "trusted_local",
         maxRuntimeMs: timeoutMs,
         maxBytesOut: sandboxConfig.maxBytesOut,
       },
@@ -1028,7 +1040,7 @@ export class CapabilityToolBroker {
       typeof record.dockerImage === "string"
         ? record.dockerImage
         : (env.OPENCLAW_RUNTIME_TOOL_DOCKER_IMAGE ?? env.OPENCLAW_SPARSEKERNEL_DOCKER_IMAGE);
-    const broker = new LocalSandboxBroker(this.db);
+    const broker = new LocalSandboxBroker(this.db, { env });
     const allocation = broker.allocateSandbox({
       taskId: context.taskId ?? context.runId ?? context.sessionId ?? `tool:${tool.name}`,
       agentId: context.agentId,

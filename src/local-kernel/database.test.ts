@@ -20,6 +20,7 @@ import {
   LocalBrowserBroker,
   LocalKernelDatabase,
   LocalSandboxBroker,
+  probeSandboxBackends,
   recoverEmbeddedRunTasks,
 } from "./index.js";
 import { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat.js";
@@ -52,17 +53,26 @@ describe("local runtime kernel database", () => {
   it("migrates an empty database idempotently", () => {
     const root = tempRoot();
     const db = openTempDb(root);
-    expect(db.schemaVersion()).toBe(4);
+    expect(db.schemaVersion()).toBe(5);
     db.migrate();
-    expect(db.schemaVersion()).toBe(4);
+    expect(db.schemaVersion()).toBe(5);
     const migrations = db.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as {
       count: number;
     };
-    expect(migrations.count).toBe(4);
+    expect(migrations.count).toBe(5);
+    expect(db.getResourceBudgetSnapshot()).toMatchObject({
+      logicalAgentsMax: 500,
+      activeAgentStepsMax: 100,
+      modelCallsInFlightMax: 50,
+      filePatchJobsMax: 16,
+      testJobsMax: 4,
+      browserContextsMax: 2,
+      heavySandboxesMax: 1,
+    });
     db.close();
 
     const reopened = openTempDb(root);
-    expect(reopened.schemaVersion()).toBe(4);
+    expect(reopened.schemaVersion()).toBe(5);
     expect(reopened.inspect().counts.audit_log).toBe(0);
   });
 
@@ -160,6 +170,56 @@ describe("local runtime kernel database", () => {
     expect(db.releaseExpiredLeases("2026-01-01T00:00:02.000Z")).toBe(1);
     const reclaimed = db.claimNextTask({ workerId: "worker-b" });
     expect(reclaimed).toMatchObject({ id: "task-b", status: "running", leaseOwner: "worker-b" });
+  });
+
+  it("enforces active task budgets through atomic task claiming", () => {
+    const db = openTempDb();
+    db.setRuntimeInfo("resource_budget.test_jobs_max", "1");
+    db.enqueueTask({ id: "test-a", kind: "test.vitest", priority: 2 });
+    db.enqueueTask({ id: "test-b", kind: "test.vitest", priority: 1 });
+    expect(db.claimTask({ taskId: "test-a", workerId: "worker-a" })).toMatchObject({
+      id: "test-a",
+      status: "running",
+    });
+    expect(db.claimNextTask({ workerId: "worker-b", kinds: ["test.vitest"] })).toBeNull();
+    expect(db.listAudit({ limit: 20 })).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "task.claim_denied_resource_budget",
+          objectId: "test-b",
+          payload: expect.objectContaining({
+            budget: "test_jobs",
+            active: 1,
+            limit: 1,
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("enforces the global active-step budget before task-specific budgets", () => {
+    const db = openTempDb();
+    db.setRuntimeInfo("resource_budget.active_agent_steps_max", "1");
+    db.enqueueTask({ id: "step-a", kind: "demo", priority: 2 });
+    db.enqueueTask({ id: "step-b", kind: "test.vitest", priority: 1 });
+    expect(db.claimTask({ taskId: "step-a", workerId: "worker-a" })).toMatchObject({
+      id: "step-a",
+      status: "running",
+    });
+    expect(db.claimNextTask({ workerId: "worker-b" })).toBeNull();
+    expect(db.listAudit({ limit: 20 })).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "task.claim_denied_resource_budget",
+          objectId: "step-b",
+          payload: expect.objectContaining({
+            budget: "active_agent_steps",
+            active: 1,
+            limit: 1,
+          }),
+        }),
+      ]),
+    );
   });
 
   it("recovers dead-owner embedded run tasks for restart claim", () => {
@@ -560,6 +620,31 @@ describe("local runtime kernel database", () => {
     });
     expect(allocation).toMatchObject({ backend: "local/no_isolation", status: "active" });
     expect(broker.releaseSandbox(allocation.id)).toBe(true);
+  });
+
+  it("probes sandbox backend availability and reports honest boundaries", () => {
+    const probes = probeSandboxBackends({
+      commandAvailable: (command) => command === "bwrap",
+    });
+    expect(probes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          backend: "local/no_isolation",
+          available: true,
+          hardBoundary: false,
+        }),
+        expect.objectContaining({
+          backend: "bwrap",
+          available: true,
+          command: "bwrap",
+          hardBoundary: true,
+        }),
+        expect.objectContaining({
+          backend: "docker",
+          available: false,
+        }),
+      ]),
+    );
   });
 
   it("fails closed when untrusted plugin work requests local/no-isolation", () => {

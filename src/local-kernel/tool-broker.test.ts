@@ -702,6 +702,39 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("treats non-bundled plugin tools as subprocess-first by default", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "workspace_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("workspace_tool");
+      setPluginToolMeta(rawTool, {
+        pluginId: "workspace-plugin",
+        optional: false,
+        origin: "workspace",
+      });
+      const broker = new CapabilityToolBroker(db);
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-workspace-default-boundary", {})).rejects.toThrow(
+        /out-of-process execution/,
+      );
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining(["plugin_tool.subprocess_required", "tool_call.failed"]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it("auto-selects an available isolated backend for plugin subprocess workers", () => {
     expect(
       resolvePluginSandboxConfig({

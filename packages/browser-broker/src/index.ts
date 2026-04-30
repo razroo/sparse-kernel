@@ -171,6 +171,7 @@ export type SparseKernelBrowserActRequest =
       kind: "click";
       ref?: string;
       selector?: string;
+      frameSelector?: string;
       targetId?: string;
       doubleClick?: boolean;
       button?: string;
@@ -193,6 +194,7 @@ export type SparseKernelBrowserActRequest =
       kind: "type";
       ref?: string;
       selector?: string;
+      frameSelector?: string;
       text: string;
       targetId?: string;
       submit?: boolean;
@@ -200,13 +202,35 @@ export type SparseKernelBrowserActRequest =
       timeoutMs?: number;
     }
   | { kind: "press"; key: string; targetId?: string; delayMs?: number; modifiers?: string[] }
-  | { kind: "hover"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
-  | { kind: "check"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
-  | { kind: "uncheck"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
+  | {
+      kind: "hover";
+      ref?: string;
+      selector?: string;
+      frameSelector?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "check";
+      ref?: string;
+      selector?: string;
+      frameSelector?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "uncheck";
+      ref?: string;
+      selector?: string;
+      frameSelector?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
   | {
       kind: "scrollIntoView";
       ref?: string;
       selector?: string;
+      frameSelector?: string;
       targetId?: string;
       timeoutMs?: number;
     }
@@ -223,6 +247,7 @@ export type SparseKernelBrowserActRequest =
       kind: "select";
       ref?: string;
       selector?: string;
+      frameSelector?: string;
       values: string[];
       targetId?: string;
       timeoutMs?: number;
@@ -246,7 +271,15 @@ export type SparseKernelBrowserActRequest =
       targetId?: string;
       timeoutMs?: number;
     }
-  | { kind: "evaluate"; fn: string; ref?: string; targetId?: string; timeoutMs?: number }
+  | {
+      kind: "evaluate";
+      fn: string;
+      ref?: string;
+      selector?: string;
+      frameSelector?: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
   | {
       kind: "batch";
       actions: SparseKernelBrowserActRequest[];
@@ -877,6 +910,7 @@ export class SparseKernelCdpBrowserBroker {
                 request.kind,
                 selector,
                 resolveCdpActionTimeoutMs(request.timeoutMs),
+                request.frameSelector,
               ),
               returnByValue: true,
               awaitPromise: true,
@@ -908,6 +942,7 @@ export class SparseKernelCdpBrowserBroker {
                 request,
                 selector,
                 resolveCdpActionTimeoutMs(request.timeoutMs),
+                request.frameSelector,
               ),
               returnByValue: true,
               awaitPromise: true,
@@ -1022,13 +1057,17 @@ export class SparseKernelCdpBrowserBroker {
       }
       case "evaluate": {
         return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
-          const selector = request.ref
-            ? this.resolveActionSelector(context, { ref: request.ref })
-            : undefined;
+          const selector =
+            request.ref || request.selector
+              ? this.resolveActionSelector(context, {
+                  ref: request.ref,
+                  selector: request.selector,
+                })
+              : undefined;
           const evaluated = await context.connection.command<{ result?: { value?: unknown } }>(
             "Runtime.evaluate",
             {
-              expression: buildEvaluateExpression(request, selector),
+              expression: buildEvaluateExpression(request, selector, request.frameSelector),
               returnByValue: true,
               awaitPromise: true,
             },
@@ -2627,9 +2666,11 @@ function buildActionExpression(
   request: SparseKernelBrowserActRequest,
   selector: string,
   timeoutMs: number,
+  frameSelector?: string,
 ): string {
   const selectorJson = JSON.stringify(selector);
   const timeoutJson = JSON.stringify(timeoutMs);
+  const frameSelectorJson = JSON.stringify(frameSelector?.trim() || "");
   if (request.kind === "click" || request.kind === "hover" || request.kind === "scrollIntoView") {
     const eventName = request.kind === "hover" ? "mouseover" : "click";
     const repeat = request.kind === "click" && request.doubleClick ? 2 : 1;
@@ -2637,7 +2678,7 @@ function buildActionExpression(
       normalizeMouseButton(request.kind === "click" ? request.button : undefined),
     );
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind, frameSelectorJson)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   if (${JSON.stringify(request.kind)} === "scrollIntoView") return { ok: true };
@@ -2659,7 +2700,7 @@ function buildActionExpression(
     const submit = request.submit === true;
     const slowly = request.slowly === true;
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind, frameSelectorJson)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   node.focus?.();
@@ -2693,7 +2734,7 @@ function buildActionExpression(
   if (request.kind === "check" || request.kind === "uncheck") {
     const desiredChecked = request.kind === "check";
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind, frameSelectorJson)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   const desiredChecked = ${JSON.stringify(desiredChecked)};
@@ -2713,7 +2754,7 @@ function buildActionExpression(
   if (request.kind === "select") {
     const values = JSON.stringify(request.values);
     return `(async () => {
-  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind, frameSelectorJson)}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   const values = ${values};
@@ -2739,16 +2780,18 @@ function buildActionPointExpression(
   kind: "click" | "hover",
   selector: string,
   timeoutMs: number,
+  frameSelector?: string,
 ): string {
   return `(async () => {
-  ${buildActionTargetHelpers(JSON.stringify(selector), JSON.stringify(timeoutMs), kind)}
+  ${buildActionTargetHelpers(JSON.stringify(selector), JSON.stringify(timeoutMs), kind, JSON.stringify(frameSelector?.trim() || ""))}
   const node = await waitForActionTarget();
   node.scrollIntoView({ block: "center", inline: "center" });
   await delay(0);
   const target = await waitForActionTarget();
+  const point = centerPointForNode(target);
   const rect = target.getBoundingClientRect();
-  const x = Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(window.innerWidth - 1, 0));
-  const y = Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(window.innerHeight - 1, 0));
+  const x = point.x;
+  const y = point.y;
   return { ok: true, x, y, rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height } };
 })()`;
 }
@@ -2847,25 +2890,62 @@ function buildFillExpression(
 function buildEvaluateExpression(
   request: Extract<SparseKernelBrowserActRequest, { kind: "evaluate" }>,
   selector?: string,
+  frameSelector?: string,
 ): string {
   return `(() => {
   const fnBody = ${JSON.stringify(request.fn)};
   const selector = ${JSON.stringify(selector ?? "")};
-  const node = selector ? document.querySelector(selector) : undefined;
+  const frameSelector = ${JSON.stringify(frameSelector?.trim() || "")};
+  const queryRoot = () => {
+    if (!frameSelector) return document;
+    const frame = document.querySelector(frameSelector);
+    if (!(frame instanceof HTMLIFrameElement || frame instanceof HTMLFrameElement)) {
+      throw new Error("SparseKernel browser evaluate frame target not found");
+    }
+    const frameDocument = frame.contentDocument;
+    if (!frameDocument) throw new Error("SparseKernel browser evaluate frame is not accessible");
+    return frameDocument;
+  };
+  const node = selector ? queryRoot().querySelector(selector) : undefined;
   if (selector && !node) throw new Error("SparseKernel browser evaluate target not found");
   const candidate = eval("(" + fnBody + ")");
   return typeof candidate === "function" ? (selector ? candidate(node) : candidate()) : candidate;
 })()`;
 }
 
-function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kind: string): string {
+function buildActionTargetHelpers(
+  selectorJson: string,
+  timeoutJson: string,
+  kind: string,
+  frameSelectorJson = '""',
+): string {
   return `const selector = ${selectorJson};
   const timeoutMs = ${timeoutJson};
   const actionKind = ${JSON.stringify(kind)};
+  const frameSelector = ${frameSelectorJson};
+  let actionFrameElement = null;
+  const queryRoot = () => {
+    if (!frameSelector) return document;
+    const frame = document.querySelector(frameSelector);
+    if (!(frame instanceof HTMLIFrameElement || frame instanceof HTMLFrameElement)) {
+      throw new Error("SparseKernel browser action frame target not found");
+    }
+    const frameDocument = frame.contentDocument;
+    if (!frameDocument) throw new Error("SparseKernel browser action frame is not accessible");
+    actionFrameElement = frame;
+    return frameDocument;
+  };
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const rectSnapshot = (node) => {
     const rect = node.getBoundingClientRect();
     return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  };
+  const centerPointForNode = (node) => {
+    const rect = node.getBoundingClientRect();
+    const frameRect = actionFrameElement ? actionFrameElement.getBoundingClientRect() : { left: 0, top: 0 };
+    const x = Math.min(Math.max(frameRect.left + rect.left + rect.width / 2, 0), Math.max(window.innerWidth - 1, 0));
+    const y = Math.min(Math.max(frameRect.top + rect.top + rect.height / 2, 0), Math.max(window.innerHeight - 1, 0));
+    return { x, y };
   };
   const isVisible = (node) => {
     if (!node?.isConnected) return false;
@@ -2896,10 +2976,10 @@ function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kin
   };
   const receivesCenterHit = (node) => {
     if (getComputedStyle(node).pointerEvents === "none") return false;
-    const rect = node.getBoundingClientRect();
-    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(window.innerWidth - 1, 0));
-    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(window.innerHeight - 1, 0));
-    const hit = document.elementFromPoint(x, y);
+    const point = centerPointForNode(node);
+    const hit = actionFrameElement
+      ? queryRoot().elementFromPoint(point.x - actionFrameElement.getBoundingClientRect().left, point.y - actionFrameElement.getBoundingClientRect().top)
+      : document.elementFromPoint(point.x, point.y);
     if (!hit) return false;
     return hit === node || node.contains(hit) || hit.closest?.("label")?.contains(node);
   };
@@ -2923,7 +3003,7 @@ function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kin
   const waitForActionTarget = async () => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() <= deadline) {
-      const node = document.querySelector(selector);
+      const node = queryRoot().querySelector(selector);
       if (node) {
         if (actionKind !== "scrollIntoView") {
           node.scrollIntoView({ block: "center", inline: "center" });

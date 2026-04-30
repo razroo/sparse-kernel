@@ -3,7 +3,7 @@ export type KernelMigration = {
   statements: readonly string[];
 };
 
-export const LOCAL_KERNEL_SCHEMA_VERSION = 4;
+export const LOCAL_KERNEL_SCHEMA_VERSION = 5;
 
 const createBaseSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -356,6 +356,18 @@ CREATE INDEX IF NOT EXISTS resource_leases_owner_status_updated_idx ON resource_
 CREATE INDEX IF NOT EXISTS runtime_info_updated_idx ON runtime_info(updated_at);
 `;
 
+const seedSmallVmResourceBudgets = `
+INSERT OR IGNORE INTO runtime_info(key, value, updated_at)
+VALUES
+  ('resource_budget.logical_agents_max', '500', datetime('now')),
+  ('resource_budget.active_agent_steps_max', '100', datetime('now')),
+  ('resource_budget.model_calls_in_flight_max', '50', datetime('now')),
+  ('resource_budget.file_patch_jobs_max', '16', datetime('now')),
+  ('resource_budget.test_jobs_max', '4', datetime('now')),
+  ('resource_budget.browser_contexts_max', '2', datetime('now')),
+  ('resource_budget.heavy_sandboxes_max', '1', datetime('now'));
+`;
+
 export const LOCAL_KERNEL_MIGRATIONS: readonly KernelMigration[] = [
   {
     version: 1,
@@ -372,5 +384,9 @@ export const LOCAL_KERNEL_MIGRATIONS: readonly KernelMigration[] = [
   {
     version: 4,
     statements: [createRuntimeInfoAndLeaseMetadata],
+  },
+  {
+    version: 5,
+    statements: [seedSmallVmResourceBudgets],
   },
 ];

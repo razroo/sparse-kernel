@@ -5,8 +5,10 @@ import { DEFAULT_AGENT_ID, normalizeAgentId } from "../../routing/session-key.js
 import type { SessionEntry } from "./types.js";
 
 export type RuntimeSessionStoreMode = "off" | "dual" | "sqlite" | "sqlite-strict";
+export type RuntimeTranscriptCompatMode = "jsonl" | "ledger-only";
 
 const SESSION_STORE_MODE_ENV = "OPENCLAW_RUNTIME_SESSION_STORE";
+const RUNTIME_TRANSCRIPT_COMPAT_ENV = "OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT";
 const log = createSubsystemLogger("sessions/runtime-ledger");
 const warnedMirrorFailures = new Set<string>();
 
@@ -71,6 +73,25 @@ export function resolveRuntimeSessionStoreMode(
 export function isRuntimeSessionStorePrimary(env: NodeJS.ProcessEnv = process.env): boolean {
   const mode = resolveRuntimeSessionStoreMode(env);
   return mode === "sqlite" || mode === "sqlite-strict";
+}
+
+export function resolveRuntimeTranscriptCompatMode(
+  env: NodeJS.ProcessEnv = process.env,
+): RuntimeTranscriptCompatMode {
+  const raw = env[RUNTIME_TRANSCRIPT_COMPAT_ENV]?.trim().toLowerCase();
+  if (raw === "ledger-only" || raw === "ledger" || raw === "sqlite" || raw === "off") {
+    return "ledger-only";
+  }
+  if (raw === "jsonl" || raw === "legacy" || raw === "compat" || raw === "on") {
+    return "jsonl";
+  }
+  return resolveRuntimeSessionStoreMode(env) === "sqlite-strict" ? "ledger-only" : "jsonl";
+}
+
+export function shouldWriteLegacyRuntimeTranscriptJsonl(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return !isRuntimeSessionStorePrimary(env) || resolveRuntimeTranscriptCompatMode(env) === "jsonl";
 }
 
 function buildSessionStoreLedgerEntries(params: {

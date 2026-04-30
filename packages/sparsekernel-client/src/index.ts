@@ -353,6 +353,15 @@ export type SparseKernelSandboxAllocation = {
   created_at: string;
 };
 
+export type SparseKernelSandboxBackendProbe = {
+  backend: string;
+  available: boolean;
+  command?: string | null;
+  hard_boundary?: boolean;
+  isolation?: string | null;
+  notes?: string[];
+};
+
 export type SparseKernelAllocateSandboxInput = {
   agent_id?: string | null;
   task_id?: string | null;
@@ -691,6 +700,10 @@ export class SparseKernelClient {
     input: SparseKernelRunSandboxCommandInput,
   ): Promise<SparseKernelRunSandboxCommandResult> {
     return await this.postJson<SparseKernelRunSandboxCommandResult>("/sandbox/run-command", input);
+  }
+
+  async probeSandboxBackends(): Promise<SparseKernelSandboxBackendProbe[]> {
+    return await this.getJson<SparseKernelSandboxBackendProbe[]>("/sandbox/backends/probe");
   }
 
   async createToolCall(input: SparseKernelCreateToolCallInput): Promise<SparseKernelToolCall> {

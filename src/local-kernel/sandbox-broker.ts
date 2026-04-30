@@ -134,6 +134,15 @@ export interface SandboxBroker {
   runCommand?(request: SandboxCommandRequest): Promise<SandboxCommandResult>;
 }
 
+export type SandboxBackendProbe = {
+  backend: SandboxBackendKind;
+  available: boolean;
+  command?: string;
+  hardBoundary: boolean;
+  isolation: string;
+  notes: string[];
+};
+
 function commandAvailable(command: string): boolean {
   const result = spawnSync(command, ["--version"], { stdio: "ignore" });
   if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -142,8 +151,11 @@ function commandAvailable(command: string): boolean {
   return result.status === 0 || result.status === 1;
 }
 
-function firstAvailableCommand(commands: string[]): string | undefined {
-  return commands.find((command) => commandAvailable(command));
+function firstAvailableCommand(
+  commands: string[],
+  available: (command: string) => boolean = commandAvailable,
+): string | undefined {
+  return commands.find((command) => available(command));
 }
 
 export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean {
@@ -161,6 +173,56 @@ export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean 
     case "other":
       return true;
   }
+}
+
+export function probeSandboxBackends(
+  input: {
+    commandAvailable?: (command: string) => boolean;
+  } = {},
+): SandboxBackendProbe[] {
+  const available = input.commandAvailable ?? commandAvailable;
+  const bwrap = firstAvailableCommand(["bwrap", "bubblewrap"], available);
+  const minijail = firstAvailableCommand(["minijail0", "minijail"], available);
+  const docker = firstAvailableCommand(["docker"], available);
+  return [
+    {
+      backend: "local/no_isolation",
+      available: true,
+      hardBoundary: false,
+      isolation: describeSandboxBackend("local/no_isolation"),
+      notes: ["Trusted operations only; no host isolation is provided."],
+    },
+    {
+      backend: "bwrap",
+      available: Boolean(bwrap),
+      ...(bwrap ? { command: bwrap } : {}),
+      hardBoundary: Boolean(bwrap),
+      isolation: describeSandboxBackend("bwrap"),
+      notes: bwrap
+        ? ["Requires kernel namespace support and broker-selected bind policy."]
+        : ["Install bubblewrap to enable this backend."],
+    },
+    {
+      backend: "minijail",
+      available: Boolean(minijail),
+      ...(minijail ? { command: minijail } : {}),
+      hardBoundary: Boolean(minijail),
+      isolation: describeSandboxBackend("minijail"),
+      notes: minijail
+        ? ["Requires host minijail policy support for the selected trust zone."]
+        : ["Install minijail to enable this backend."],
+    },
+    {
+      backend: "docker",
+      available: Boolean(docker),
+      ...(docker ? { command: docker } : {}),
+      hardBoundary: Boolean(docker),
+      isolation: describeSandboxBackend("docker"),
+      notes: docker
+        ? ["Container isolation depends on daemon policy; not a per-agent default."]
+        : ["Install/configure Docker and an explicit image to enable this backend."],
+    },
+  ];
 }
 
 export type SandboxSpawnPlan = {
@@ -323,7 +385,10 @@ function profileRequiresIsolatedBackend(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (profile === "plugin_untrusted") {
-    return !isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED);
+    return (
+      !isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED) &&
+      !isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION)
+    );
   }
   if (profile === "code_execution") {
     return isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_ISOLATED_CODE_EXECUTION);
@@ -1029,7 +1094,10 @@ export async function runSandboxSpawnPlan(
 export class LocalSandboxBroker implements SandboxBroker {
   private readonly allocationBackends = new Map<string, SandboxBackendKind>();
 
-  constructor(private readonly db: LocalKernelDatabase) {}
+  constructor(
+    private readonly db: LocalKernelDatabase,
+    private readonly options: { env?: NodeJS.ProcessEnv } = {},
+  ) {}
 
   allocateSandbox(request: SandboxAllocationRequest): SandboxAllocationRecord {
     if (request.agentId) {
@@ -1056,6 +1124,7 @@ export class LocalSandboxBroker implements SandboxBroker {
       backend = selectSandboxBackendForProfile({
         requestedBackend: request.requirements?.backend,
         profile: request.requirements?.isolationProfile ?? requestedProfile,
+        env: this.options.env,
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);

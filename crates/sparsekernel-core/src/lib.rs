@@ -14,12 +14,13 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 3;
+pub const SPARSEKERNEL_SCHEMA_VERSION: i64 = 4;
 pub const SPARSEKERNEL_PROTOCOL_VERSION: &str = "2026-04-29.v1";
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_0002: &str =
     include_str!("../../../migrations/0002_browser_targets_observations.sql");
 const MIGRATION_0003: &str = include_str!("../../../migrations/0003_resource_lease_metadata.sql");
+const MIGRATION_0004: &str = include_str!("../../../migrations/0004_resource_budgets.sql");
 
 pub type Result<T> = std::result::Result<T, SparseKernelError>;
 
@@ -87,6 +88,62 @@ fn truthy_env_flag(name: &str) -> bool {
         env::var(name).ok().as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskBudgetKind {
+    ActiveAgentSteps,
+    ModelCallsInFlight,
+    FilePatchJobs,
+    TestJobs,
+}
+
+fn task_budget_kind(kind: &str) -> TaskBudgetKind {
+    let normalized = kind.trim().to_ascii_lowercase();
+    if normalized.contains("model")
+        || normalized.contains("llm")
+        || normalized.contains("completion")
+    {
+        return TaskBudgetKind::ModelCallsInFlight;
+    }
+    if normalized.contains("file_patch")
+        || normalized.contains("patch")
+        || normalized.contains("write_file")
+    {
+        return TaskBudgetKind::FilePatchJobs;
+    }
+    if normalized.contains("test") || normalized.contains("vitest") || normalized.contains("check")
+    {
+        return TaskBudgetKind::TestJobs;
+    }
+    TaskBudgetKind::ActiveAgentSteps
+}
+
+fn task_budget_key(kind: TaskBudgetKind) -> &'static str {
+    match kind {
+        TaskBudgetKind::ActiveAgentSteps => "resource_budget.active_agent_steps_max",
+        TaskBudgetKind::ModelCallsInFlight => "resource_budget.model_calls_in_flight_max",
+        TaskBudgetKind::FilePatchJobs => "resource_budget.file_patch_jobs_max",
+        TaskBudgetKind::TestJobs => "resource_budget.test_jobs_max",
+    }
+}
+
+fn task_budget_name(kind: TaskBudgetKind) -> &'static str {
+    match kind {
+        TaskBudgetKind::ActiveAgentSteps => "active_agent_steps",
+        TaskBudgetKind::ModelCallsInFlight => "model_calls_in_flight",
+        TaskBudgetKind::FilePatchJobs => "file_patch_jobs",
+        TaskBudgetKind::TestJobs => "test_jobs",
+    }
+}
+
+fn task_budget_default(kind: TaskBudgetKind) -> i64 {
+    match kind {
+        TaskBudgetKind::ActiveAgentSteps => 100,
+        TaskBudgetKind::ModelCallsInFlight => 50,
+        TaskBudgetKind::FilePatchJobs => 16,
+        TaskBudgetKind::TestJobs => 4,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,6 +465,16 @@ pub struct BrowserEndpointProbe {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxBackendProbe {
+    pub backend: String,
+    pub available: bool,
+    pub command: Option<String>,
+    pub hard_boundary: bool,
+    pub isolation: String,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxAllocationRecord {
     pub id: String,
@@ -484,6 +551,13 @@ impl SparseKernelDb {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
                     params![3, now_iso()],
+                )?;
+            }
+            if current < 4 {
+                self.conn.execute_batch(MIGRATION_0004)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    params![4, now_iso()],
                 )?;
             }
             Ok(())
@@ -897,6 +971,90 @@ impl SparseKernelDb {
             .map_err(SparseKernelError::from)
     }
 
+    fn task_claim_budget_denial(
+        tx: &rusqlite::Transaction<'_>,
+        kind: &str,
+        worker_id: &str,
+    ) -> Result<Option<Value>> {
+        let global_limit = Self::runtime_info_integer_tx(
+            tx,
+            task_budget_key(TaskBudgetKind::ActiveAgentSteps),
+            task_budget_default(TaskBudgetKind::ActiveAgentSteps),
+        )?;
+        let global_active =
+            Self::running_task_count_for_budget_tx(tx, TaskBudgetKind::ActiveAgentSteps)?;
+        if global_active >= global_limit {
+            return Ok(Some(json!({
+                "kind": kind,
+                "workerId": worker_id,
+                "budget": task_budget_name(TaskBudgetKind::ActiveAgentSteps),
+                "active": global_active,
+                "limit": global_limit,
+            })));
+        }
+        let budget_kind = task_budget_kind(kind);
+        if budget_kind == TaskBudgetKind::ActiveAgentSteps {
+            return Ok(None);
+        }
+        let limit = Self::runtime_info_integer_tx(
+            tx,
+            task_budget_key(budget_kind),
+            task_budget_default(budget_kind),
+        )?;
+        let active = Self::running_task_count_for_budget_tx(tx, budget_kind)?;
+        if active < limit {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "kind": kind,
+            "workerId": worker_id,
+            "budget": task_budget_name(budget_kind),
+            "active": active,
+            "limit": limit,
+        })))
+    }
+
+    fn runtime_info_integer_tx(
+        tx: &rusqlite::Transaction<'_>,
+        key: &str,
+        fallback: i64,
+    ) -> Result<i64> {
+        let value: Option<String> = tx
+            .query_row(
+                "SELECT value FROM runtime_info WHERE key = ?",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value
+            .as_deref()
+            .and_then(|entry| entry.trim().parse::<i64>().ok())
+            .map(|entry| entry.max(0))
+            .unwrap_or(fallback))
+    }
+
+    fn running_task_count_for_budget_tx(
+        tx: &rusqlite::Transaction<'_>,
+        kind: TaskBudgetKind,
+    ) -> Result<i64> {
+        if kind == TaskBudgetKind::ActiveAgentSteps {
+            return Ok(tx.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'",
+                [],
+                |row| row.get(0),
+            )?);
+        }
+        let mut stmt = tx.prepare("SELECT kind FROM tasks WHERE status = 'running'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut count = 0;
+        for row in rows {
+            if task_budget_kind(&row?) == kind {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn claim_next_task(
         &mut self,
         worker_id: &str,
@@ -926,6 +1084,15 @@ impl SparseKernelDb {
             return Ok(None);
         };
         let now = now_iso();
+        if let Some(payload) = Self::task_claim_budget_denial(&tx, &kind, worker_id)? {
+            tx.execute(
+                "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+                 VALUES('worker', ?, 'task.claim_denied_resource_budget', 'task', ?, ?, ?)",
+                params![worker_id, id, payload.to_string(), now],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
         let lease_until = future_iso(lease_seconds.max(1));
         let updated = tx.execute(
             "UPDATE tasks
@@ -951,35 +1118,58 @@ impl SparseKernelDb {
     }
 
     pub fn claim_task(
-        &self,
+        &mut self,
         task_id: &str,
         worker_id: &str,
         lease_seconds: i64,
     ) -> Result<Option<TaskRecord>> {
         let now = now_iso();
         let lease_until = future_iso(lease_seconds.max(1));
-        let updated = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let task_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM tasks WHERE id = ? AND status = 'queued'",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(kind) = task_kind else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if let Some(payload) = Self::task_claim_budget_denial(&tx, &kind, worker_id)? {
+            tx.execute(
+                "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+                 VALUES('worker', ?, 'task.claim_denied_resource_budget', 'task', ?, ?, ?)",
+                params![worker_id, task_id, payload.to_string(), now],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = tx.execute(
             "UPDATE tasks
              SET status = 'running', lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated_at = ?
              WHERE id = ? AND status = 'queued'",
             params![worker_id, lease_until, now, task_id],
         )?;
         if updated == 0 {
+            tx.commit()?;
             return Ok(None);
         }
-        self.record_task_event(
-            task_id,
-            "claimed",
-            json!({ "workerId": worker_id, "leaseUntil": lease_until }),
+        tx.execute(
+            "INSERT INTO task_events(task_id, event_type, payload_json, created_at) VALUES(?, 'claimed', ?, ?)",
+            params![
+                task_id,
+                json!({ "workerId": worker_id, "leaseUntil": lease_until }).to_string(),
+                now
+            ],
         )?;
-        self.record_audit(AuditInput {
-            actor_type: Some("worker".to_string()),
-            actor_id: Some(worker_id.to_string()),
-            action: "task.claimed".to_string(),
-            object_type: Some("task".to_string()),
-            object_id: Some(task_id.to_string()),
-            payload: Some(json!({ "leaseUntil": lease_until })),
-        })?;
+        tx.execute(
+            "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+             VALUES('worker', ?, 'task.claimed', 'task', ?, ?, ?)",
+            params![worker_id, task_id, json!({ "leaseUntil": lease_until }).to_string(), now],
+        )?;
+        tx.commit()?;
         self.get_task(task_id).map(Some)
     }
 
@@ -2203,6 +2393,68 @@ fn validate_browser_cdp_endpoint(endpoint: &str) -> Result<()> {
         .map_err(SparseKernelError::Invalid)
 }
 
+fn command_available(command: &str) -> bool {
+    match Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success() || status.code() == Some(1),
+        Err(_) => false,
+    }
+}
+
+fn first_available_command(commands: &[&str]) -> Option<String> {
+    commands
+        .iter()
+        .find(|command| command_available(command))
+        .map(|command| (*command).to_string())
+}
+
+pub fn probe_sandbox_backends() -> Vec<SandboxBackendProbe> {
+    let bwrap = first_available_command(&["bwrap", "bubblewrap"]);
+    let minijail = first_available_command(&["minijail0", "minijail"]);
+    let docker = first_available_command(&["docker"]);
+    let bwrap_available = bwrap.is_some();
+    let minijail_available = minijail.is_some();
+    let docker_available = docker.is_some();
+    vec![
+        SandboxBackendProbe {
+            backend: "local/no_isolation".to_string(),
+            available: true,
+            command: None,
+            hard_boundary: false,
+            isolation: "local/no_isolation command runner; trusted execution only".to_string(),
+            notes: vec!["Trusted operations only; no host isolation is provided.".to_string()],
+        },
+        SandboxBackendProbe {
+            backend: "bwrap".to_string(),
+            available: bwrap_available,
+            command: bwrap,
+            hard_boundary: bwrap_available,
+            isolation: "bubblewrap process namespace with broker-selected binds".to_string(),
+            notes: vec!["Requires kernel namespace support and broker-selected bind policy.".to_string()],
+        },
+        SandboxBackendProbe {
+            backend: "minijail".to_string(),
+            available: minijail_available,
+            command: minijail,
+            hard_boundary: minijail_available,
+            isolation: "minijail process jail with backend-defined limits".to_string(),
+            notes: vec!["Requires host minijail policy support for the selected trust zone.".to_string()],
+        },
+        SandboxBackendProbe {
+            backend: "docker".to_string(),
+            available: docker_available,
+            command: docker,
+            hard_boundary: docker_available,
+            isolation: "Docker container process with broker-selected image, no pull, and network disabled by default".to_string(),
+            notes: vec!["Container isolation depends on daemon policy; not a per-agent default.".to_string()],
+        },
+    ]
+}
+
 pub fn probe_browser_endpoint(endpoint: &str) -> BrowserEndpointProbe {
     let parsed = match parse_loopback_http_endpoint(endpoint) {
         Ok(parsed) => parsed,
@@ -3003,6 +3255,82 @@ mod tests {
         assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
         assert!(db.complete_task("task-b", "worker-b", None).unwrap());
         assert_eq!(db.get_task("task-b").unwrap().status, "completed");
+    }
+
+    #[test]
+    fn task_claiming_respects_small_vm_budgets() {
+        let (_dir, mut db) = temp_db();
+        db.conn
+            .execute(
+                "UPDATE runtime_info SET value = '1' WHERE key = 'resource_budget.test_jobs_max'",
+                [],
+            )
+            .unwrap();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("test-a".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "test.vitest".to_string(),
+            priority: 2,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("test-b".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "test.vitest".to_string(),
+            priority: 1,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        assert!(db.claim_task("test-a", "worker-a", 60).unwrap().is_some());
+        assert!(db
+            .claim_next_task("worker-b", &["test.vitest".to_string()], 60)
+            .unwrap()
+            .is_none());
+        let latest = db.list_audit(10).unwrap();
+        assert!(latest.iter().any(|entry| {
+            entry.action == "task.claim_denied_resource_budget"
+                && entry.object_id.as_deref() == Some("test-b")
+        }));
+    }
+
+    #[test]
+    fn task_claiming_respects_global_active_step_budget() {
+        let (_dir, mut db) = temp_db();
+        db.conn
+            .execute(
+                "UPDATE runtime_info SET value = '1' WHERE key = 'resource_budget.active_agent_steps_max'",
+                [],
+            )
+            .unwrap();
+        for id in ["step-a", "step-b"] {
+            db.enqueue_task(EnqueueTaskInput {
+                id: Some(id.to_string()),
+                agent_id: None,
+                session_id: None,
+                kind: "demo".to_string(),
+                priority: if id == "step-a" { 2 } else { 1 },
+                idempotency_key: None,
+                input: None,
+            })
+            .unwrap();
+        }
+        assert!(db.claim_task("step-a", "worker-a", 60).unwrap().is_some());
+        assert!(db.claim_next_task("worker-b", &[], 60).unwrap().is_none());
+        let latest = db.list_audit(10).unwrap();
+        assert!(latest.iter().any(|entry| {
+            entry.action == "task.claim_denied_resource_budget"
+                && entry.object_id.as_deref() == Some("step-b")
+                && entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("budget"))
+                    == Some(&json!("active_agent_steps"))
+        }));
     }
 
     #[test]

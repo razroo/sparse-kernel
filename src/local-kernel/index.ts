@@ -104,6 +104,7 @@ export type {
 } from "./sandbox-broker-runtime.js";
 export type {
   SandboxAllocationRequest,
+  SandboxBackendProbe,
   SandboxBackendKind,
   SandboxCommandRequest,
   SandboxCommandResult,
@@ -118,6 +119,7 @@ export {
   buildSandboxProcessEnv,
   buildSandboxSpawnPlan,
   isSandboxBackendAvailable,
+  probeSandboxBackends,
   runSandboxSpawnPlan,
 } from "./sandbox-broker.js";
 export { exportSessionAsJsonl, importLegacySessionStore } from "./session-compat.js";

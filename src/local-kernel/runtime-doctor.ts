@@ -1,3 +1,4 @@
+import { resolveRuntimeTranscriptCompatMode } from "../config/sessions/runtime-ledger.js";
 import {
   inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
@@ -5,7 +6,7 @@ import {
 import type { LocalKernelDatabase } from "./database.js";
 import { isBuiltinFirewallHardEgressHelper } from "./hard-egress-firewall.js";
 import { resolveNetworkPolicyProxyRef } from "./network-policy.js";
-import { isSandboxBackendAvailable } from "./sandbox-broker.js";
+import { probeSandboxBackends } from "./sandbox-broker.js";
 import { resolveRuntimeToolBrokerMode } from "./tool-broker-runtime.js";
 
 export type SparseKernelDoctorStatus = "pass" | "warn" | "fail" | "info";
@@ -33,6 +34,8 @@ export type SparseKernelDoctorReport = {
   tableCounts: Record<string, number>;
   toolBrokerMode: string;
   sessionStoreMode: string;
+  transcriptCompatMode: string;
+  resourceBudgets: Record<string, number>;
   checks: SparseKernelDoctorCheck[];
   acceptanceLanes: SparseKernelAcceptanceLane[];
 };
@@ -46,8 +49,10 @@ export function inspectSparseKernelRuntime(params: {
   const checks = [
     inspectLedger(params.db),
     inspectSessionStore(env),
+    inspectTranscriptMode(env),
     inspectToolBroker(env),
     inspectSandboxBackends(env),
+    inspectResourceBudgets(params.db),
     inspectHardEgress(env),
     inspectEgressProxy(env),
     inspectWorkerIdentities(env),
@@ -61,6 +66,8 @@ export function inspectSparseKernelRuntime(params: {
     tableCounts: inspect.counts,
     toolBrokerMode: resolveRuntimeToolBrokerMode(env),
     sessionStoreMode: resolveSessionStoreMode(env),
+    transcriptCompatMode: resolveRuntimeTranscriptCompatMode(env),
+    resourceBudgets: params.db.getResourceBudgetSnapshot(),
     checks,
     acceptanceLanes: sparseKernelAcceptanceLanes(),
   };
@@ -158,6 +165,22 @@ function inspectSessionStore(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
   };
 }
 
+function inspectTranscriptMode(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
+  const mode = resolveRuntimeTranscriptCompatMode(env);
+  return {
+    id: "sessions.transcript_compat",
+    status: mode === "ledger-only" ? "pass" : "warn",
+    summary:
+      mode === "ledger-only"
+        ? "Transcript writes use the ledger-primary path without legacy JSONL compatibility writes."
+        : "Transcript writes still keep legacy JSONL compatibility enabled.",
+    remediation:
+      mode === "ledger-only"
+        ? undefined
+        : "Set OPENCLAW_RUNTIME_SESSION_STORE=sqlite-strict or OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT=ledger-only after import/export coverage is green.",
+  };
+}
+
 function inspectToolBroker(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
   const mode = resolveRuntimeToolBrokerMode(env);
   if (mode === "off") {
@@ -176,14 +199,18 @@ function inspectToolBroker(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
 }
 
 function inspectSandboxBackends(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
-  const available = ["bwrap", "minijail", "docker"].filter((backend) =>
-    isSandboxBackendAvailable(backend as "bwrap" | "minijail" | "docker"),
-  );
+  const probes = probeSandboxBackends();
+  const available = probes
+    .filter((probe) => probe.hardBoundary && probe.available)
+    .map((probe) => probe.backend);
   if (available.length > 0) {
     return {
       id: "sandbox.backends",
       status: "pass",
       summary: `Available isolated sandbox backend(s): ${available.join(", ")}.`,
+      detail: probes
+        .map((probe) => `${probe.backend}: ${probe.available ? "available" : "missing"}`)
+        .join("; "),
     };
   }
   const allowNoIsolation = env.OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION === "1";
@@ -193,6 +220,15 @@ function inspectSandboxBackends(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck
     summary: "No isolated command sandbox backend was found.",
     remediation:
       "Install bwrap/minijail, configure a Docker image, or only use local/no_isolation for trusted operations.",
+  };
+}
+
+function inspectResourceBudgets(db: LocalKernelDatabase): SparseKernelDoctorCheck {
+  const budgets = db.getResourceBudgetSnapshot();
+  return {
+    id: "scheduler.resource_budgets",
+    status: "pass",
+    summary: `Small-VM resource budgets: active steps ${budgets.activeAgentStepsMax}, model calls ${budgets.modelCallsInFlightMax}, file patch jobs ${budgets.filePatchJobsMax}, test jobs ${budgets.testJobsMax}, browser contexts ${budgets.browserContextsMax}, heavy sandboxes ${budgets.heavySandboxesMax}.`,
   };
 }
 
@@ -290,7 +326,7 @@ function inspectPluginSubprocess(env: NodeJS.ProcessEnv): SparseKernelDoctorChec
     status: defaultWorker ? "pass" : "warn",
     summary: defaultWorker
       ? "Default plugin subprocess worker is configured."
-      : "Bundled/native plugins may still run in process by default.",
+      : "Non-bundled plugins are subprocess-first; bundled/native plugins may still run in process by default.",
     remediation: defaultWorker
       ? undefined
       : "Set OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY=strict to require subprocess workers.",

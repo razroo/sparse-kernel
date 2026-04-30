@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from "vitest";
 import { LocalKernelDatabase } from "../../local-kernel/database.js";
 import * as transcriptEvents from "../../sessions/transcript-events.js";
 import { resolveSessionTranscriptPathInDir } from "./paths.js";
-import { persistSessionStoreToRuntimeLedger } from "./runtime-ledger.js";
+import {
+  persistSessionStoreToRuntimeLedger,
+  resolveRuntimeSessionStoreMode,
+  resolveRuntimeTranscriptCompatMode,
+} from "./runtime-ledger.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
 import {
   appendAssistantMessageToSessionTranscript,
@@ -34,6 +38,14 @@ describe("appendAssistantMessageToSessionTranscript", () => {
       "utf-8",
     );
   }
+
+  it("defaults SparseKernel strict mode to ledger-authoritative transcript storage", () => {
+    const env = {
+      OPENCLAW_SPARSEKERNEL_STRICT: "1",
+    } as NodeJS.ProcessEnv;
+    expect(resolveRuntimeSessionStoreMode(env)).toBe("sqlite-strict");
+    expect(resolveRuntimeTranscriptCompatMode(env)).toBe("ledger-only");
+  });
 
   function createExactAssistantMessage(params: {
     text?: string;

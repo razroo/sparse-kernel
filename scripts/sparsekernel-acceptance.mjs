@@ -17,7 +17,7 @@ const lanes = [
     id: "runtime-cli",
     platform: "all",
     command: "pnpm test src/commands/runtime.sparsekernel.test.ts",
-    purpose: "Runtime operator commands and doctor checks.",
+    purpose: "Runtime operator commands, strict acceptance, cutover plan, and doctor checks.",
   },
   {
     id: "egress-proxy",

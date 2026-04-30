@@ -42,6 +42,18 @@ const KERNEL_DIR_MODE = 0o700;
 const KERNEL_FILE_MODE = 0o600;
 const KERNEL_SIDECAR_SUFFIXES = ["", "-shm", "-wal"] as const;
 
+export type ResourceBudgetSnapshot = {
+  logicalAgentsMax: number;
+  activeAgentStepsMax: number;
+  modelCallsInFlightMax: number;
+  filePatchJobsMax: number;
+  testJobsMax: number;
+  browserContextsMax: number;
+  heavySandboxesMax: number;
+};
+
+export type ResourceBudgetUpdateInput = Partial<ResourceBudgetSnapshot>;
+
 type MigrationRow = { version: number | bigint };
 type CountRow = { count: number | bigint };
 type MaxSeqRow = { seq: number | bigint | null };
@@ -343,6 +355,26 @@ function taskBudgetDefault(kind: TaskBudgetKind): number {
       return 4;
   }
 }
+
+const RESOURCE_BUDGET_INFO_KEYS = {
+  logicalAgentsMax: "resource_budget.logical_agents_max",
+  activeAgentStepsMax: "resource_budget.active_agent_steps_max",
+  modelCallsInFlightMax: "resource_budget.model_calls_in_flight_max",
+  filePatchJobsMax: "resource_budget.file_patch_jobs_max",
+  testJobsMax: "resource_budget.test_jobs_max",
+  browserContextsMax: "resource_budget.browser_contexts_max",
+  heavySandboxesMax: "resource_budget.heavy_sandboxes_max",
+} as const satisfies Record<keyof ResourceBudgetSnapshot, string>;
+
+const RESOURCE_BUDGET_DEFAULTS = {
+  logicalAgentsMax: 500,
+  activeAgentStepsMax: 100,
+  modelCallsInFlightMax: 50,
+  filePatchJobsMax: 16,
+  testJobsMax: 4,
+  browserContextsMax: 2,
+  heavySandboxesMax: 1,
+} as const satisfies ResourceBudgetSnapshot;
 
 function ensureRuntimeDbPermissions(dbPath: string, env: NodeJS.ProcessEnv): void {
   if (dbPath === ":memory:") {
@@ -713,22 +745,62 @@ export class LocalKernelDatabase {
     return rows.map((row) => ({ key: row.key, value: row.value, updatedAt: row.updated_at }));
   }
 
-  getResourceBudgetSnapshot(): Record<string, number> {
+  getResourceBudgetSnapshot(): ResourceBudgetSnapshot {
     return {
-      logicalAgentsMax: this.readRuntimeInfoInteger("resource_budget.logical_agents_max", 500),
+      logicalAgentsMax: this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.logicalAgentsMax,
+        RESOURCE_BUDGET_DEFAULTS.logicalAgentsMax,
+      ),
       activeAgentStepsMax: this.readRuntimeInfoInteger(
-        "resource_budget.active_agent_steps_max",
-        100,
+        RESOURCE_BUDGET_INFO_KEYS.activeAgentStepsMax,
+        RESOURCE_BUDGET_DEFAULTS.activeAgentStepsMax,
       ),
       modelCallsInFlightMax: this.readRuntimeInfoInteger(
-        "resource_budget.model_calls_in_flight_max",
-        50,
+        RESOURCE_BUDGET_INFO_KEYS.modelCallsInFlightMax,
+        RESOURCE_BUDGET_DEFAULTS.modelCallsInFlightMax,
       ),
-      filePatchJobsMax: this.readRuntimeInfoInteger("resource_budget.file_patch_jobs_max", 16),
-      testJobsMax: this.readRuntimeInfoInteger("resource_budget.test_jobs_max", 4),
-      browserContextsMax: this.readRuntimeInfoInteger("resource_budget.browser_contexts_max", 2),
-      heavySandboxesMax: this.readRuntimeInfoInteger("resource_budget.heavy_sandboxes_max", 1),
+      filePatchJobsMax: this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.filePatchJobsMax,
+        RESOURCE_BUDGET_DEFAULTS.filePatchJobsMax,
+      ),
+      testJobsMax: this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.testJobsMax,
+        RESOURCE_BUDGET_DEFAULTS.testJobsMax,
+      ),
+      browserContextsMax: this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.browserContextsMax,
+        RESOURCE_BUDGET_DEFAULTS.browserContextsMax,
+      ),
+      heavySandboxesMax: this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.heavySandboxesMax,
+        RESOURCE_BUDGET_DEFAULTS.heavySandboxesMax,
+      ),
     };
+  }
+
+  updateResourceBudgets(input: ResourceBudgetUpdateInput): ResourceBudgetSnapshot {
+    const entries = Object.entries(input) as Array<[keyof ResourceBudgetSnapshot, unknown]>;
+    const now = nowIso();
+    for (const [key, value] of entries) {
+      if (value === undefined) {
+        continue;
+      }
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) {
+        throw new Error(`Invalid resource budget value for ${key}`);
+      }
+      const normalized = Math.max(0, Math.trunc(numeric));
+      this.db
+        .prepare(
+          `INSERT INTO runtime_info(key, value, updated_at)
+           VALUES(?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET
+             value=excluded.value,
+             updated_at=excluded.updated_at`,
+        )
+        .run(RESOURCE_BUDGET_INFO_KEYS[key], String(normalized), now);
+    }
+    return this.getResourceBudgetSnapshot();
   }
 
   listTrustZones(): TrustZoneRecord[] {
@@ -1899,7 +1971,11 @@ export class LocalKernelDatabase {
         id,
         input.trustZoneId,
         input.browserKind ?? "chromium",
-        input.maxContexts ?? 8,
+        input.maxContexts ??
+          this.readRuntimeInfoInteger(
+            RESOURCE_BUDGET_INFO_KEYS.browserContextsMax,
+            RESOURCE_BUDGET_DEFAULTS.browserContextsMax,
+          ),
         input.cdpEndpoint ?? null,
         now,
         now,
@@ -2365,6 +2441,42 @@ export class LocalKernelDatabase {
     const zone = input.trustZoneId
       ? this.listTrustZones().find((entry) => entry.id === input.trustZoneId)
       : undefined;
+    if (input.resourceType === "browser_context") {
+      const limit = this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.browserContextsMax,
+        RESOURCE_BUDGET_DEFAULTS.browserContextsMax,
+      );
+      const active = this.countActiveResourceLeasesByType("browser_context");
+      if (active >= limit) {
+        throw new ResourceLeaseBudgetError(
+          `Browser context budget exhausted: ${active}/${limit} active`,
+          {
+            resourceType: input.resourceType,
+            active,
+            limit,
+          },
+        );
+      }
+    }
+    if (input.resourceType === "sandbox") {
+      const limit = this.readRuntimeInfoInteger(
+        RESOURCE_BUDGET_INFO_KEYS.heavySandboxesMax,
+        RESOURCE_BUDGET_DEFAULTS.heavySandboxesMax,
+      );
+      const active = this.countActiveResourceLeasesByType("sandbox");
+      if (active >= limit) {
+        throw new ResourceLeaseBudgetError(
+          `Heavy sandbox budget exhausted: ${active}/${limit} active`,
+          {
+            trustZoneId: input.trustZoneId,
+            resourceType: input.resourceType,
+            active,
+            limit,
+            budget: "heavy_sandboxes",
+          },
+        );
+      }
+    }
     if (
       zone?.maxProcesses !== undefined &&
       input.resourceType === "sandbox" &&
@@ -2410,6 +2522,17 @@ export class LocalKernelDatabase {
       }
     }
     return { leaseUntil, maxRuntimeMs };
+  }
+
+  private countActiveResourceLeasesByType(resourceType: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM resource_leases
+         WHERE resource_type = ? AND status = 'active'`,
+      )
+      .get(resourceType) as CountRow;
+    return Number(row.count);
   }
 
   getResourceLease(id: string): ResourceLeaseRecord | undefined {

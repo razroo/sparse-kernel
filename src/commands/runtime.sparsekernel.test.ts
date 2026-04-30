@@ -6,9 +6,12 @@ import { ContentAddressedArtifactStore } from "../local-kernel/artifact-store.js
 import { LocalKernelDatabase } from "../local-kernel/database.js";
 import type { OutputRuntimeEnv } from "../runtime.js";
 import {
+  runtimeAcceptanceCommand,
   runtimeArtifactAccessCommand,
   runtimeArtifactSummaryCommand,
   runtimeBrowserPoolsCommand,
+  runtimeBudgetSetCommand,
+  runtimeCutoverPlanCommand,
   runtimeDoctorCommand,
   runtimeLeasesCommand,
   runtimeMaintainCommand,
@@ -348,6 +351,72 @@ describe("SparseKernel runtime commands", () => {
           acceptanceLanes: expect.arrayContaining([
             expect.objectContaining({ id: "ledger-and-leases" }),
             expect.objectContaining({ id: "egress-proxy" }),
+          ]),
+        }),
+        2,
+      );
+    });
+  });
+
+  it("updates global SparseKernel resource budgets from the runtime budget command", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const runtime = makeRuntime();
+      await runtimeBudgetSetCommand(
+        {
+          activeAgentStepsMax: "12",
+          browserContextsMax: "3",
+          heavySandboxesMax: "2",
+          json: true,
+        },
+        runtime,
+      );
+      expect(runtime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ok: true,
+          resourceBudgets: expect.objectContaining({
+            activeAgentStepsMax: 12,
+            browserContextsMax: 3,
+            heavySandboxesMax: 2,
+          }),
+        }),
+        2,
+      );
+    });
+  });
+
+  it("reports strict acceptance failures and cutover guidance", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const runtime = makeRuntime();
+      await expect(runtimeAcceptanceCommand({ strict: true, json: true }, runtime)).rejects.toThrow(
+        /exit 1/,
+      );
+      expect(runtime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ok: false,
+          strict: true,
+          checks: expect.arrayContaining([
+            expect.objectContaining({ id: "sessions.sqlite_strict", status: "fail" }),
+            expect.objectContaining({ id: "transcripts.ledger_only", status: "fail" }),
+            expect.objectContaining({ id: "plugins.subprocess_default", status: "fail" }),
+          ]),
+        }),
+        2,
+      );
+
+      const planRuntime = makeRuntime();
+      await runtimeCutoverPlanCommand({ json: true }, planRuntime);
+      expect(planRuntime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          environment: expect.objectContaining({
+            OPENCLAW_SPARSEKERNEL_STRICT: "1",
+            OPENCLAW_RUNTIME_SESSION_STORE: "sqlite-strict",
+            OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT: "ledger-only",
+          }),
+          commands: expect.arrayContaining([
+            "openclaw sessions import --from-existing",
+            "openclaw runtime acceptance --strict --current-platform",
           ]),
         }),
         2,

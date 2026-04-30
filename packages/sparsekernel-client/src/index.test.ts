@@ -145,4 +145,47 @@ describe("SparseKernelClient protocol compatibility", () => {
       expect.objectContaining({ backend: "bwrap", available: true }),
     ]);
   });
+
+  it("calls runtime resource budget APIs", async () => {
+    const requests: Array<{ path: string; body?: unknown }> = [];
+    const budgets = {
+      logical_agents_max: 500,
+      active_agent_steps_max: 12,
+      model_calls_in_flight_max: 50,
+      file_patch_jobs_max: 16,
+      test_jobs_max: 4,
+      browser_contexts_max: 3,
+      heavy_sandboxes_max: 2,
+    };
+    const fetchImpl = vi.fn(async (input, init) => {
+      const url = new URL(String(input));
+      requests.push({
+        path: url.pathname,
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      return Response.json(budgets);
+    }) as unknown as typeof fetch;
+    const client = new SparseKernelClient({ fetchImpl });
+
+    await expect(client.resourceBudgets()).resolves.toMatchObject({
+      active_agent_steps_max: 12,
+    });
+    await expect(
+      client.updateResourceBudgets({
+        browser_contexts_max: 3,
+        heavy_sandboxes_max: 2,
+      }),
+    ).resolves.toMatchObject({ browser_contexts_max: 3 });
+
+    expect(requests).toEqual([
+      { path: "/runtime/budgets" },
+      {
+        path: "/runtime/budgets/update",
+        body: {
+          browser_contexts_max: 3,
+          heavy_sandboxes_max: 2,
+        },
+      },
+    ]);
+  });
 });

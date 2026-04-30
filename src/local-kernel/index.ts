@@ -22,6 +22,7 @@ export type {
   NativeBrowserPoolSweepResult,
 } from "./browser-process-pool.js";
 export { LocalKernelDatabase, openLocalKernelDatabase } from "./database.js";
+export type { ResourceBudgetSnapshot, ResourceBudgetUpdateInput } from "./database.js";
 export { LOCAL_KERNEL_SCHEMA_VERSION } from "./schema.js";
 export {
   checkTrustZoneNetworkUrl,

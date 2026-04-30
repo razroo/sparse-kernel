@@ -9,8 +9,14 @@ export type RuntimeTranscriptCompatMode = "jsonl" | "ledger-only";
 
 const SESSION_STORE_MODE_ENV = "OPENCLAW_RUNTIME_SESSION_STORE";
 const RUNTIME_TRANSCRIPT_COMPAT_ENV = "OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT";
+const SPARSEKERNEL_STRICT_ENV = "OPENCLAW_SPARSEKERNEL_STRICT";
 const log = createSubsystemLogger("sessions/runtime-ledger");
 const warnedMirrorFailures = new Set<string>();
+
+function isTruthyRuntimeFlag(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
 
 function dateFromEpochMs(value: number | undefined): string | undefined {
   return typeof value === "number" && Number.isFinite(value)
@@ -55,6 +61,9 @@ export function resolveRuntimeSessionStoreMode(
   env: NodeJS.ProcessEnv = process.env,
 ): RuntimeSessionStoreMode {
   const raw = env[SESSION_STORE_MODE_ENV]?.trim().toLowerCase();
+  if (!raw && isTruthyRuntimeFlag(env[SPARSEKERNEL_STRICT_ENV])) {
+    return "sqlite-strict";
+  }
   if (!raw && (env.VITEST || env.NODE_ENV === "test")) {
     return "off";
   }

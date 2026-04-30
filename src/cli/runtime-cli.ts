@@ -2,11 +2,13 @@ import type { Command } from "commander";
 import {
   runtimeArtifactAccessCommand,
   runtimeArtifactSummaryCommand,
+  runtimeAcceptanceCommand,
   runtimeBrowserObservationsCommand,
   runtimeBrowserPoolsCommand,
   runtimeBrowserTargetsCommand,
   runtimeBudgetCommand,
   runtimeBudgetSetCommand,
+  runtimeCutoverPlanCommand,
   runtimeDoctorCommand,
   runtimeEgressProxyCommand,
   runtimeEgressProxyListCommand,
@@ -80,6 +82,8 @@ export function registerRuntimeCli(program: Command) {
             "Plan broker-managed SparseKernel worker identities.",
           ],
           ["openclaw runtime doctor", "Check SparseKernel runtime readiness."],
+          ["openclaw runtime acceptance --strict", "Check strict SparseKernel cutover readiness."],
+          ["openclaw runtime cutover-plan", "Print a guided SparseKernel strict cutover plan."],
           [
             "openclaw runtime egress-proxy --trust-zone public_web",
             "Start a loopback policy-enforcing egress proxy.",
@@ -130,6 +134,35 @@ export function registerRuntimeCli(program: Command) {
     .option("--json", "Output JSON", false)
     .action(
       createRunner((opts) => runtimeDoctorCommand({ json: Boolean(opts.json) }, defaultRuntime)),
+    );
+
+  runtime
+    .command("acceptance")
+    .description("Check SparseKernel acceptance readiness and test lanes")
+    .option("--strict", "Require strict SparseKernel cutover settings", false)
+    .option("--current-platform", "Show only lanes for the current platform", false)
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeAcceptanceCommand(
+          {
+            strict: Boolean(opts.strict),
+            currentPlatform: Boolean(opts.currentPlatform),
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        ),
+      ),
+    );
+
+  runtime
+    .command("cutover-plan")
+    .description("Print a guided plan for switching SparseKernel to strict ledger-primary mode")
+    .option("--json", "Output JSON", false)
+    .action(
+      createRunner((opts) =>
+        runtimeCutoverPlanCommand({ json: Boolean(opts.json) }, defaultRuntime),
+      ),
     );
 
   runtime
@@ -510,11 +543,18 @@ export function registerRuntimeCli(program: Command) {
       ),
     )
     .command("set")
-    .description("Update trust-zone budget limits")
-    .requiredOption("--trust-zone <id>", "Trust zone id")
+    .description("Update trust-zone or global SparseKernel budget limits")
+    .option("--trust-zone <id>", "Trust zone id")
     .option("--max-processes <count>", "Maximum process count")
     .option("--max-memory-mb <mb>", "Maximum memory in MiB")
     .option("--max-runtime-seconds <seconds>", "Maximum runtime in seconds")
+    .option("--logical-agents-max <count>", "Maximum parked logical agents")
+    .option("--active-agent-steps-max <count>", "Maximum active agent steps")
+    .option("--model-calls-in-flight-max <count>", "Maximum concurrent model-call tasks")
+    .option("--file-patch-jobs-max <count>", "Maximum concurrent file patch jobs")
+    .option("--test-jobs-max <count>", "Maximum concurrent test jobs")
+    .option("--browser-contexts-max <count>", "Maximum active browser context leases")
+    .option("--heavy-sandboxes-max <count>", "Maximum active sandbox leases")
     .option("--json", "Output JSON", false)
     .action(
       createRunner((opts) =>
@@ -524,6 +564,13 @@ export function registerRuntimeCli(program: Command) {
             maxProcesses: opts.maxProcesses as string | undefined,
             maxMemoryMb: opts.maxMemoryMb as string | undefined,
             maxRuntimeSeconds: opts.maxRuntimeSeconds as string | undefined,
+            logicalAgentsMax: opts.logicalAgentsMax as string | undefined,
+            activeAgentStepsMax: opts.activeAgentStepsMax as string | undefined,
+            modelCallsInFlightMax: opts.modelCallsInFlightMax as string | undefined,
+            filePatchJobsMax: opts.filePatchJobsMax as string | undefined,
+            testJobsMax: opts.testJobsMax as string | undefined,
+            browserContextsMax: opts.browserContextsMax as string | undefined,
+            heavySandboxesMax: opts.heavySandboxesMax as string | undefined,
             json: Boolean(opts.json),
           },
           defaultRuntime,

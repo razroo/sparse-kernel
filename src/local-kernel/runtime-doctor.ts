@@ -1,4 +1,7 @@
-import { resolveRuntimeTranscriptCompatMode } from "../config/sessions/runtime-ledger.js";
+import {
+  resolveRuntimeSessionStoreMode,
+  resolveRuntimeTranscriptCompatMode,
+} from "../config/sessions/runtime-ledger.js";
 import {
   inspectNativeBrowserPoolStats,
   inspectNativeBrowserPools,
@@ -65,7 +68,7 @@ export function inspectSparseKernelRuntime(params: {
     schemaVersion: inspect.schemaVersion,
     tableCounts: inspect.counts,
     toolBrokerMode: resolveRuntimeToolBrokerMode(env),
-    sessionStoreMode: resolveSessionStoreMode(env),
+    sessionStoreMode: resolveRuntimeSessionStoreMode(env),
     transcriptCompatMode: resolveRuntimeTranscriptCompatMode(env),
     resourceBudgets: params.db.getResourceBudgetSnapshot(),
     checks,
@@ -94,7 +97,8 @@ export function sparseKernelAcceptanceLanes(): SparseKernelAcceptanceLane[] {
       id: "runtime-cli",
       platform: "all",
       command: "pnpm test src/commands/runtime.sparsekernel.test.ts",
-      purpose: "Runtime CLI inspection, maintenance, doctor, and operator-facing surfaces.",
+      purpose:
+        "Runtime CLI inspection, maintenance, strict acceptance, cutover plan, and operator-facing surfaces.",
       status: "required",
     },
     {
@@ -149,7 +153,7 @@ function inspectLedger(db: LocalKernelDatabase): SparseKernelDoctorCheck {
 }
 
 function inspectSessionStore(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
-  const mode = resolveSessionStoreMode(env);
+  const mode = resolveRuntimeSessionStoreMode(env);
   if (mode === "sqlite" || mode === "sqlite-strict") {
     return {
       id: "sessions.ledger_primary",
@@ -349,18 +353,4 @@ function inspectBrowserBroker(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
         ? "Unset OPENCLAW_RUNTIME_BROWSER_BROKER=off for brokered contexts."
         : undefined,
   };
-}
-
-function resolveSessionStoreMode(env: NodeJS.ProcessEnv): string {
-  const raw = env.OPENCLAW_RUNTIME_SESSION_STORE?.trim().toLowerCase();
-  if (raw === "off" || raw === "0" || raw === "false") {
-    return "off";
-  }
-  if (raw === "sqlite-strict" || raw === "strict-sqlite" || raw === "strict") {
-    return "sqlite-strict";
-  }
-  if (raw === "sqlite" || raw === "on" || raw === "1" || raw === "true") {
-    return "sqlite";
-  }
-  return raw || "dual";
 }

@@ -8,8 +8,8 @@ use sparsekernel_core::{
     AuditInput, BrowserBroker, CapabilityCheck, CompleteToolCallInput, CreateToolCallInput,
     EnqueueTaskInput, GrantCapabilityInput, LedgerToolBroker, ListBrowserObservationsInput,
     ListBrowserTargetsInput, LocalSandboxBroker, MockBrowserBroker, RecordBrowserObservationInput,
-    RecordBrowserTargetInput, SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker,
-    UpsertSessionInput, SPARSEKERNEL_PROTOCOL_VERSION,
+    RecordBrowserTargetInput, ResourceBudgetUpdateInput, SandboxBroker, SparseKernelDb,
+    SparseKernelPaths, ToolBroker, UpsertSessionInput, SPARSEKERNEL_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -1313,10 +1313,22 @@ pub fn handle_api_request_with_daemon_state(
                     "capabilities.v1",
                     "browser-broker.v1",
                     "sandbox-broker.v1",
-                    "sandbox-backends.probe.v1"
+                    "sandbox-backends.probe.v1",
+                    "resource-budgets.v1"
                 ],
             }),
         },
+        ("GET", "/runtime/budgets") => ApiReply {
+            status_code: 200,
+            body: serde_json::to_value(db.resource_budgets()?)?,
+        },
+        ("POST", "/runtime/budgets/update") => {
+            let input: ResourceBudgetUpdateInput = parse_body(body)?;
+            ApiReply {
+                status_code: 200,
+                body: serde_json::to_value(db.update_resource_budgets(input)?)?,
+            }
+        }
         ("GET", "/status") => ApiReply {
             status_code: 200,
             body: serde_json::to_value(db.inspect()?)?,
@@ -1975,6 +1987,30 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("tasks.v1")));
+        assert!(health["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("resource-budgets.v1")));
+    }
+
+    #[test]
+    fn runtime_budget_api_reads_and_updates_budgets() {
+        let mut db = SparseKernelDb::open(":memory:").unwrap();
+        let initial = json_call(&mut db, "GET", "/runtime/budgets", json!({}));
+        assert_eq!(initial["browser_contexts_max"], 2);
+        let updated = json_call(
+            &mut db,
+            "POST",
+            "/runtime/budgets/update",
+            json!({
+                "active_agent_steps_max": 12,
+                "browser_contexts_max": 3,
+                "heavy_sandboxes_max": 2,
+            }),
+        );
+        assert_eq!(updated["active_agent_steps_max"], 12);
+        assert_eq!(updated["browser_contexts_max"], 3);
+        assert_eq!(updated["heavy_sandboxes_max"], 2);
     }
 
     #[test]

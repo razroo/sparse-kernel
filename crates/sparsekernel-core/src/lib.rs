@@ -147,6 +147,28 @@ fn task_budget_default(kind: TaskBudgetKind) -> i64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceBudgetSnapshot {
+    pub logical_agents_max: i64,
+    pub active_agent_steps_max: i64,
+    pub model_calls_in_flight_max: i64,
+    pub file_patch_jobs_max: i64,
+    pub test_jobs_max: i64,
+    pub browser_contexts_max: i64,
+    pub heavy_sandboxes_max: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceBudgetUpdateInput {
+    pub logical_agents_max: Option<i64>,
+    pub active_agent_steps_max: Option<i64>,
+    pub model_calls_in_flight_max: Option<i64>,
+    pub file_patch_jobs_max: Option<i64>,
+    pub test_jobs_max: Option<i64>,
+    pub browser_contexts_max: Option<i64>,
+    pub heavy_sandboxes_max: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SparseKernelPaths {
     pub home_dir: PathBuf,
     pub runtime_dir: PathBuf,
@@ -1031,6 +1053,88 @@ impl SparseKernelDb {
             .and_then(|entry| entry.trim().parse::<i64>().ok())
             .map(|entry| entry.max(0))
             .unwrap_or(fallback))
+    }
+
+    fn runtime_info_integer(&self, key: &str, fallback: i64) -> Result<i64> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM runtime_info WHERE key = ?",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value
+            .as_deref()
+            .and_then(|entry| entry.trim().parse::<i64>().ok())
+            .map(|entry| entry.max(0))
+            .unwrap_or(fallback))
+    }
+
+    pub fn resource_budgets(&self) -> Result<ResourceBudgetSnapshot> {
+        Ok(ResourceBudgetSnapshot {
+            logical_agents_max: self
+                .runtime_info_integer("resource_budget.logical_agents_max", 500)?,
+            active_agent_steps_max: self
+                .runtime_info_integer("resource_budget.active_agent_steps_max", 100)?,
+            model_calls_in_flight_max: self
+                .runtime_info_integer("resource_budget.model_calls_in_flight_max", 50)?,
+            file_patch_jobs_max: self
+                .runtime_info_integer("resource_budget.file_patch_jobs_max", 16)?,
+            test_jobs_max: self.runtime_info_integer("resource_budget.test_jobs_max", 4)?,
+            browser_contexts_max: self
+                .runtime_info_integer("resource_budget.browser_contexts_max", 2)?,
+            heavy_sandboxes_max: self
+                .runtime_info_integer("resource_budget.heavy_sandboxes_max", 1)?,
+        })
+    }
+
+    pub fn update_resource_budgets(
+        &mut self,
+        input: ResourceBudgetUpdateInput,
+    ) -> Result<ResourceBudgetSnapshot> {
+        let tx = self.conn.transaction()?;
+        let now = now_iso();
+        let set_value = |key: &str, value: Option<i64>| -> Result<()> {
+            if let Some(value) = value {
+                tx.execute(
+                    "INSERT INTO runtime_info(key, value, updated_at)
+                     VALUES(?, ?, ?)
+                     ON CONFLICT(key) DO UPDATE SET
+                       value=excluded.value,
+                       updated_at=excluded.updated_at",
+                    params![key, value.max(0).to_string(), now],
+                )?;
+            }
+            Ok(())
+        };
+        set_value(
+            "resource_budget.logical_agents_max",
+            input.logical_agents_max,
+        )?;
+        set_value(
+            "resource_budget.active_agent_steps_max",
+            input.active_agent_steps_max,
+        )?;
+        set_value(
+            "resource_budget.model_calls_in_flight_max",
+            input.model_calls_in_flight_max,
+        )?;
+        set_value(
+            "resource_budget.file_patch_jobs_max",
+            input.file_patch_jobs_max,
+        )?;
+        set_value("resource_budget.test_jobs_max", input.test_jobs_max)?;
+        set_value(
+            "resource_budget.browser_contexts_max",
+            input.browser_contexts_max,
+        )?;
+        set_value(
+            "resource_budget.heavy_sandboxes_max",
+            input.heavy_sandboxes_max,
+        )?;
+        tx.commit()?;
+        self.resource_budgets()
     }
 
     fn running_task_count_for_budget_tx(
@@ -2680,6 +2784,30 @@ impl BrowserBroker for MockBrowserBroker<'_> {
                 "no browser contexts available".to_string(),
             ));
         }
+        let budget = self.db.resource_budgets()?;
+        let active_budget: i64 = self.db.conn.query_row(
+            "SELECT COUNT(*) FROM resource_leases WHERE resource_type = 'browser_context' AND status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_budget >= budget.browser_contexts_max {
+            self.db.record_audit(AuditInput {
+                actor_type: agent_id.map(|_| "agent".to_string()),
+                actor_id: agent_id.map(str::to_string),
+                action: "resource_lease.denied_budget_exhausted".to_string(),
+                object_type: Some("browser_context".to_string()),
+                object_id: None,
+                payload: Some(json!({
+                    "resourceType": "browser_context",
+                    "active": active_budget,
+                    "limit": budget.browser_contexts_max,
+                })),
+            })?;
+            return Err(SparseKernelError::Denied(format!(
+                "browser context budget exhausted: {}/{} active",
+                active_budget, budget.browser_contexts_max
+            )));
+        }
         let context_id = format!("browser_ctx_{}", Uuid::new_v4());
         self.db.conn.execute(
             "INSERT INTO browser_contexts(id, pool_id, agent_id, session_id, task_id, profile_mode, status, created_at)
@@ -3010,6 +3138,32 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
                 }
             }
         }
+        let budget = self.db.resource_budgets()?;
+        let active_sandboxes: i64 = self.db.conn.query_row(
+            "SELECT COUNT(*) FROM resource_leases WHERE resource_type = 'sandbox' AND status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_sandboxes >= budget.heavy_sandboxes_max {
+            self.db.record_audit(AuditInput {
+                actor_type: agent_id.map(|_| "agent".to_string()),
+                actor_id: agent_id.map(str::to_string),
+                action: "resource_lease.denied_budget_exhausted".to_string(),
+                object_type: Some("trust_zone".to_string()),
+                object_id: Some(trust_zone_id.to_string()),
+                payload: Some(json!({
+                    "trustZoneId": trust_zone_id,
+                    "resourceType": "sandbox",
+                    "budget": "heavy_sandboxes",
+                    "active": active_sandboxes,
+                    "limit": budget.heavy_sandboxes_max,
+                })),
+            })?;
+            return Err(SparseKernelError::Denied(format!(
+                "heavy sandbox budget exhausted: {}/{} active",
+                active_sandboxes, budget.heavy_sandboxes_max
+            )));
+        }
         self.db.conn.execute(
             "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, metadata_json, created_at, updated_at)
              VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?, ?)",
@@ -3331,6 +3485,68 @@ mod tests {
                     .and_then(|payload| payload.get("budget"))
                     == Some(&json!("active_agent_steps"))
         }));
+    }
+
+    #[test]
+    fn resource_budgets_update_and_gate_browser_contexts() {
+        let (_dir, mut db) = temp_db();
+        let budgets = db
+            .update_resource_budgets(ResourceBudgetUpdateInput {
+                browser_contexts_max: Some(1),
+                heavy_sandboxes_max: Some(2),
+                ..ResourceBudgetUpdateInput::default()
+            })
+            .unwrap();
+        assert_eq!(budgets.browser_contexts_max, 1);
+        assert_eq!(budgets.heavy_sandboxes_max, 2);
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "agent-a".to_string(),
+            resource_type: "browser_context".to_string(),
+            resource_id: Some("public_web".to_string()),
+            action: "allocate".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        db.grant_capability(GrantCapabilityInput {
+            subject_type: "agent".to_string(),
+            subject_id: "agent-a".to_string(),
+            resource_type: "browser_context".to_string(),
+            resource_id: Some("authenticated_web".to_string()),
+            action: "allocate".to_string(),
+            constraints: None,
+            expires_at: None,
+        })
+        .unwrap();
+        let broker = MockBrowserBroker { db: &db };
+        assert!(broker
+            .acquire_context(Some("agent-a"), None, None, "public_web", 10, None)
+            .is_ok());
+        let denied = broker
+            .acquire_context(Some("agent-a"), None, None, "authenticated_web", 10, None)
+            .unwrap_err()
+            .to_string();
+        assert!(denied.contains("browser context budget exhausted"));
+    }
+
+    #[test]
+    fn resource_budgets_gate_heavy_sandboxes() {
+        let (_dir, mut db) = temp_db();
+        db.update_resource_budgets(ResourceBudgetUpdateInput {
+            heavy_sandboxes_max: Some(1),
+            ..ResourceBudgetUpdateInput::default()
+        })
+        .unwrap();
+        let broker = LocalSandboxBroker { db: &db };
+        assert!(broker
+            .allocate_sandbox(None, None, "code_execution", Some("local/no_isolation"))
+            .is_ok());
+        let denied = broker
+            .allocate_sandbox(None, None, "plugin_untrusted", Some("local/no_isolation"))
+            .unwrap_err()
+            .to_string();
+        assert!(denied.contains("heavy sandbox budget exhausted"));
     }
 
     #[test]

@@ -66,6 +66,28 @@ export class LocalBrowserBroker implements BrowserBroker {
       throw new Error(`Agent ${request.agentId} lacks browser_context allocate capability`);
     }
 
+    const { browserContextsMax } = this.db.getResourceBudgetSnapshot();
+    const activeBrowserLeases = this.db.listResourceLeases({
+      resourceType: "browser_context",
+      status: "active",
+      limit: browserContextsMax + 1,
+    }).length;
+    if (activeBrowserLeases >= browserContextsMax) {
+      this.db.recordAudit({
+        actor: { type: "agent", id: request.agentId },
+        action: "resource_lease.denied_budget_exhausted",
+        objectType: "browser_context",
+        payload: {
+          resourceType: "browser_context",
+          active: activeBrowserLeases,
+          limit: browserContextsMax,
+        },
+      });
+      throw new Error(
+        `Browser context budget exhausted: ${activeBrowserLeases}/${browserContextsMax} active`,
+      );
+    }
+
     return this.db.withTransaction(() => {
       const poolId = this.db.ensureBrowserPool({
         trustZoneId: request.trustZoneId,

@@ -20,6 +20,18 @@ export type SparseKernelInspect = {
   counts: Record<string, number>;
 };
 
+export type SparseKernelResourceBudgets = {
+  logical_agents_max: number;
+  active_agent_steps_max: number;
+  model_calls_in_flight_max: number;
+  file_patch_jobs_max: number;
+  test_jobs_max: number;
+  browser_contexts_max: number;
+  heavy_sandboxes_max: number;
+};
+
+export type SparseKernelResourceBudgetUpdate = Partial<SparseKernelResourceBudgets>;
+
 export type SparseKernelNetworkPolicy = {
   id: string;
   default_action: "allow" | "deny" | string;
@@ -485,6 +497,16 @@ export class SparseKernelClient {
 
   async status(): Promise<SparseKernelInspect> {
     return await this.getJson<SparseKernelInspect>("/status");
+  }
+
+  async resourceBudgets(): Promise<SparseKernelResourceBudgets> {
+    return await this.getJson<SparseKernelResourceBudgets>("/runtime/budgets");
+  }
+
+  async updateResourceBudgets(
+    input: SparseKernelResourceBudgetUpdate,
+  ): Promise<SparseKernelResourceBudgets> {
+    return await this.postJson<SparseKernelResourceBudgets>("/runtime/budgets/update", input);
   }
 
   async trustZoneNetworkPolicy(input: {

@@ -23,7 +23,7 @@ import {
   stopSupervisedEgressProxy,
   sweepNativeBrowserProcesses,
 } from "../local-kernel/index.js";
-import type { RuntimeRetentionPolicy } from "../local-kernel/index.js";
+import type { ResourceBudgetUpdateInput, RuntimeRetentionPolicy } from "../local-kernel/index.js";
 import type { WorkerIdentityProvisionPlatform } from "../local-kernel/index.js";
 import type { OutputRuntimeEnv, RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
@@ -103,6 +103,250 @@ export async function runtimeDoctorCommand(
     runtime.log("Acceptance lanes:");
     for (const lane of report.acceptanceLanes) {
       runtime.log(`  ${lane.id} [${lane.platform}/${lane.status}]: ${lane.command}`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+type SparseKernelStrictFinding = {
+  id: string;
+  status: "pass" | "fail";
+  summary: string;
+  remediation?: string;
+};
+
+function isTruthyRuntimeFlag(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function currentAcceptancePlatform(): "linux" | "darwin" | "windows" {
+  return process.platform === "win32"
+    ? "windows"
+    : process.platform === "darwin"
+      ? "darwin"
+      : "linux";
+}
+
+function buildStrictAcceptanceFindings(params: {
+  report: ReturnType<typeof inspectSparseKernelRuntime>;
+  env?: NodeJS.ProcessEnv;
+}): SparseKernelStrictFinding[] {
+  const env = params.env ?? process.env;
+  const checkStatus = (id: string) =>
+    params.report.checks.find((check) => check.id === id)?.status ?? "fail";
+  const pluginBoundary =
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY?.trim().toLowerCase() ??
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS?.trim().toLowerCase();
+  const pluginWorker = env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND?.trim();
+  const browserMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase() || "auto";
+  const hardEgressRequired = isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS);
+  return [
+    {
+      id: "sessions.sqlite_strict",
+      status: params.report.sessionStoreMode === "sqlite-strict" ? "pass" : "fail",
+      summary:
+        params.report.sessionStoreMode === "sqlite-strict"
+          ? "Session metadata reads and writes are ledger-authoritative."
+          : `Session store mode is ${params.report.sessionStoreMode}, not sqlite-strict.`,
+      remediation:
+        params.report.sessionStoreMode === "sqlite-strict"
+          ? undefined
+          : "Import existing sessions, then set OPENCLAW_SPARSEKERNEL_STRICT=1 or OPENCLAW_RUNTIME_SESSION_STORE=sqlite-strict.",
+    },
+    {
+      id: "transcripts.ledger_only",
+      status: params.report.transcriptCompatMode === "ledger-only" ? "pass" : "fail",
+      summary:
+        params.report.transcriptCompatMode === "ledger-only"
+          ? "Transcript appends are ledger-only; JSONL is export/compat."
+          : "Transcript compatibility mode still writes legacy JSONL.",
+      remediation:
+        params.report.transcriptCompatMode === "ledger-only"
+          ? undefined
+          : "Set OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT=ledger-only after import/export coverage is green.",
+    },
+    {
+      id: "tools.broker_required",
+      status: params.report.toolBrokerMode === "off" ? "fail" : "pass",
+      summary:
+        params.report.toolBrokerMode === "off"
+          ? "Tool broker is disabled."
+          : `Tool broker mode is ${params.report.toolBrokerMode}.`,
+      remediation:
+        params.report.toolBrokerMode === "off"
+          ? "Unset OPENCLAW_RUNTIME_TOOL_BROKER=off or set it to local/daemon."
+          : undefined,
+    },
+    {
+      id: "sandbox.isolated_backend",
+      status: checkStatus("sandbox.backends") === "pass" ? "pass" : "fail",
+      summary:
+        checkStatus("sandbox.backends") === "pass"
+          ? "At least one isolated sandbox backend is available."
+          : "No isolated sandbox backend is available.",
+      remediation:
+        checkStatus("sandbox.backends") === "pass"
+          ? undefined
+          : "Install bwrap/minijail or configure an explicit Docker/VM backend before accepting untrusted work.",
+    },
+    {
+      id: "egress.proxy",
+      status: checkStatus("egress.proxy") === "pass" ? "pass" : "fail",
+      summary:
+        checkStatus("egress.proxy") === "pass"
+          ? "Loopback egress proxy is configured."
+          : "No valid loopback egress proxy is configured.",
+      remediation:
+        checkStatus("egress.proxy") === "pass"
+          ? undefined
+          : "Run openclaw runtime egress-proxy --trust-zone public_web --attach and require broker proxy mode where needed.",
+    },
+    {
+      id: "egress.hard_when_required",
+      status: !hardEgressRequired || checkStatus("egress.hard") === "pass" ? "pass" : "fail",
+      summary: hardEgressRequired
+        ? checkStatus("egress.hard") === "pass"
+          ? "Hard-egress mode has a supported helper."
+          : "Hard-egress mode is required but not enforced."
+        : "Hard-egress mode is not required for this profile.",
+      remediation:
+        hardEgressRequired && checkStatus("egress.hard") !== "pass"
+          ? "Configure OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER=builtin, builtin-firewall, or an operator helper."
+          : undefined,
+    },
+    {
+      id: "plugins.subprocess_default",
+      status:
+        (pluginBoundary === "subprocess" || pluginBoundary === "strict") && pluginWorker
+          ? "pass"
+          : "fail",
+      summary:
+        (pluginBoundary === "subprocess" || pluginBoundary === "strict") && pluginWorker
+          ? "Plugin subprocess policy and default worker are configured."
+          : "Bundled/native plugin tools can still run in process.",
+      remediation:
+        (pluginBoundary === "subprocess" || pluginBoundary === "strict") && pluginWorker
+          ? undefined
+          : "Set OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY=strict and OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND.",
+    },
+    {
+      id: "browser.brokered_mode",
+      status:
+        browserMode === "cdp" || browserMode === "managed" || browserMode === "native"
+          ? "pass"
+          : "fail",
+      summary:
+        browserMode === "cdp" || browserMode === "managed" || browserMode === "native"
+          ? `Browser broker mode is ${browserMode}.`
+          : `Browser broker mode is ${browserMode}; strict acceptance requires an explicit brokered mode.`,
+      remediation:
+        browserMode === "cdp" || browserMode === "managed" || browserMode === "native"
+          ? undefined
+          : "Set OPENCLAW_RUNTIME_BROWSER_BROKER=native, managed, or cdp.",
+    },
+    {
+      id: "scheduler.resource_budgets",
+      status: checkStatus("scheduler.resource_budgets") === "pass" ? "pass" : "fail",
+      summary: "Small-VM task, browser, and sandbox resource budgets are available.",
+    },
+  ];
+}
+
+export async function runtimeAcceptanceCommand(
+  opts: { strict?: boolean; currentPlatform?: boolean; json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const db = openLocalKernelDatabase();
+  try {
+    const report = inspectSparseKernelRuntime({ db });
+    const platform = currentAcceptancePlatform();
+    const lanes = opts.currentPlatform
+      ? report.acceptanceLanes.filter(
+          (lane) => lane.platform === "all" || lane.platform === platform,
+        )
+      : report.acceptanceLanes;
+    const strictFindings = opts.strict ? buildStrictAcceptanceFindings({ report }) : undefined;
+    const ok = opts.strict
+      ? strictFindings?.every((finding) => finding.status === "pass") === true
+      : report.ok;
+    const checks = opts.strict ? (strictFindings ?? []) : report.checks;
+    const payload = {
+      ok,
+      strict: Boolean(opts.strict),
+      platform,
+      checks,
+      lanes,
+    };
+    if (opts.json) {
+      writeRuntimeJson(runtime, payload);
+    } else {
+      runtime.log(`SparseKernel acceptance: ${ok ? "ok" : "attention needed"}`);
+      for (const check of payload.checks) {
+        runtime.log(`${check.status.toUpperCase()} ${check.id}: ${check.summary}`);
+        if (check.remediation) {
+          runtime.log(`  ${check.remediation}`);
+        }
+      }
+      runtime.log("Acceptance lanes:");
+      for (const lane of lanes) {
+        runtime.log(`  ${lane.id} [${lane.platform}/${lane.status}]: ${lane.command}`);
+      }
+    }
+    if (!ok) {
+      runtime.exit(1);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export async function runtimeCutoverPlanCommand(
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<void> {
+  const db = openLocalKernelDatabase();
+  try {
+    const report = inspectSparseKernelRuntime({ db });
+    const strictFindings = buildStrictAcceptanceFindings({ report });
+    const payload = {
+      ok: strictFindings.every((finding) => finding.status === "pass"),
+      environment: {
+        OPENCLAW_SPARSEKERNEL_STRICT: "1",
+        OPENCLAW_RUNTIME_SESSION_STORE: "sqlite-strict",
+        OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT: "ledger-only",
+        OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY: "strict",
+        OPENCLAW_RUNTIME_BROWSER_BROKER: "native",
+      },
+      commands: [
+        "openclaw sessions import --from-existing",
+        "openclaw runtime acceptance --strict --current-platform",
+        "openclaw sessions export --session <session-id> --format jsonl",
+      ],
+      checks: strictFindings,
+    };
+    if (opts.json) {
+      writeRuntimeJson(runtime, payload);
+      return;
+    }
+    runtime.log("SparseKernel cutover plan:");
+    runtime.log("1. Import existing file-backed sessions:");
+    runtime.log("   openclaw sessions import --from-existing");
+    runtime.log("2. Set strict runtime environment:");
+    for (const [key, value] of Object.entries(payload.environment)) {
+      runtime.log(`   ${key}=${value}`);
+    }
+    runtime.log("3. Run strict acceptance:");
+    runtime.log("   openclaw runtime acceptance --strict --current-platform");
+    runtime.log("4. Keep JSONL as explicit export/rollback:");
+    runtime.log("   openclaw sessions export --session <session-id> --format jsonl");
+    runtime.log(`Current readiness: ${payload.ok ? "ok" : "attention needed"}`);
+    for (const check of strictFindings) {
+      runtime.log(`${check.status.toUpperCase()} ${check.id}: ${check.summary}`);
+      if (check.remediation) {
+        runtime.log(`  ${check.remediation}`);
+      }
     }
   } finally {
     db.close();
@@ -968,52 +1212,105 @@ export async function runtimeBudgetSetCommand(
     maxProcesses?: string;
     maxMemoryMb?: string;
     maxRuntimeSeconds?: string;
+    logicalAgentsMax?: string;
+    activeAgentStepsMax?: string;
+    modelCallsInFlightMax?: string;
+    filePatchJobsMax?: string;
+    testJobsMax?: string;
+    browserContextsMax?: string;
+    heavySandboxesMax?: string;
     json?: boolean;
   },
   runtime: RuntimeEnv,
 ): Promise<void> {
   const trustZone = opts.trustZone?.trim();
-  if (!trustZone) {
-    runtime.error("--trust-zone <id> is required");
-    runtime.exit(1);
-    return;
-  }
   let maxProcesses: number | undefined;
   let maxMemoryMb: number | undefined;
   let maxRuntimeSeconds: number | undefined;
+  const resourceBudgetUpdates: ResourceBudgetUpdateInput = {};
   try {
     maxProcesses = parseOptionalInteger(opts.maxProcesses, "--max-processes");
     maxMemoryMb = parseOptionalInteger(opts.maxMemoryMb, "--max-memory-mb");
     maxRuntimeSeconds = parseOptionalInteger(opts.maxRuntimeSeconds, "--max-runtime-seconds");
+    resourceBudgetUpdates.logicalAgentsMax = parseOptionalInteger(
+      opts.logicalAgentsMax,
+      "--logical-agents-max",
+    );
+    resourceBudgetUpdates.activeAgentStepsMax = parseOptionalInteger(
+      opts.activeAgentStepsMax,
+      "--active-agent-steps-max",
+    );
+    resourceBudgetUpdates.modelCallsInFlightMax = parseOptionalInteger(
+      opts.modelCallsInFlightMax,
+      "--model-calls-in-flight-max",
+    );
+    resourceBudgetUpdates.filePatchJobsMax = parseOptionalInteger(
+      opts.filePatchJobsMax,
+      "--file-patch-jobs-max",
+    );
+    resourceBudgetUpdates.testJobsMax = parseOptionalInteger(opts.testJobsMax, "--test-jobs-max");
+    resourceBudgetUpdates.browserContextsMax = parseOptionalInteger(
+      opts.browserContextsMax,
+      "--browser-contexts-max",
+    );
+    resourceBudgetUpdates.heavySandboxesMax = parseOptionalInteger(
+      opts.heavySandboxesMax,
+      "--heavy-sandboxes-max",
+    );
   } catch (err) {
     runtime.error(formatErrorMessage(err));
     runtime.exit(1);
     return;
   }
-  if (maxProcesses === undefined && maxMemoryMb === undefined && maxRuntimeSeconds === undefined) {
+  const hasTrustZoneUpdates =
+    maxProcesses !== undefined || maxMemoryMb !== undefined || maxRuntimeSeconds !== undefined;
+  const hasResourceBudgetUpdates = Object.values(resourceBudgetUpdates).some(
+    (value) => value !== undefined,
+  );
+  if (hasTrustZoneUpdates && !trustZone) {
+    runtime.error("--trust-zone <id> is required when updating trust-zone limits.");
+    runtime.exit(1);
+    return;
+  }
+  if (!hasTrustZoneUpdates && !hasResourceBudgetUpdates) {
     runtime.error("Pass at least one budget limit to update.");
     runtime.exit(1);
     return;
   }
   const db = openLocalKernelDatabase();
   try {
-    const ok = db.updateTrustZoneLimits({
-      id: trustZone,
-      maxProcesses,
-      maxMemoryMb,
-      maxRuntimeSeconds,
-    });
-    if (!ok) {
-      runtime.error(`Unknown trust zone: ${trustZone}`);
-      runtime.exit(1);
-      return;
+    let zone;
+    if (hasTrustZoneUpdates && trustZone) {
+      const ok = db.updateTrustZoneLimits({
+        id: trustZone,
+        maxProcesses,
+        maxMemoryMb,
+        maxRuntimeSeconds,
+      });
+      if (!ok) {
+        runtime.error(`Unknown trust zone: ${trustZone}`);
+        runtime.exit(1);
+        return;
+      }
+      zone = db.listTrustZones().find((entry) => entry.id === trustZone);
     }
-    const zone = db.listTrustZones().find((entry) => entry.id === trustZone);
+    const resourceBudgets = hasResourceBudgetUpdates
+      ? db.updateResourceBudgets(resourceBudgetUpdates)
+      : db.getResourceBudgetSnapshot();
     if (opts.json) {
-      writeRuntimeJson(runtime, { ok: true, trustZone: zone });
+      writeRuntimeJson(runtime, {
+        ok: true,
+        resourceBudgets,
+        ...(zone ? { trustZone: zone } : {}),
+      });
       return;
     }
-    runtime.log(`Updated runtime budget for trust zone ${trustZone}.`);
+    if (zone) {
+      runtime.log(`Updated runtime budget for trust zone ${trustZone}.`);
+    }
+    if (hasResourceBudgetUpdates) {
+      runtime.log("Updated SparseKernel small-VM resource budgets.");
+    }
   } finally {
     db.close();
   }

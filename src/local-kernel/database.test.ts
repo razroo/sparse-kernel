@@ -376,6 +376,44 @@ describe("local runtime kernel database", () => {
     expect(broker.releaseContext(context.id)).toBe(true);
   });
 
+  it("enforces the global browser context resource budget across pools", () => {
+    const db = openTempDb();
+    db.ensureAgent({ id: "main" });
+    db.updateResourceBudgets({ browserContextsMax: 1 });
+    for (const zone of ["public_web", "authenticated_web"]) {
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "browser_context",
+        resourceId: zone,
+        action: "allocate",
+      });
+    }
+    const broker = new LocalBrowserBroker(db);
+    const context = broker.acquireContext({
+      agentId: "main",
+      trustZoneId: "public_web",
+      maxContexts: 10,
+    });
+    expect(context.status).toBe("active");
+    expect(() =>
+      broker.acquireContext({
+        agentId: "main",
+        trustZoneId: "authenticated_web",
+        maxContexts: 10,
+      }),
+    ).toThrow(/Browser context budget exhausted/);
+    const audit = db.db
+      .prepare("SELECT action, payload_json FROM audit_log ORDER BY id DESC LIMIT 1")
+      .get() as { action: string; payload_json: string };
+    expect(audit.action).toBe("resource_lease.denied_budget_exhausted");
+    expect(JSON.parse(audit.payload_json)).toMatchObject({
+      resourceType: "browser_context",
+      active: 1,
+      limit: 1,
+    });
+  });
+
   it("records browser target lifecycle and queryable observations", () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });
@@ -599,6 +637,34 @@ describe("local runtime kernel database", () => {
         trustZoneId: "code_execution",
       }),
     ).toBe("sandbox-budget-c");
+  });
+
+  it("enforces the global heavy sandbox budget across trust zones", () => {
+    const db = openTempDb();
+    db.updateResourceBudgets({ heavySandboxesMax: 1 });
+    db.createResourceLease({
+      id: "heavy-sandbox-a",
+      resourceType: "sandbox",
+      resourceId: "heavy-sandbox-a",
+      trustZoneId: "code_execution",
+    });
+    expect(() =>
+      db.createResourceLease({
+        id: "heavy-sandbox-b",
+        resourceType: "sandbox",
+        resourceId: "heavy-sandbox-b",
+        trustZoneId: "plugin_untrusted",
+      }),
+    ).toThrow(/Heavy sandbox budget exhausted/);
+    expect(db.releaseResourceLease("heavy-sandbox-a")).toBe(true);
+    expect(
+      db.createResourceLease({
+        id: "heavy-sandbox-c",
+        resourceType: "sandbox",
+        resourceId: "heavy-sandbox-c",
+        trustZoneId: "plugin_untrusted",
+      }),
+    ).toBe("heavy-sandbox-c");
   });
 
   it("brokers local/no-isolation sandbox allocations without pretending isolation", () => {

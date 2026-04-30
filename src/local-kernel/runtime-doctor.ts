@@ -203,7 +203,7 @@ function inspectToolBroker(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
 }
 
 function inspectSandboxBackends(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
-  const probes = probeSandboxBackends();
+  const probes = probeSandboxBackends({ env });
   const available = probes
     .filter((probe) => probe.hardBoundary && probe.available)
     .map((probe) => probe.backend);
@@ -223,7 +223,7 @@ function inspectSandboxBackends(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck
     status: allowNoIsolation ? "warn" : "fail",
     summary: "No isolated command sandbox backend was found.",
     remediation:
-      "Install bwrap/minijail, configure a Docker image, or only use local/no_isolation for trusted operations.",
+      "Install bwrap/minijail, configure Docker, configure an operator VM wrapper, or only use local/no_isolation for trusted operations.",
   };
 }
 
@@ -311,7 +311,10 @@ function inspectWorkerIdentities(env: NodeJS.ProcessEnv): SparseKernelDoctorChec
 function inspectPluginSubprocess(env: NodeJS.ProcessEnv): SparseKernelDoctorCheck {
   const boundary =
     env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY?.trim().toLowerCase() ??
-    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS?.trim().toLowerCase();
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS?.trim().toLowerCase() ??
+    (env.OPENCLAW_SPARSEKERNEL_STRICT === "1" || env.OPENCLAW_SPARSEKERNEL_STRICT === "true"
+      ? "strict"
+      : undefined);
   const defaultWorker = env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND?.trim();
   if (boundary === "subprocess" || boundary === "strict") {
     return {

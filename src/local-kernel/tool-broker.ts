@@ -25,8 +25,14 @@ const DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS: SandboxBackendKind[] = [
   "bwrap",
   "minijail",
   "docker",
+  "vm",
 ];
-const DEFAULT_COMMAND_SANDBOX_BACKENDS: SandboxBackendKind[] = ["bwrap", "minijail", "docker"];
+const DEFAULT_COMMAND_SANDBOX_BACKENDS: SandboxBackendKind[] = [
+  "bwrap",
+  "minijail",
+  "docker",
+  "vm",
+];
 const PLUGIN_SANDBOX_BACKENDS = new Set<SandboxBackendKind>([
   "local/no_isolation",
   "docker",
@@ -124,6 +130,21 @@ export function requiresPluginSubprocess(raw: string | undefined): boolean {
   );
 }
 
+function isTruthySparseKernelFlag(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function resolvePluginProcessBoundary(env: NodeJS.ProcessEnv): string | undefined {
+  const explicit =
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY?.trim().toLowerCase() ??
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS?.trim().toLowerCase();
+  if (explicit) {
+    return explicit;
+  }
+  return isTruthySparseKernelFlag(env.OPENCLAW_SPARSEKERNEL_STRICT) ? "strict" : undefined;
+}
+
 function requiresNonBundledPluginSubprocess(raw: string | undefined): boolean {
   const normalized = raw?.trim().toLowerCase();
   if (!normalized) {
@@ -151,10 +172,7 @@ export function pluginToolRequiresSubprocess(
   if (!meta) {
     return false;
   }
-  if (
-    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY) ||
-    requiresPluginSubprocess(env.OPENCLAW_RUNTIME_PLUGIN_PROCESS)
-  ) {
+  if (requiresPluginSubprocess(resolvePluginProcessBoundary(env))) {
     return true;
   }
   if (meta.processBoundary === "subprocess_required") {

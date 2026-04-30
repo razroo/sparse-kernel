@@ -634,6 +634,41 @@ describe("CapabilityToolBroker", () => {
     }
   });
 
+  it("treats SparseKernel strict mode as a subprocess boundary for bundled plugins", async () => {
+    const db = new LocalKernelDatabase({ dbPath: ":memory:" });
+    try {
+      db.ensureAgent({ id: "main" });
+      db.grantCapability({
+        subjectType: "agent",
+        subjectId: "main",
+        resourceType: "tool",
+        resourceId: "bundled_tool",
+        action: "invoke",
+      });
+      const rawTool = makeTool("bundled_tool");
+      setPluginToolMeta(rawTool, {
+        pluginId: "browser",
+        optional: false,
+        origin: "bundled",
+      });
+      const broker = new CapabilityToolBroker(db, {
+        env: { OPENCLAW_SPARSEKERNEL_STRICT: "1" } as NodeJS.ProcessEnv,
+      });
+      const tool = broker.wrapTool(rawTool, {
+        subject: { subjectType: "agent", subjectId: "main" },
+        agentId: "main",
+      });
+      await expect(tool.execute("call-bundled-strict", {})).rejects.toThrow(
+        /out-of-process execution/,
+      );
+      expect(db.listAudit({ limit: 20 }).map((entry) => entry.action)).toEqual(
+        expect.arrayContaining(["plugin_tool.subprocess_required", "tool_call.failed"]),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it("fails closed when plugin tool metadata requires a subprocess boundary", async () => {
     const db = new LocalKernelDatabase({ dbPath: ":memory:" });
     try {

@@ -82,7 +82,10 @@ export function registerRuntimeCli(program: Command) {
             "Plan broker-managed SparseKernel worker identities.",
           ],
           ["openclaw runtime doctor", "Check SparseKernel runtime readiness."],
-          ["openclaw runtime acceptance --strict", "Check strict SparseKernel cutover readiness."],
+          [
+            "openclaw runtime acceptance --strict --run",
+            "Check strict SparseKernel readiness and run required lanes.",
+          ],
           ["openclaw runtime cutover-plan", "Print a guided SparseKernel strict cutover plan."],
           [
             "openclaw runtime egress-proxy --trust-zone public_web",
@@ -141,6 +144,8 @@ export function registerRuntimeCli(program: Command) {
     .description("Check SparseKernel acceptance readiness and test lanes")
     .option("--strict", "Require strict SparseKernel cutover settings", false)
     .option("--current-platform", "Show only lanes for the current platform", false)
+    .option("--run", "Run required acceptance lane commands", false)
+    .option("--include-recommended", "Also run recommended acceptance lanes with --run", false)
     .option("--json", "Output JSON", false)
     .action(
       createRunner((opts) =>
@@ -148,6 +153,8 @@ export function registerRuntimeCli(program: Command) {
           {
             strict: Boolean(opts.strict),
             currentPlatform: Boolean(opts.currentPlatform),
+            run: Boolean(opts.run),
+            includeRecommended: Boolean(opts.includeRecommended),
             json: Boolean(opts.json),
           },
           defaultRuntime,

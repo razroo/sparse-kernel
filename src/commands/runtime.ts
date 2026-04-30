@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { parseDurationMs } from "../cli/parse-duration.js";
 import { getRuntimeConfig } from "../config/config.js";
 import {
@@ -25,6 +26,7 @@ import {
 } from "../local-kernel/index.js";
 import type { ResourceBudgetUpdateInput, RuntimeRetentionPolicy } from "../local-kernel/index.js";
 import type { WorkerIdentityProvisionPlatform } from "../local-kernel/index.js";
+import type { SparseKernelAcceptanceLane } from "../local-kernel/runtime-doctor.js";
 import type { OutputRuntimeEnv, RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
 
@@ -116,6 +118,17 @@ type SparseKernelStrictFinding = {
   remediation?: string;
 };
 
+type SparseKernelAcceptanceLaneRun = {
+  id: string;
+  command: string;
+  status: "passed" | "failed";
+  exitCode: number | null;
+  signal?: NodeJS.Signals | null;
+  durationMs: number;
+  stdout?: string;
+  stderr?: string;
+};
+
 function isTruthyRuntimeFlag(value: string | undefined): boolean {
   const normalized = value?.trim().toLowerCase();
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
@@ -129,6 +142,16 @@ function currentAcceptancePlatform(): "linux" | "darwin" | "windows" {
       : "linux";
 }
 
+function resolvePluginBoundaryMode(env: NodeJS.ProcessEnv): string | undefined {
+  const explicit =
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY?.trim().toLowerCase() ??
+    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS?.trim().toLowerCase();
+  if (explicit) {
+    return explicit;
+  }
+  return isTruthyRuntimeFlag(env.OPENCLAW_SPARSEKERNEL_STRICT) ? "strict" : undefined;
+}
+
 function buildStrictAcceptanceFindings(params: {
   report: ReturnType<typeof inspectSparseKernelRuntime>;
   env?: NodeJS.ProcessEnv;
@@ -136,9 +159,7 @@ function buildStrictAcceptanceFindings(params: {
   const env = params.env ?? process.env;
   const checkStatus = (id: string) =>
     params.report.checks.find((check) => check.id === id)?.status ?? "fail";
-  const pluginBoundary =
-    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS_BOUNDARY?.trim().toLowerCase() ??
-    env.OPENCLAW_RUNTIME_PLUGIN_PROCESS?.trim().toLowerCase();
+  const pluginBoundary = resolvePluginBoundaryMode(env);
   const pluginWorker = env.OPENCLAW_RUNTIME_PLUGIN_SUBPROCESS_COMMAND?.trim();
   const browserMode = env.OPENCLAW_RUNTIME_BROWSER_BROKER?.trim().toLowerCase() || "auto";
   const hardEgressRequired = isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS);
@@ -254,30 +275,96 @@ function buildStrictAcceptanceFindings(params: {
   ];
 }
 
+function acceptanceLaneRunnable(
+  lane: SparseKernelAcceptanceLane,
+  includeRecommended: boolean,
+): boolean {
+  return lane.status === "required" || (includeRecommended && lane.status === "recommended");
+}
+
+function tailOutput(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  return value.length <= 4_000 ? value : value.slice(value.length - 4_000);
+}
+
+function runAcceptanceLaneCommand(
+  lane: SparseKernelAcceptanceLane,
+  env: NodeJS.ProcessEnv,
+): SparseKernelAcceptanceLaneRun {
+  const started = Date.now();
+  const result = spawnSync(lane.command, {
+    shell: true,
+    encoding: "utf8",
+    env,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const exitCode = result.status;
+  const status = exitCode === 0 ? "passed" : "failed";
+  return {
+    id: lane.id,
+    command: lane.command,
+    status,
+    exitCode,
+    signal: result.signal,
+    durationMs: Date.now() - started,
+    stdout: tailOutput(result.stdout),
+    stderr: tailOutput(
+      result.stderr || (result.error ? `${result.error.name}: ${result.error.message}` : ""),
+    ),
+  };
+}
+
 export async function runtimeAcceptanceCommand(
-  opts: { strict?: boolean; currentPlatform?: boolean; json?: boolean },
+  opts: {
+    strict?: boolean;
+    currentPlatform?: boolean;
+    includeRecommended?: boolean;
+    run?: boolean;
+    json?: boolean;
+    env?: NodeJS.ProcessEnv;
+    runLaneCommand?: (
+      lane: SparseKernelAcceptanceLane,
+      env: NodeJS.ProcessEnv,
+    ) => SparseKernelAcceptanceLaneRun;
+  },
   runtime: RuntimeEnv,
 ): Promise<void> {
+  const env = opts.env ?? process.env;
   const db = openLocalKernelDatabase();
   try {
-    const report = inspectSparseKernelRuntime({ db });
+    const report = inspectSparseKernelRuntime({ db, env });
     const platform = currentAcceptancePlatform();
     const lanes = opts.currentPlatform
       ? report.acceptanceLanes.filter(
           (lane) => lane.platform === "all" || lane.platform === platform,
         )
       : report.acceptanceLanes;
-    const strictFindings = opts.strict ? buildStrictAcceptanceFindings({ report }) : undefined;
-    const ok = opts.strict
+    const strictFindings = opts.strict ? buildStrictAcceptanceFindings({ report, env }) : undefined;
+    const readinessOk = opts.strict
       ? strictFindings?.every((finding) => finding.status === "pass") === true
       : report.ok;
     const checks = opts.strict ? (strictFindings ?? []) : report.checks;
+    const runResults = opts.run
+      ? lanes
+          .filter((lane) => acceptanceLaneRunnable(lane, Boolean(opts.includeRecommended)))
+          .map((lane) => (opts.runLaneCommand ?? runAcceptanceLaneCommand)(lane, env))
+      : undefined;
+    const runOk = runResults ? runResults.every((result) => result.status === "passed") : true;
+    const ok = readinessOk && runOk;
     const payload = {
       ok,
       strict: Boolean(opts.strict),
       platform,
       checks,
       lanes,
+      ...(opts.run
+        ? {
+            ran: runResults ?? [],
+            includeRecommended: Boolean(opts.includeRecommended),
+          }
+        : {}),
     };
     if (opts.json) {
       writeRuntimeJson(runtime, payload);
@@ -292,6 +379,17 @@ export async function runtimeAcceptanceCommand(
       runtime.log("Acceptance lanes:");
       for (const lane of lanes) {
         runtime.log(`  ${lane.id} [${lane.platform}/${lane.status}]: ${lane.command}`);
+      }
+      if (runResults) {
+        runtime.log("Executed lanes:");
+        for (const result of runResults) {
+          runtime.log(
+            `  ${result.status.toUpperCase()} ${result.id}: ${result.command} (${result.durationMs}ms)`,
+          );
+          if (result.stderr && result.status === "failed") {
+            runtime.log(`  stderr: ${result.stderr}`);
+          }
+        }
       }
     }
     if (!ok) {
@@ -321,7 +419,7 @@ export async function runtimeCutoverPlanCommand(
       },
       commands: [
         "openclaw sessions import --from-existing",
-        "openclaw runtime acceptance --strict --current-platform",
+        "openclaw runtime acceptance --strict --current-platform --run --include-recommended",
         "openclaw sessions export --session <session-id> --format jsonl",
       ],
       checks: strictFindings,
@@ -338,7 +436,9 @@ export async function runtimeCutoverPlanCommand(
       runtime.log(`   ${key}=${value}`);
     }
     runtime.log("3. Run strict acceptance:");
-    runtime.log("   openclaw runtime acceptance --strict --current-platform");
+    runtime.log(
+      "   openclaw runtime acceptance --strict --current-platform --run --include-recommended",
+    );
     runtime.log("4. Keep JSONL as explicit export/rollback:");
     runtime.log("   openclaw sessions export --session <session-id> --format jsonl");
     runtime.log(`Current readiness: ${payload.ok ? "ok" : "attention needed"}`);

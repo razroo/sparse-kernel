@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -158,6 +159,65 @@ function firstAvailableCommand(
   return commands.find((command) => available(command));
 }
 
+function isExternalSandboxBackend(
+  backend: SandboxBackendKind,
+): backend is "ssh" | "openshell" | "vm" | "other" {
+  return backend === "ssh" || backend === "openshell" || backend === "vm" || backend === "other";
+}
+
+function externalSandboxEnvKey(backend: SandboxBackendKind): string {
+  return backend.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+}
+
+function resolveExternalSandboxWrapper(
+  backend: SandboxBackendKind,
+  env: NodeJS.ProcessEnv = process.env,
+):
+  | { command: string; args: string[]; hardBoundary: boolean; boundaryDescription?: string }
+  | undefined {
+  if (!isExternalSandboxBackend(backend)) {
+    return undefined;
+  }
+  const key = externalSandboxEnvKey(backend);
+  const command =
+    env[`OPENCLAW_RUNTIME_SANDBOX_${key}_COMMAND`]?.trim() ||
+    env.OPENCLAW_RUNTIME_SANDBOX_REMOTE_COMMAND?.trim();
+  if (!command) {
+    return undefined;
+  }
+  const args = readJsonOrWhitespaceArgs(
+    env[`OPENCLAW_RUNTIME_SANDBOX_${key}_ARGS`] ?? env.OPENCLAW_RUNTIME_SANDBOX_REMOTE_ARGS,
+    `OPENCLAW_RUNTIME_SANDBOX_${key}_ARGS`,
+  );
+  const boundary =
+    env[`OPENCLAW_RUNTIME_SANDBOX_${key}_BOUNDARY`]?.trim() ||
+    env.OPENCLAW_RUNTIME_SANDBOX_REMOTE_BOUNDARY?.trim();
+  const hardBoundary =
+    boundary === "host_firewall" ||
+    boundary === "egress_proxy" ||
+    boundary === "vm_firewall" ||
+    boundary === "platform_enforcer";
+  return {
+    command,
+    args,
+    hardBoundary,
+    ...(boundary ? { boundaryDescription: boundary } : {}),
+  };
+}
+
+function sandboxBackendProvidesRequiredIsolation(
+  backend: SandboxBackendKind,
+  env: NodeJS.ProcessEnv,
+): boolean {
+  if (backend === "local/no_isolation") {
+    return false;
+  }
+  if (isExternalSandboxBackend(backend)) {
+    return resolveExternalSandboxWrapper(backend, env)?.hardBoundary === true;
+  }
+  return true;
+}
+
 export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean {
   switch (backend) {
     case "bwrap":
@@ -167,23 +227,29 @@ export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean 
     case "docker":
       return commandAvailable("docker");
     case "local/no_isolation":
+      return true;
     case "ssh":
     case "openshell":
     case "vm":
     case "other":
-      return true;
+      return Boolean(resolveExternalSandboxWrapper(backend));
   }
 }
 
 export function probeSandboxBackends(
   input: {
     commandAvailable?: (command: string) => boolean;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): SandboxBackendProbe[] {
   const available = input.commandAvailable ?? commandAvailable;
+  const env = input.env ?? process.env;
   const bwrap = firstAvailableCommand(["bwrap", "bubblewrap"], available);
   const minijail = firstAvailableCommand(["minijail0", "minijail"], available);
   const docker = firstAvailableCommand(["docker"], available);
+  const vmWrapper = resolveExternalSandboxWrapper("vm", env);
+  const sshWrapper = resolveExternalSandboxWrapper("ssh", env);
+  const openshellWrapper = resolveExternalSandboxWrapper("openshell", env);
   return [
     {
       backend: "local/no_isolation",
@@ -221,6 +287,50 @@ export function probeSandboxBackends(
       notes: docker
         ? ["Container isolation depends on daemon policy; not a per-agent default."]
         : ["Install/configure Docker and an explicit image to enable this backend."],
+    },
+    {
+      backend: "vm",
+      available: Boolean(vmWrapper),
+      ...(vmWrapper ? { command: vmWrapper.command } : {}),
+      hardBoundary: Boolean(vmWrapper?.hardBoundary),
+      isolation: describeSandboxBackend("vm"),
+      notes: vmWrapper
+        ? [
+            vmWrapper.hardBoundary
+              ? `Operator VM wrapper declares boundary ${vmWrapper.boundaryDescription}.`
+              : "Operator VM wrapper is configured; SparseKernel does not assume a hard boundary unless the wrapper declares one.",
+          ]
+        : ["Set OPENCLAW_RUNTIME_SANDBOX_VM_COMMAND to enable the VM wrapper backend."],
+    },
+    {
+      backend: "ssh",
+      available: Boolean(sshWrapper),
+      ...(sshWrapper ? { command: sshWrapper.command } : {}),
+      hardBoundary: Boolean(sshWrapper?.hardBoundary),
+      isolation: describeSandboxBackend("ssh"),
+      notes: sshWrapper
+        ? [
+            sshWrapper.hardBoundary
+              ? `Operator SSH wrapper declares boundary ${sshWrapper.boundaryDescription}.`
+              : "Operator SSH wrapper is configured; SSH transport is not itself a sandbox boundary.",
+          ]
+        : ["Set OPENCLAW_RUNTIME_SANDBOX_SSH_COMMAND to enable the SSH wrapper backend."],
+    },
+    {
+      backend: "openshell",
+      available: Boolean(openshellWrapper),
+      ...(openshellWrapper ? { command: openshellWrapper.command } : {}),
+      hardBoundary: Boolean(openshellWrapper?.hardBoundary),
+      isolation: describeSandboxBackend("openshell"),
+      notes: openshellWrapper
+        ? [
+            openshellWrapper.hardBoundary
+              ? `Operator OpenShell wrapper declares boundary ${openshellWrapper.boundaryDescription}.`
+              : "Operator OpenShell wrapper is configured; SparseKernel does not assume host isolation.",
+          ]
+        : [
+            "Set OPENCLAW_RUNTIME_SANDBOX_OPENSHELL_COMMAND to enable the OpenShell wrapper backend.",
+          ],
     },
   ];
 }
@@ -405,9 +515,9 @@ function selectSandboxBackendForProfile(params: {
   const requested = params.requestedBackend;
   const requiresIsolation = profileRequiresIsolatedBackend(params.profile, env);
   if (requested) {
-    if (requiresIsolation && requested === "local/no_isolation") {
+    if (requiresIsolation && !sandboxBackendProvidesRequiredIsolation(requested, env)) {
       throw new Error(
-        `Sandbox isolation profile ${params.profile} requires an isolated backend; local/no_isolation is trusted execution only`,
+        `Sandbox isolation profile ${params.profile} requires an isolated backend; ${requested} is not an asserted isolation boundary`,
       );
     }
     return requested;
@@ -415,12 +525,13 @@ function selectSandboxBackendForProfile(params: {
   if (!requiresIsolation) {
     return "local/no_isolation";
   }
-  const selected = (["bwrap", "minijail", "docker", "vm"] as SandboxBackendKind[]).find((backend) =>
-    isSandboxBackendAvailable(backend),
+  const selected = (["bwrap", "minijail", "docker", "vm"] as SandboxBackendKind[]).find(
+    (backend) =>
+      isSandboxBackendAvailable(backend) && sandboxBackendProvidesRequiredIsolation(backend, env),
   );
   if (!selected) {
     throw new Error(
-      `Sandbox isolation profile ${params.profile} requires bwrap, minijail, Docker, or VM backend support`,
+      `Sandbox isolation profile ${params.profile} requires bwrap, minijail, Docker, or a configured VM backend wrapper`,
     );
   }
   return selected;
@@ -459,13 +570,13 @@ function describeSandboxBackend(backend: SandboxBackendKind): string {
     case "docker":
       return "Docker container process with broker-selected image, no pull, and network disabled by default";
     case "ssh":
-      return "remote SSH backend placeholder; no v0 command execution";
+      return "operator-supplied SSH command wrapper; SSH transport is not host isolation";
     case "openshell":
-      return "OpenShell backend placeholder; no v0 command execution";
+      return "operator-supplied OpenShell command wrapper";
     case "vm":
-      return "VM backend placeholder; no v0 command execution";
+      return "operator-supplied VM command wrapper";
     case "other":
-      return "unknown sandbox backend placeholder; no v0 command execution";
+      return "operator-supplied custom sandbox command wrapper";
   }
 }
 
@@ -1020,10 +1131,40 @@ export function buildSandboxSpawnPlan(params: {
     case "ssh":
     case "openshell":
     case "vm":
-    case "other":
-      throw new Error(
-        `Sandbox backend does not support brokered command execution yet: ${params.backend}`,
-      );
+    case "other": {
+      const wrapper = resolveExternalSandboxWrapper(params.backend);
+      if (!wrapper) {
+        throw new Error(
+          `Sandbox backend ${params.backend} requires OPENCLAW_RUNTIME_SANDBOX_${externalSandboxEnvKey(
+            params.backend,
+          )}_COMMAND or OPENCLAW_RUNTIME_SANDBOX_REMOTE_COMMAND.`,
+        );
+      }
+      const request = {
+        protocol: "openclaw.sparsekernel.sandbox-command.v1",
+        backend: params.backend,
+        isolationProfile,
+        command: params.command,
+        args: params.args,
+        ...(params.cwd ? { cwd: params.cwd } : {}),
+        env: params.env ?? {},
+        stdin: params.stdin === true,
+      };
+      return {
+        command: wrapper.command,
+        args: [
+          ...wrapper.args,
+          "--sparsekernel-request-base64",
+          Buffer.from(JSON.stringify(request), "utf8").toString("base64url"),
+          "--",
+          params.command,
+          ...params.args,
+        ],
+        isolation: `${describeSandboxBackend(params.backend)}; profile=${isolationProfile}${
+          wrapper.hardBoundary ? `; declaredBoundary=${wrapper.boundaryDescription}` : ""
+        }`,
+      };
+    }
   }
 }
 

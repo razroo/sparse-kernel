@@ -416,10 +416,88 @@ describe("SparseKernel runtime commands", () => {
           }),
           commands: expect.arrayContaining([
             "openclaw sessions import --from-existing",
-            "openclaw runtime acceptance --strict --current-platform",
+            "openclaw runtime acceptance --strict --current-platform --run --include-recommended",
           ]),
         }),
         2,
+      );
+    });
+  });
+
+  it("can execute required SparseKernel acceptance lanes", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const runtime = makeRuntime();
+      await runtimeAcceptanceCommand(
+        {
+          run: true,
+          currentPlatform: true,
+          json: true,
+          env: { OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION: "1" } as NodeJS.ProcessEnv,
+          runLaneCommand: (lane) => ({
+            id: lane.id,
+            command: lane.command,
+            status: "passed",
+            exitCode: 0,
+            durationMs: 1,
+          }),
+        },
+        runtime,
+      );
+
+      const payload = vi.mocked(runtime.writeJson).mock.calls[0]?.[0] as {
+        ok?: boolean;
+        ran?: Array<{ id: string; status: string }>;
+      };
+      expect(payload.ok).toBe(true);
+      expect(payload.ran?.map((lane) => lane.id)).toEqual([
+        "ledger-and-leases",
+        "tool-broker",
+        "runtime-cli",
+        "egress-proxy",
+      ]);
+      expect(payload.ran?.every((lane) => lane.status === "passed")).toBe(true);
+    });
+  });
+
+  it("fails executable acceptance when a selected lane fails", async () => {
+    const stateDir = tempRoot();
+    await withStateDir(stateDir, async () => {
+      const runtime = makeRuntime();
+      await expect(
+        runtimeAcceptanceCommand(
+          {
+            run: true,
+            includeRecommended: true,
+            currentPlatform: true,
+            json: true,
+            env: { OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION: "1" } as NodeJS.ProcessEnv,
+            runLaneCommand: (lane) => ({
+              id: lane.id,
+              command: lane.command,
+              status: lane.id === "browser-cdp" ? "failed" : "passed",
+              exitCode: lane.id === "browser-cdp" ? 1 : 0,
+              durationMs: 1,
+              stderr: lane.id === "browser-cdp" ? "browser conformance failed" : undefined,
+            }),
+          },
+          runtime,
+        ),
+      ).rejects.toThrow(/exit 1/);
+
+      const payload = vi.mocked(runtime.writeJson).mock.calls[0]?.[0] as {
+        ok?: boolean;
+        ran?: Array<{ id: string; status: string; stderr?: string }>;
+      };
+      expect(payload.ok).toBe(false);
+      expect(payload.ran).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "browser-cdp",
+            status: "failed",
+            stderr: "browser conformance failed",
+          }),
+        ]),
       );
     });
   });

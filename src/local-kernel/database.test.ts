@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1521,7 +1522,7 @@ describe("local runtime kernel database", () => {
     ).rejects.toThrow(/backend is not available/);
   });
 
-  it("does not silently execute unsupported sandbox backends on the host", async () => {
+  it("does not silently allocate unconfigured external sandbox backends", () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });
     db.enqueueTask({ id: "task-a", kind: "demo" });
@@ -1533,23 +1534,91 @@ describe("local runtime kernel database", () => {
       action: "allocate",
     });
     const broker = new LocalSandboxBroker(db);
-    const allocation = broker.allocateSandbox({
-      taskId: "task-a",
-      agentId: "main",
-      trustZoneId: "code_execution",
-      requirements: { backend: "other" },
-    });
-    await expect(
-      broker.runCommand({
-        allocationId: allocation.id,
-        command: process.execPath,
-        args: ["-e", "process.stdout.write('should-not-run')"],
+    expect(() =>
+      broker.allocateSandbox({
+        taskId: "task-a",
+        agentId: "main",
+        trustZoneId: "code_execution",
+        requirements: { backend: "other" },
       }),
-    ).rejects.toThrow(/does not support brokered command execution/);
+    ).toThrow(/Sandbox backend unavailable: other/);
     const audit = db.db
-      .prepare("SELECT action FROM audit_log WHERE action = 'sandbox.command_failed'")
+      .prepare(
+        "SELECT action FROM audit_log WHERE action = 'sandbox.allocation_denied_backend_unavailable'",
+      )
       .get() as { action: string } | undefined;
-    expect(audit?.action).toBe("sandbox.command_failed");
+    expect(audit?.action).toBe("sandbox.allocation_denied_backend_unavailable");
+  });
+
+  it("builds brokered VM sandbox wrapper command plans", () => {
+    const previousCommand = process.env.OPENCLAW_RUNTIME_SANDBOX_VM_COMMAND;
+    const previousArgs = process.env.OPENCLAW_RUNTIME_SANDBOX_VM_ARGS;
+    const previousBoundary = process.env.OPENCLAW_RUNTIME_SANDBOX_VM_BOUNDARY;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_VM_COMMAND = process.execPath;
+    process.env.OPENCLAW_RUNTIME_SANDBOX_VM_ARGS = JSON.stringify(["vm-wrapper.mjs"]);
+    process.env.OPENCLAW_RUNTIME_SANDBOX_VM_BOUNDARY = "vm_firewall";
+    try {
+      const probes = probeSandboxBackends({ env: process.env });
+      expect(probes.find((probe) => probe.backend === "vm")).toMatchObject({
+        available: true,
+        hardBoundary: true,
+        command: process.execPath,
+      });
+      expect(isSandboxBackendAvailable("vm")).toBe(true);
+
+      const plan = buildSandboxSpawnPlan({
+        backend: "vm",
+        command: "node",
+        args: ["worker.mjs"],
+        cwd: "/workspace",
+        env: { SAFE_ENV: "1" },
+        stdin: true,
+        isolationProfile: "plugin_untrusted",
+      });
+      const requestIndex = plan.args.indexOf("--sparsekernel-request-base64");
+      expect(plan).toMatchObject({
+        command: process.execPath,
+        args: expect.arrayContaining(["vm-wrapper.mjs", "--", "node", "worker.mjs"]),
+      });
+      expect(requestIndex).toBeGreaterThanOrEqual(0);
+      const encoded = plan.args[requestIndex + 1];
+      if (!encoded) {
+        throw new Error("expected encoded sandbox command request");
+      }
+      const request = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
+        protocol: string;
+        backend: string;
+        command: string;
+        args: string[];
+        env: Record<string, string>;
+        stdin: boolean;
+      };
+      expect(request).toMatchObject({
+        protocol: "openclaw.sparsekernel.sandbox-command.v1",
+        backend: "vm",
+        command: "node",
+        args: ["worker.mjs"],
+        env: { SAFE_ENV: "1" },
+        stdin: true,
+      });
+      expect(plan.isolation).toContain("declaredBoundary=vm_firewall");
+    } finally {
+      if (previousCommand === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_VM_COMMAND;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_VM_COMMAND = previousCommand;
+      }
+      if (previousArgs === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_VM_ARGS;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_VM_ARGS = previousArgs;
+      }
+      if (previousBoundary === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_VM_BOUNDARY;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_VM_BOUNDARY = previousBoundary;
+      }
+    }
   });
 
   it("builds explicit Docker sandbox command plans without host fallback", () => {

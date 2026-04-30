@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { SessionManager } from "@mariozechner/pi-coding-agent";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { openLocalKernelDatabase } from "../../local-kernel/database.js";
 import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import { extractAssistantVisibleText } from "../../shared/chat-message-content.js";
 import {
@@ -14,6 +15,7 @@ import {
 import {
   appendTranscriptMessageToRuntimeLedger,
   isRuntimeSessionStorePrimary,
+  resolveRuntimeSessionStoreMode,
 } from "./runtime-ledger.js";
 import { resolveAndPersistSessionFile } from "./session-file.js";
 import { loadSessionStore, normalizeStoreSessionKey } from "./store.js";
@@ -56,10 +58,26 @@ export type SessionTranscriptAppendResult =
   | { ok: false; reason: string };
 
 export type SessionTranscriptUpdateMode = "inline" | "file-only" | "none";
+export type RuntimeTranscriptCompatMode = "jsonl" | "ledger-only";
 
 export type SessionTranscriptAssistantMessage = Parameters<SessionManager["appendMessage"]>[0] & {
   role: "assistant";
 };
+
+const RUNTIME_TRANSCRIPT_COMPAT_ENV = "OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT";
+
+export function resolveRuntimeTranscriptCompatMode(
+  env: NodeJS.ProcessEnv = process.env,
+): RuntimeTranscriptCompatMode {
+  const raw = env[RUNTIME_TRANSCRIPT_COMPAT_ENV]?.trim().toLowerCase();
+  if (raw === "ledger-only" || raw === "ledger" || raw === "sqlite" || raw === "off") {
+    return "ledger-only";
+  }
+  if (raw === "jsonl" || raw === "legacy" || raw === "compat" || raw === "on") {
+    return "jsonl";
+  }
+  return resolveRuntimeSessionStoreMode(env) === "sqlite-strict" ? "ledger-only" : "jsonl";
+}
 
 export type LatestAssistantTranscriptText = {
   id?: string;
@@ -259,20 +277,29 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
     };
   }
 
-  await ensureSessionHeader({ sessionFile, sessionId: entry.sessionId });
+  const runtimePrimary = isRuntimeSessionStorePrimary();
+  const transcriptCompatMode = runtimePrimary ? resolveRuntimeTranscriptCompatMode() : "jsonl";
+
+  if (transcriptCompatMode === "jsonl") {
+    await ensureSessionHeader({ sessionFile, sessionId: entry.sessionId });
+  }
 
   const explicitIdempotencyKey =
     params.idempotencyKey ??
     ((params.message as { idempotencyKey?: unknown }).idempotencyKey as string | undefined);
   const existingMessageId = explicitIdempotencyKey
-    ? await transcriptHasIdempotencyKey(sessionFile, explicitIdempotencyKey)
+    ? transcriptCompatMode === "ledger-only"
+      ? transcriptLedgerHasIdempotencyKey(entry.sessionId, explicitIdempotencyKey)
+      : await transcriptHasIdempotencyKey(sessionFile, explicitIdempotencyKey)
     : undefined;
   if (existingMessageId) {
     return { ok: true, sessionFile, messageId: existingMessageId };
   }
 
   const latestEquivalentAssistantId = isRedundantDeliveryMirror(params.message)
-    ? await findLatestEquivalentAssistantMessageId(sessionFile, params.message)
+    ? transcriptCompatMode === "ledger-only"
+      ? findLatestEquivalentAssistantMessageIdInRuntimeLedger(entry.sessionId, params.message)
+      : await findLatestEquivalentAssistantMessageId(sessionFile, params.message)
     : undefined;
   if (latestEquivalentAssistantId) {
     return { ok: true, sessionFile, messageId: latestEquivalentAssistantId };
@@ -282,13 +309,14 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
     ...params.message,
     ...(explicitIdempotencyKey ? { idempotencyKey: explicitIdempotencyKey } : {}),
   } as Parameters<SessionManager["appendMessage"]>[0];
-  if (isRuntimeSessionStorePrimary()) {
+  if (runtimePrimary) {
     const messageId = await appendPrimaryRuntimeTranscriptMessage({
       storePath,
       sessionKey,
       agentId: params.agentId,
       entry: runtimeEntry,
       sessionFile,
+      compatMode: transcriptCompatMode,
       message,
     });
     emitAssistantTranscriptUpdate({
@@ -353,9 +381,13 @@ async function appendPrimaryRuntimeTranscriptMessage(params: {
   agentId?: string;
   entry: SessionEntry;
   sessionFile: string;
+  compatMode: RuntimeTranscriptCompatMode;
   message: Parameters<SessionManager["appendMessage"]>[0];
 }): Promise<string> {
-  const summary = await readTranscriptEntrySummary(params.sessionFile);
+  const summary =
+    params.compatMode === "ledger-only"
+      ? readRuntimeTranscriptEntrySummary(params.entry.sessionId)
+      : await readTranscriptEntrySummary(params.sessionFile);
   const messageId = generateTranscriptEntryId(summary.ids);
   appendTranscriptMessageToRuntimeLedger({
     storePath: params.storePath,
@@ -365,6 +397,9 @@ async function appendPrimaryRuntimeTranscriptMessage(params: {
     messageId,
     message: params.message,
   });
+  if (params.compatMode === "ledger-only") {
+    return messageId;
+  }
   const line = {
     type: "message",
     id: messageId,
@@ -407,6 +442,34 @@ async function readTranscriptEntrySummary(transcriptPath: string): Promise<{
   return { ids, ...(latestEntryId ? { latestEntryId } : {}) };
 }
 
+function readRuntimeTranscriptEntrySummary(sessionId: string): {
+  ids: Set<string>;
+  latestEntryId?: string;
+} {
+  const ids = new Set<string>();
+  let latestEntryId: string | undefined;
+  const db = openLocalKernelDatabase();
+  try {
+    for (const event of db.listTranscriptEvents(sessionId)) {
+      const content = event.content;
+      if (!content || typeof content !== "object" || Array.isArray(content)) {
+        continue;
+      }
+      const id = (content as { id?: unknown }).id;
+      if (typeof id !== "string" || !id) {
+        continue;
+      }
+      ids.add(id);
+      if ((content as { type?: unknown }).type !== "session") {
+        latestEntryId = id;
+      }
+    }
+  } finally {
+    db.close();
+  }
+  return { ids, ...(latestEntryId ? { latestEntryId } : {}) };
+}
+
 function generateTranscriptEntryId(existingIds: Set<string>): string {
   for (let attempt = 0; attempt < 32; attempt += 1) {
     const id = randomUUID().slice(0, 8);
@@ -445,6 +508,36 @@ async function transcriptHasIdempotencyKey(
     }
   } catch {
     return undefined;
+  }
+  return undefined;
+}
+
+function transcriptLedgerHasIdempotencyKey(
+  sessionId: string,
+  idempotencyKey: string,
+): string | undefined {
+  const db = openLocalKernelDatabase();
+  try {
+    for (const event of db.listTranscriptEvents(sessionId)) {
+      const content = event.content;
+      if (!content || typeof content !== "object" || Array.isArray(content)) {
+        continue;
+      }
+      const message = (content as { message?: unknown }).message;
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        continue;
+      }
+      const id = (content as { id?: unknown }).id;
+      if (
+        (message as { idempotencyKey?: unknown }).idempotencyKey === idempotencyKey &&
+        typeof id === "string" &&
+        id
+      ) {
+        return id;
+      }
+    }
+  } finally {
+    db.close();
   }
   return undefined;
 }
@@ -514,5 +607,43 @@ async function findLatestEquivalentAssistantMessageId(
     return undefined;
   }
 
+  return undefined;
+}
+
+function findLatestEquivalentAssistantMessageIdInRuntimeLedger(
+  sessionId: string,
+  message: SessionTranscriptAssistantMessage,
+): string | undefined {
+  const expectedText = extractAssistantMessageText(message);
+  if (!expectedText) {
+    return undefined;
+  }
+  const db = openLocalKernelDatabase();
+  try {
+    const events = db.listTranscriptEvents(sessionId);
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const content = events[index]?.content;
+      if (!content || typeof content !== "object" || Array.isArray(content)) {
+        continue;
+      }
+      const candidate = (content as { message?: unknown }).message;
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        continue;
+      }
+      if ((candidate as { role?: unknown }).role !== "assistant") {
+        continue;
+      }
+      const candidateText = extractAssistantMessageText(
+        candidate as SessionTranscriptAssistantMessage,
+      );
+      if (candidateText !== expectedText) {
+        return undefined;
+      }
+      const id = (content as { id?: unknown }).id;
+      return typeof id === "string" && id ? id : undefined;
+    }
+  } finally {
+    db.close();
+  }
   return undefined;
 }

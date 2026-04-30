@@ -1280,6 +1280,14 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       values: ["choice"],
     });
     await broker.actContext(context.ledger_context.id, {
+      kind: "check",
+      selector: "#agree",
+    });
+    await broker.actContext(context.ledger_context.id, {
+      kind: "uncheck",
+      selector: "#agree",
+    });
+    await broker.actContext(context.ledger_context.id, {
       kind: "fill",
       fields: [{ ref: "e3", type: "text", value: "filled" }],
     });
@@ -1325,6 +1333,12 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
           method: "Runtime.evaluate",
           params: expect.objectContaining({
             expression: expect.stringContaining("filled"),
+          }),
+        }),
+        expect.objectContaining({
+          method: "Runtime.evaluate",
+          params: expect.objectContaining({
+            expression: expect.stringContaining("desiredChecked"),
           }),
         }),
       ]),

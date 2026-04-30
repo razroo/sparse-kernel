@@ -201,6 +201,8 @@ export type SparseKernelBrowserActRequest =
     }
   | { kind: "press"; key: string; targetId?: string; delayMs?: number; modifiers?: string[] }
   | { kind: "hover"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
+  | { kind: "check"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
+  | { kind: "uncheck"; ref?: string; selector?: string; targetId?: string; timeoutMs?: number }
   | {
       kind: "scrollIntoView";
       ref?: string;
@@ -893,6 +895,8 @@ export class SparseKernelCdpBrowserBroker {
         });
       }
       case "type":
+      case "check":
+      case "uncheck":
       case "scrollIntoView":
       case "select": {
         return await this.withPostActionNavigationGuard(context, request.timeoutMs, async () => {
@@ -2686,6 +2690,26 @@ function buildActionExpression(
   return { ok: true };
 })()`;
   }
+  if (request.kind === "check" || request.kind === "uncheck") {
+    const desiredChecked = request.kind === "check";
+    return `(async () => {
+  ${buildActionTargetHelpers(selectorJson, timeoutJson, request.kind)}
+  const node = await waitForActionTarget();
+  node.scrollIntoView({ block: "center", inline: "center" });
+  const desiredChecked = ${JSON.stringify(desiredChecked)};
+  const control = node instanceof HTMLLabelElement && node.control ? node.control : node;
+  if (!(control instanceof HTMLInputElement) || !["checkbox", "radio"].includes(String(control.type || "").toLowerCase())) {
+    throw new Error("SparseKernel browser ${request.kind} target must be a checkbox, radio, or associated label");
+  }
+  if (control.checked !== desiredChecked) {
+    control.click();
+  }
+  if (control.checked !== desiredChecked) {
+    throw new Error("SparseKernel browser ${request.kind} did not reach requested checked state");
+  }
+  return { ok: true, checked: control.checked };
+})()`;
+  }
   if (request.kind === "select") {
     const values = JSON.stringify(request.values);
     return `(async () => {
@@ -2890,7 +2914,7 @@ function buildActionTargetHelpers(selectorJson: string, timeoutJson: string, kin
   };
   const isActionable = async (node) => {
     if (!isVisible(node)) return false;
-    if ((actionKind === "click" || actionKind === "type" || actionKind === "select") && !isEnabled(node)) return false;
+    if ((actionKind === "click" || actionKind === "type" || actionKind === "select" || actionKind === "check" || actionKind === "uncheck") && !isEnabled(node)) return false;
     if (actionKind === "type" && !isEditable(node)) return false;
     if (!(await isStable(node))) return false;
     if (actionKind !== "scrollIntoView" && !receivesCenterHit(node)) return false;

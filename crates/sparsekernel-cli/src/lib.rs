@@ -14,9 +14,15 @@ use sparsekernel_core::{
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::net::{TcpListener, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{env, io};
 use tiny_http::{Header, Response, Server};
@@ -231,8 +237,12 @@ pub struct DaemonState {
 struct SupervisedEgressProxyProcess {
     trust_zone_id: String,
     proxy_ref: String,
-    pid: u32,
-    child: Child,
+    host: String,
+    port: u16,
+    pid: Option<u32>,
+    child: Option<Child>,
+    shutdown: Option<Arc<AtomicBool>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +388,7 @@ struct StartEgressProxyRequest {
     trust_zone_id: String,
     host: Option<String>,
     port: Option<u16>,
+    mode: Option<String>,
     command: Option<String>,
     args: Option<Vec<String>>,
 }
@@ -640,21 +651,20 @@ fn proxy_command_args(input: &StartEgressProxyRequest, host: &str, port: u16) ->
         .collect()
 }
 
-fn start_supervised_egress_proxy(
+fn should_start_command_proxy(input: &StartEgressProxyRequest) -> bool {
+    matches!(
+        input.mode.as_deref().map(str::trim).map(str::to_ascii_lowercase),
+        Some(mode) if mode == "command" || mode == "child" || mode == "external"
+    ) || input.command.is_some()
+        || env::var("SPARSEKERNEL_EGRESS_PROXY_COMMAND").is_ok()
+}
+
+fn spawn_command_egress_proxy(
     db: &mut SparseKernelDb,
     daemon_state: &mut DaemonState,
     input: StartEgressProxyRequest,
+    host: String,
 ) -> Result<Value, Box<dyn Error>> {
-    prune_exited_egress_proxies(daemon_state);
-    if let Some(existing) = daemon_state.egress_proxies.get(&input.trust_zone_id) {
-        return Ok(json!({
-            "trust_zone_id": existing.trust_zone_id,
-            "proxy_ref": existing.proxy_ref,
-            "pid": existing.pid,
-            "already_running": true,
-        }));
-    }
-    let host = normalize_proxy_host(input.host.clone())?;
     let port = allocate_proxy_port(&host, input.port)?;
     let proxy_ref = format!("http://{host}:{port}/");
     let command = input
@@ -682,6 +692,7 @@ fn start_supervised_egress_proxy(
         object_type: Some("trust_zone".to_string()),
         object_id: Some(input.trust_zone_id.clone()),
         payload: Some(json!({
+            "mode": "command",
             "proxyRef": proxy_ref,
             "pid": pid,
             "command": command,
@@ -693,16 +704,108 @@ fn start_supervised_egress_proxy(
         SupervisedEgressProxyProcess {
             trust_zone_id: input.trust_zone_id.clone(),
             proxy_ref: proxy_ref.clone(),
-            pid,
-            child,
+            host,
+            port,
+            pid: Some(pid),
+            child: Some(child),
+            shutdown: None,
+            thread: None,
         },
     );
     Ok(json!({
         "trust_zone_id": input.trust_zone_id,
         "proxy_ref": proxy_ref,
         "pid": pid,
+        "mode": "command",
         "already_running": false,
     }))
+}
+
+fn start_builtin_egress_proxy(
+    db: &mut SparseKernelDb,
+    daemon_state: &mut DaemonState,
+    input: StartEgressProxyRequest,
+    host: String,
+) -> Result<Value, Box<dyn Error>> {
+    let listener = TcpListener::bind((host.as_str(), input.port.unwrap_or(0)))?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let proxy_ref = format!("http://{host}:{port}/");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = shutdown.clone();
+    let trust_zone_id = input.trust_zone_id.clone();
+    let handle = thread::spawn(move || {
+        while !thread_shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    let trust_zone_id = trust_zone_id.clone();
+                    thread::spawn(move || {
+                        let _ = handle_builtin_proxy_connection(&trust_zone_id, stream);
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    db.attach_network_policy_proxy_to_trust_zone(&input.trust_zone_id, Some(proxy_ref.clone()))?;
+    db.record_audit(AuditInput {
+        actor_type: Some("runtime".to_string()),
+        actor_id: None,
+        action: "egress_proxy.daemon_supervised_started".to_string(),
+        object_type: Some("trust_zone".to_string()),
+        object_id: Some(input.trust_zone_id.clone()),
+        payload: Some(json!({
+            "mode": "builtin",
+            "proxyRef": proxy_ref,
+            "host": host,
+            "port": port,
+        })),
+    })?;
+    daemon_state.egress_proxies.insert(
+        input.trust_zone_id.clone(),
+        SupervisedEgressProxyProcess {
+            trust_zone_id: input.trust_zone_id.clone(),
+            proxy_ref: proxy_ref.clone(),
+            host,
+            port,
+            pid: None,
+            child: None,
+            shutdown: Some(shutdown),
+            thread: Some(handle),
+        },
+    );
+    Ok(json!({
+        "trust_zone_id": input.trust_zone_id,
+        "proxy_ref": proxy_ref,
+        "mode": "builtin",
+        "already_running": false,
+    }))
+}
+
+fn start_supervised_egress_proxy(
+    db: &mut SparseKernelDb,
+    daemon_state: &mut DaemonState,
+    input: StartEgressProxyRequest,
+) -> Result<Value, Box<dyn Error>> {
+    prune_exited_egress_proxies(daemon_state);
+    if let Some(existing) = daemon_state.egress_proxies.get(&input.trust_zone_id) {
+        return Ok(json!({
+            "trust_zone_id": existing.trust_zone_id,
+            "proxy_ref": existing.proxy_ref,
+            "pid": existing.pid,
+            "mode": if existing.child.is_some() { "command" } else { "builtin" },
+            "already_running": true,
+        }));
+    }
+    let host = normalize_proxy_host(input.host.clone())?;
+    if should_start_command_proxy(&input) {
+        spawn_command_egress_proxy(db, daemon_state, input, host)
+    } else {
+        start_builtin_egress_proxy(db, daemon_state, input, host)
+    }
 }
 
 fn stop_supervised_egress_proxy(
@@ -713,8 +816,17 @@ fn stop_supervised_egress_proxy(
     let Some(mut process) = daemon_state.egress_proxies.remove(&input.trust_zone_id) else {
         return Ok(json!({ "trust_zone_id": input.trust_zone_id, "stopped": false }));
     };
-    let _ = process.child.kill();
-    let _ = process.child.wait();
+    if let Some(shutdown) = &process.shutdown {
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect((process.host.as_str(), process.port));
+    }
+    if let Some(child) = process.child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(handle) = process.thread.take() {
+        let _ = handle.join();
+    }
     if input.clear_proxy_ref.unwrap_or(false) {
         db.attach_network_policy_proxy_to_trust_zone(&input.trust_zone_id, None)?;
     }
@@ -726,6 +838,7 @@ fn stop_supervised_egress_proxy(
         object_id: Some(input.trust_zone_id.clone()),
         payload: Some(json!({
             "pid": process.pid,
+            "mode": if process.child.is_some() { "command" } else { "builtin" },
             "clearProxyRef": input.clear_proxy_ref.unwrap_or(false),
         })),
     })?;
@@ -733,6 +846,7 @@ fn stop_supervised_egress_proxy(
         "trust_zone_id": input.trust_zone_id,
         "proxy_ref": process.proxy_ref,
         "pid": process.pid,
+        "mode": if process.child.is_some() { "command" } else { "builtin" },
         "stopped": true,
     }))
 }
@@ -747,15 +861,420 @@ fn list_supervised_egress_proxies(daemon_state: &mut DaemonState) -> Value {
                 "trust_zone_id": process.trust_zone_id,
                 "proxy_ref": process.proxy_ref,
                 "pid": process.pid,
+                "mode": if process.child.is_some() { "command" } else { "builtin" },
             })
         })
         .collect::<Vec<_>>())
 }
 
 fn prune_exited_egress_proxies(daemon_state: &mut DaemonState) {
-    daemon_state
-        .egress_proxies
-        .retain(|_, process| matches!(process.child.try_wait(), Ok(None)));
+    daemon_state.egress_proxies.retain(|_, process| {
+        if let Some(child) = process.child.as_mut() {
+            return matches!(child.try_wait(), Ok(None));
+        }
+        !process.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    });
+}
+
+#[derive(Debug)]
+struct ParsedProxyRequest {
+    method: String,
+    version: String,
+    target_url: String,
+    host: String,
+    port: u16,
+    origin_form: String,
+}
+
+fn handle_builtin_proxy_connection(trust_zone_id: &str, mut client: TcpStream) -> io::Result<()> {
+    let (header_bytes, body_tail) = read_http_header(&mut client)?;
+    let header = String::from_utf8_lossy(&header_bytes);
+    let Some(first_line) = header.lines().next() else {
+        return write_proxy_response(&mut client, 400, "Bad Request", "missing request line");
+    };
+    if first_line.starts_with("CONNECT ") {
+        return handle_builtin_connect_proxy(trust_zone_id, client, first_line, &body_tail);
+    }
+    let parsed = match parse_proxy_request(first_line, &header) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return write_proxy_response(&mut client, 400, "Bad Request", &message);
+        }
+    };
+    if let Err(reason) = enforce_builtin_proxy_policy(trust_zone_id, &parsed) {
+        let _ = record_builtin_proxy_denial(trust_zone_id, &parsed.target_url, &reason);
+        return write_proxy_response(
+            &mut client,
+            403,
+            "Forbidden",
+            &format!("SparseKernel egress denied: {reason}"),
+        );
+    }
+    let mut upstream = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+    let request_head = rewrite_proxy_request_header(&parsed, &header);
+    upstream.write_all(request_head.as_bytes())?;
+    upstream.write_all(&body_tail)?;
+    let mut upstream_for_body = upstream.try_clone()?;
+    let mut client_for_body = client.try_clone()?;
+    thread::spawn(move || {
+        let _ = io::copy(&mut client_for_body, &mut upstream_for_body);
+        let _ = upstream_for_body.shutdown(Shutdown::Write);
+    });
+    io::copy(&mut upstream, &mut client)?;
+    Ok(())
+}
+
+fn handle_builtin_connect_proxy(
+    trust_zone_id: &str,
+    mut client: TcpStream,
+    first_line: &str,
+    body_tail: &[u8],
+) -> io::Result<()> {
+    let parts = first_line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return write_proxy_response(&mut client, 400, "Bad Request", "invalid CONNECT request");
+    }
+    let (host, port) = parse_host_port(parts[1], 443).map_err(io::Error::other)?;
+    let parsed = ParsedProxyRequest {
+        method: "CONNECT".to_string(),
+        version: parts[2].to_string(),
+        target_url: format!("https://{}:{port}/", format_host_for_url(&host)),
+        host,
+        port,
+        origin_form: String::new(),
+    };
+    if let Err(reason) = enforce_builtin_proxy_policy(trust_zone_id, &parsed) {
+        let _ = record_builtin_proxy_denial(trust_zone_id, &parsed.target_url, &reason);
+        return write_proxy_response(
+            &mut client,
+            403,
+            "Forbidden",
+            &format!("SparseKernel egress denied: {reason}"),
+        );
+    }
+    let mut upstream = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+    if !body_tail.is_empty() {
+        upstream.write_all(body_tail)?;
+    }
+    let mut upstream_for_client = upstream.try_clone()?;
+    let mut client_for_upstream = client.try_clone()?;
+    thread::spawn(move || {
+        let _ = io::copy(&mut client_for_upstream, &mut upstream_for_client);
+        let _ = upstream_for_client.shutdown(Shutdown::Write);
+    });
+    io::copy(&mut upstream, &mut client)?;
+    Ok(())
+}
+
+fn read_http_header(stream: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if bytes.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proxy request header too large",
+            ));
+        }
+    }
+    let Some(split_at) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "proxy request header incomplete",
+        ));
+    };
+    let body_start = split_at + 4;
+    Ok((bytes[..body_start].to_vec(), bytes[body_start..].to_vec()))
+}
+
+fn parse_proxy_request(first_line: &str, header: &str) -> Result<ParsedProxyRequest, String> {
+    let parts = first_line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return Err("invalid request line".to_string());
+    }
+    let method = parts[0].to_string();
+    let target = parts[1];
+    let version = parts[2].to_string();
+    if let Some(parsed) = parse_absolute_http_url(target)? {
+        return Ok(ParsedProxyRequest {
+            method,
+            version,
+            target_url: target.to_string(),
+            host: parsed.0,
+            port: parsed.1,
+            origin_form: parsed.2,
+        });
+    }
+    let Some(host_header) = proxy_header_value(header, "host") else {
+        return Err("relative proxy request requires Host header".to_string());
+    };
+    let (host, port) = parse_host_port(host_header, 80)?;
+    Ok(ParsedProxyRequest {
+        method,
+        version,
+        target_url: format!("http://{}:{port}{target}", format_host_for_url(&host)),
+        host,
+        port,
+        origin_form: target.to_string(),
+    })
+}
+
+fn parse_absolute_http_url(raw: &str) -> Result<Option<(String, u16, String)>, String> {
+    let Some(rest) = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+    else {
+        return Ok(None);
+    };
+    let default_port = if raw.starts_with("https://") { 443 } else { 80 };
+    let slash_index = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..slash_index];
+    let path = if slash_index < rest.len() {
+        &rest[slash_index..]
+    } else {
+        "/"
+    };
+    let (host, port) = parse_host_port(authority, default_port)?;
+    Ok(Some((host, port, path.to_string())))
+}
+
+fn parse_host_port(raw: &str, default_port: u16) -> Result<(String, u16), String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("missing host".to_string());
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err("invalid IPv6 host".to_string());
+        };
+        let host = rest[..end].to_string();
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok((host, port));
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if !host.contains(':') {
+            return Ok((
+                host.to_string(),
+                port.parse::<u16>().unwrap_or(default_port),
+            ));
+        }
+    }
+    Ok((value.to_string(), default_port))
+}
+
+fn proxy_header_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    for line in header.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+fn rewrite_proxy_request_header(parsed: &ParsedProxyRequest, header: &str) -> String {
+    let mut output = format!(
+        "{} {} {}\r\n",
+        parsed.method, parsed.origin_form, parsed.version
+    );
+    for line in header.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((key, _value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.eq_ignore_ascii_case("proxy-connection")
+            || key.eq_ignore_ascii_case("connection")
+            || key.eq_ignore_ascii_case("keep-alive")
+            || key.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    output.push_str("Connection: close\r\n\r\n");
+    output
+}
+
+fn write_proxy_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())
+}
+
+fn enforce_builtin_proxy_policy(
+    trust_zone_id: &str,
+    request: &ParsedProxyRequest,
+) -> Result<(), String> {
+    let db = SparseKernelDb::open_default().map_err(|err| err.to_string())?;
+    let Some(policy) = db
+        .network_policy_for_trust_zone(trust_zone_id)
+        .map_err(|err| err.to_string())?
+    else {
+        return Err("missing policy".to_string());
+    };
+    let host = request.host.trim().to_ascii_lowercase();
+    if policy
+        .denied_cidrs
+        .iter()
+        .any(|cidr| cidr_contains_host(cidr, &host))
+    {
+        return Err("denied cidr".to_string());
+    }
+    if !policy.allow_private_network && is_private_or_local_host(&host) {
+        return Err("private network denied".to_string());
+    }
+    if policy
+        .allowed_hosts
+        .iter()
+        .any(|pattern| host_matches_policy_pattern(&host, pattern))
+    {
+        return Ok(());
+    }
+    if !policy.allow_private_network {
+        for address in (host.as_str(), request.port)
+            .to_socket_addrs()
+            .map_err(|err| format!("dns lookup failed: {err}"))?
+        {
+            if is_private_ip(&address.ip()) {
+                return Err("resolved private network denied".to_string());
+            }
+            if policy
+                .denied_cidrs
+                .iter()
+                .any(|cidr| cidr_contains_ip(cidr, &address.ip()))
+            {
+                return Err("resolved denied cidr".to_string());
+            }
+        }
+    }
+    if policy.default_action == "allow" {
+        Ok(())
+    } else {
+        Err("default deny".to_string())
+    }
+}
+
+fn record_builtin_proxy_denial(
+    trust_zone_id: &str,
+    url: &str,
+    reason: &str,
+) -> Result<(), Box<dyn Error>> {
+    let db = SparseKernelDb::open_default()?;
+    db.record_audit(AuditInput {
+        actor_type: Some("egress_proxy".to_string()),
+        actor_id: Some(trust_zone_id.to_string()),
+        action: "egress_proxy.denied".to_string(),
+        object_type: Some("network_request".to_string()),
+        object_id: Some(trust_zone_id.to_string()),
+        payload: Some(json!({ "url": url, "reason": reason })),
+    })?;
+    Ok(())
+}
+
+fn host_matches_policy_pattern(host: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return host.ends_with(suffix);
+    }
+    host == pattern
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<IpAddr>()
+            .ok()
+            .as_ref()
+            .is_some_and(is_private_ip)
+}
+
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
+fn cidr_contains_host(cidr: &str, host: &str) -> bool {
+    host.parse::<IpAddr>()
+        .ok()
+        .is_some_and(|ip| cidr_contains_ip(cidr, &ip))
+}
+
+fn cidr_contains_ip(cidr: &str, ip: &IpAddr) -> bool {
+    let Some((raw_base, raw_prefix)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = raw_prefix.parse::<u32>() else {
+        return false;
+    };
+    match (raw_base.parse::<IpAddr>(), ip) {
+        (Ok(IpAddr::V4(base)), IpAddr::V4(ip)) if prefix <= 32 => {
+            let base = u32::from(base);
+            let ip = u32::from(*ip);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (base & mask) == (ip & mask)
+        }
+        (Ok(IpAddr::V6(base)), IpAddr::V6(ip)) if prefix <= 128 => {
+            let base = u128::from(base);
+            let ip = u128::from(*ip);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (base & mask) == (ip & mask)
+        }
+        _ => false,
+    }
+}
+
+fn format_host_for_url(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 pub fn handle_api_request_with_artifact_root(
@@ -1374,6 +1893,12 @@ mod tests {
             env::remove_var(name);
             Self { name, previous }
         }
+
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = env::var(name).ok();
+            env::set_var(name, value);
+            Self { name, previous }
+        }
     }
 
     impl Drop for EnvRestore {
@@ -1409,6 +1934,25 @@ mod tests {
             url,
             serde_json::to_string(&body).unwrap().as_bytes(),
             Some(artifact_root),
+        )
+        .unwrap()
+        .body
+    }
+
+    fn json_call_with_daemon_state(
+        db: &mut SparseKernelDb,
+        daemon_state: &mut DaemonState,
+        method: &str,
+        url: &str,
+        body: Value,
+    ) -> Value {
+        handle_api_request_with_daemon_state(
+            db,
+            method,
+            url,
+            serde_json::to_string(&body).unwrap().as_bytes(),
+            None,
+            daemon_state,
         )
         .unwrap()
         .body
@@ -1450,6 +1994,58 @@ mod tests {
             json!({ "trust_zone_id": "public_web" }),
         );
         assert_eq!(policy["proxy_ref"], "http://127.0.0.1:18080/");
+    }
+
+    #[test]
+    fn daemon_builtin_egress_proxy_enforces_policy_and_stops() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("SPARSEKERNEL_HOME", temp.path().to_str().unwrap());
+        let _command = EnvRestore::remove("SPARSEKERNEL_EGRESS_PROXY_COMMAND");
+        let mut db = SparseKernelDb::open_default().unwrap();
+        let mut daemon_state = DaemonState::default();
+        let started = json_call_with_daemon_state(
+            &mut db,
+            &mut daemon_state,
+            "POST",
+            "/egress-proxies/start",
+            json!({ "trust_zone_id": "public_web", "host": "127.0.0.1" }),
+        );
+        assert_eq!(started["mode"], "builtin");
+        let proxy_ref = started["proxy_ref"].as_str().unwrap();
+        let port = proxy_ref
+            .trim_end_matches('/')
+            .rsplit_once(':')
+            .unwrap()
+            .1
+            .parse::<u16>()
+            .unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("private network denied"));
+
+        let stopped = json_call_with_daemon_state(
+            &mut db,
+            &mut daemon_state,
+            "POST",
+            "/egress-proxies/stop",
+            json!({ "trust_zone_id": "public_web", "clear_proxy_ref": true }),
+        );
+        assert_eq!(stopped["stopped"], true);
+        let policy = json_call(
+            &mut db,
+            "POST",
+            "/trust-zones/network-policy",
+            json!({ "trust_zone_id": "public_web" }),
+        );
+        assert!(policy["proxy_ref"].is_null());
     }
 
     #[test]

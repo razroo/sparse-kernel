@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { LocalKernelDatabase } from "../../local-kernel/database.js";
 import * as transcriptEvents from "../../sessions/transcript-events.js";
 import { resolveSessionTranscriptPathInDir } from "./paths.js";
+import { persistSessionStoreToRuntimeLedger } from "./runtime-ledger.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
 import {
   appendAssistantMessageToSessionTranscript,
@@ -25,6 +26,7 @@ describe("appendAssistantMessageToSessionTranscript", () => {
       JSON.stringify({
         [sessionKey]: {
           sessionId,
+          updatedAt: Date.now(),
           chatType: "direct",
           channel: "discord",
         },
@@ -381,6 +383,71 @@ describe("appendAssistantMessageToSessionTranscript", () => {
         delete process.env.OPENCLAW_RUNTIME_SESSION_STORE;
       } else {
         process.env.OPENCLAW_RUNTIME_SESSION_STORE = previousMode;
+      }
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("can append primary assistant transcript messages without legacy JSONL in strict mode", async () => {
+    writeTranscriptStore();
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-transcript-ledger-only-"));
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const previousMode = process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+    const previousCompat = process.env.OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    process.env.OPENCLAW_RUNTIME_SESSION_STORE = "sqlite-strict";
+    delete process.env.OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT;
+    persistSessionStoreToRuntimeLedger({
+      storePath: fixture.storePath(),
+      store: {
+        [sessionKey]: {
+          sessionId,
+          updatedAt: Date.now(),
+          chatType: "direct",
+          channel: "discord",
+        },
+      },
+    });
+    try {
+      const result = await appendExactAssistantMessageToSessionTranscript({
+        sessionKey,
+        storePath: fixture.storePath(),
+        message: createExactAssistantMessage({ text: "Ledger only" }),
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+      expect(fs.existsSync(result.sessionFile)).toBe(false);
+      const db = new LocalKernelDatabase();
+      try {
+        const events = db.listTranscriptEvents(sessionId);
+        expect(events).toHaveLength(1);
+        expect(events[0]?.content).toMatchObject({
+          id: result.messageId,
+          message: expect.objectContaining({
+            role: "assistant",
+            content: [{ type: "text", text: "Ledger only" }],
+          }),
+        });
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      if (previousMode === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SESSION_STORE;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SESSION_STORE = previousMode;
+      }
+      if (previousCompat === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT;
+      } else {
+        process.env.OPENCLAW_RUNTIME_TRANSCRIPT_COMPAT = previousCompat;
       }
       fs.rmSync(stateDir, { recursive: true, force: true });
     }

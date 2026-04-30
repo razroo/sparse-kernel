@@ -430,6 +430,8 @@ function readActRequest(value: Record<string, unknown>): SparseKernelBrowserActR
         delayMs: readNumber(value.delayMs),
       } as const;
     case "hover":
+    case "check":
+    case "uncheck":
     case "scrollIntoView":
       return {
         kind,

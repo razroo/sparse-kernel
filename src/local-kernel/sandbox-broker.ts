@@ -318,6 +318,49 @@ function profileAllowsWorkspaceWrite(profile: SandboxIsolationProfileId): boolea
   return profile === "rw_workspace" || profile === "code_execution";
 }
 
+function profileRequiresIsolatedBackend(
+  profile: SandboxIsolationProfileId,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (profile === "plugin_untrusted") {
+    return !isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED);
+  }
+  if (profile === "code_execution") {
+    return isTruthyRuntimeFlag(env.OPENCLAW_RUNTIME_SANDBOX_REQUIRE_ISOLATED_CODE_EXECUTION);
+  }
+  return false;
+}
+
+function selectSandboxBackendForProfile(params: {
+  requestedBackend?: SandboxBackendKind;
+  profile: SandboxIsolationProfileId;
+  env?: NodeJS.ProcessEnv;
+}): SandboxBackendKind {
+  const env = params.env ?? process.env;
+  const requested = params.requestedBackend;
+  const requiresIsolation = profileRequiresIsolatedBackend(params.profile, env);
+  if (requested) {
+    if (requiresIsolation && requested === "local/no_isolation") {
+      throw new Error(
+        `Sandbox isolation profile ${params.profile} requires an isolated backend; local/no_isolation is trusted execution only`,
+      );
+    }
+    return requested;
+  }
+  if (!requiresIsolation) {
+    return "local/no_isolation";
+  }
+  const selected = (["bwrap", "minijail", "docker", "vm"] as SandboxBackendKind[]).find((backend) =>
+    isSandboxBackendAvailable(backend),
+  );
+  if (!selected) {
+    throw new Error(
+      `Sandbox isolation profile ${params.profile} requires bwrap, minijail, Docker, or VM backend support`,
+    );
+  }
+  return selected;
+}
+
 function minijailProfileArgs(profile: SandboxIsolationProfileId): string[] {
   const profileEnvName = `OPENCLAW_RUNTIME_MINIJAIL_${profile
     .toUpperCase()
@@ -1003,7 +1046,32 @@ export class LocalSandboxBroker implements SandboxBroker {
       }
     }
 
-    const backend = request.requirements?.backend ?? "local/no_isolation";
+    const requestedProfile = resolveSandboxIsolationProfile({
+      trustZoneId: request.trustZoneId,
+      filesystemPolicy: this.db.listTrustZones().find((entry) => entry.id === request.trustZoneId)
+        ?.filesystemPolicy,
+    });
+    let backend: SandboxBackendKind;
+    try {
+      backend = selectSandboxBackendForProfile({
+        requestedBackend: request.requirements?.backend,
+        profile: request.requirements?.isolationProfile ?? requestedProfile,
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.db.recordAudit({
+        actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
+        action: "sandbox.allocation_denied_isolation_required",
+        objectType: "trust_zone",
+        objectId: request.trustZoneId,
+        payload: {
+          requestedBackend: request.requirements?.backend,
+          isolationProfile: request.requirements?.isolationProfile ?? requestedProfile,
+          reason,
+        },
+      });
+      throw error;
+    }
     if (!isSandboxBackendAvailable(backend)) {
       this.db.recordAudit({
         actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
@@ -1014,12 +1082,24 @@ export class LocalSandboxBroker implements SandboxBroker {
       });
       throw new Error(`Sandbox backend unavailable: ${backend}`);
     }
+    if (!request.requirements?.backend && backend !== "local/no_isolation") {
+      this.db.recordAudit({
+        actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },
+        action: "sandbox.backend_auto_selected",
+        objectType: "trust_zone",
+        objectId: request.trustZoneId,
+        payload: {
+          backend,
+          isolationProfile: request.requirements?.isolationProfile ?? requestedProfile,
+        },
+      });
+    }
     const allocationId = `sandbox_${crypto.randomUUID()}`;
     const policy = resolveSandboxPolicySnapshot({
       db: this.db,
       trustZoneId: request.trustZoneId,
       backend,
-      requestedProfile: request.requirements?.isolationProfile,
+      requestedProfile: request.requirements?.isolationProfile ?? requestedProfile,
     });
     let hardEgress: HardEgressEnforcementSnapshot | undefined;
     let workerIdentity: SandboxWorkerIdentitySnapshot | undefined;

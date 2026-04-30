@@ -562,6 +562,36 @@ describe("local runtime kernel database", () => {
     expect(broker.releaseSandbox(allocation.id)).toBe(true);
   });
 
+  it("fails closed when untrusted plugin work requests local/no-isolation", () => {
+    const previousAllow = process.env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED;
+    delete process.env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED;
+    try {
+      const db = openTempDb();
+      const broker = new LocalSandboxBroker(db);
+      expect(() =>
+        broker.allocateSandbox({
+          taskId: "task-a",
+          trustZoneId: "plugin_untrusted",
+          requirements: { backend: "local/no_isolation" },
+        }),
+      ).toThrow(/requires an isolated backend/);
+      const audit = db.db
+        .prepare("SELECT action, payload_json FROM audit_log ORDER BY id DESC LIMIT 1")
+        .get() as { action: string; payload_json: string };
+      expect(audit.action).toBe("sandbox.allocation_denied_isolation_required");
+      expect(JSON.parse(audit.payload_json)).toMatchObject({
+        requestedBackend: "local/no_isolation",
+        isolationProfile: "plugin_untrusted",
+      });
+    } finally {
+      if (previousAllow === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED;
+      } else {
+        process.env.OPENCLAW_RUNTIME_SANDBOX_ALLOW_LOCAL_UNTRUSTED = previousAllow;
+      }
+    }
+  });
+
   it("runs trusted local commands behind an active sandbox lease", async () => {
     const db = openTempDb();
     db.ensureAgent({ id: "main" });

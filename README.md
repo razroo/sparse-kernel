@@ -43,7 +43,7 @@ The goal is to make local multi-agent systems practical on ordinary machines, in
 
 - `crates/sparsekernel-core`: Rust ledger, artifact store, task leases, capabilities, audit records, and mock broker primitives.
 - `crates/sparsekernel-cli`: `sparsekernel` CLI and `sparsekerneld` local daemon.
-- `migrations/0001_initial.sql`: initial SQLite runtime schema.
+- `crates/sparsekernel-core/migrations/0001_initial.sql`: initial SQLite runtime schema.
 - `packages/browser-broker`: TypeScript CDP browser broker for materialized browser-context leases and artifactized screenshots/downloads.
 - `packages/openclaw-sparsekernel-adapter`: TypeScript adapter that wraps OpenClaw-shaped tools in Sparse Kernel session, capability, tool-call, and artifact lifecycle calls.
 - `packages/sparsekernel-client`: TypeScript client for the daemon HTTP surface.

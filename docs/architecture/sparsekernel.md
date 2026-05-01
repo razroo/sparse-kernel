@@ -36,7 +36,7 @@ Small machines can keep many logical agents parked in durable state, but they ca
 
 - `crates/sparsekernel-core`: Rust ledger, artifacts, task leases, capabilities, audit, and mock brokers.
 - `crates/sparsekernel-cli`: `sparsekernel` CLI and `sparsekerneld` local daemon.
-- `migrations/0001_initial.sql`: initial SQLite schema.
+- `crates/sparsekernel-core/migrations/0001_initial.sql`: initial SQLite schema.
 - `packages/browser-broker`: TypeScript CDP adapter that materializes leased browser contexts and artifactizes screenshots/downloads.
 - `packages/openclaw-sparsekernel-adapter`: TypeScript adapter that wraps OpenClaw-shaped tool execution with daemon-backed session upsert, capability grants, tool-call lifecycle transitions, and oversized-output artifactization.
 - `packages/sparsekernel-client`: small TypeScript daemon client.

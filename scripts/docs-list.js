@@ -20,7 +20,8 @@ if (!statSync(DOCS_DIR).isDirectory()) {
   process.exit(1);
 }
 
-const EXCLUDED_DIRS = new Set(["archive", "research"]);
+const EXCLUDED_DIRS = new Set(["archive", "research", "superpowers"]);
+const EXCLUDED_FILES = new Set(["AGENTS.md", "CLAUDE.md"]);
 
 /**
  * @param {unknown[]} values
@@ -59,13 +60,14 @@ function walkMarkdownFiles(dir, base = dir) {
       continue;
     }
     const fullPath = join(dir, entry.name);
+    const relativePath = relative(base, fullPath);
     if (entry.isDirectory()) {
       if (EXCLUDED_DIRS.has(entry.name)) {
         continue;
       }
       files.push(...walkMarkdownFiles(fullPath, base));
-    } else if (entry.isFile() && entry.name.endsWith(".md")) {
-      files.push(relative(base, fullPath));
+    } else if (entry.isFile() && entry.name.endsWith(".md") && !EXCLUDED_FILES.has(relativePath)) {
+      files.push(relativePath);
     }
   }
   return files.toSorted((a, b) => a.localeCompare(b));

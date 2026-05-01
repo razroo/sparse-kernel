@@ -304,6 +304,7 @@ pub struct EnqueueTaskInput {
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
     pub kind: String,
+    #[serde(default)]
     pub priority: i64,
     pub idempotency_key: Option<String>,
     pub input: Option<Value>,

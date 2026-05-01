@@ -2139,13 +2139,9 @@ mod tests {
     #[test]
     fn task_api_enqueues_claims_and_completes() {
         let mut db = SparseKernelDb::open(":memory:").unwrap();
-        let task = json_call(
-            &mut db,
-            "POST",
-            "/tasks/enqueue",
-            json!({ "kind": "demo", "priority": 4 }),
-        );
+        let task = json_call(&mut db, "POST", "/tasks/enqueue", json!({ "kind": "demo" }));
         let task_id = task["id"].as_str().unwrap().to_string();
+        assert_eq!(task["priority"], 0);
 
         let claimed = json_call(
             &mut db,

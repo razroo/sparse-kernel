@@ -1224,6 +1224,9 @@ export function stageBundledPluginRuntimeDeps(params = {}) {
   for (const pluginDir of listBundledPluginRuntimeDirs(repoRoot)) {
     const pluginId = path.basename(pluginDir);
     const sourcePluginRoot = resolveInstalledWorkspacePluginRoot(repoRoot, pluginId);
+    if (sourcePluginRoot !== pluginDir) {
+      removeStaleRuntimeDepsTempDirs(sourcePluginRoot);
+    }
     const directDependencyPackageRoot = fs.existsSync(path.join(sourcePluginRoot, "package.json"))
       ? sourcePluginRoot
       : null;

@@ -2932,6 +2932,12 @@ pub struct LocalSandboxBroker<'a> {
     pub db: &'a SparseKernelDb,
 }
 
+#[derive(Debug, Default)]
+struct TrustZoneSandboxLimits {
+    max_processes: Option<i64>,
+    max_runtime_seconds: Option<i64>,
+}
+
 fn trust_zone_allows_network(db: &SparseKernelDb, trust_zone_id: &str) -> Result<bool> {
     let action = db
         .conn
@@ -2945,6 +2951,25 @@ fn trust_zone_allows_network(db: &SparseKernelDb, trust_zone_id: &str) -> Result
         )
         .optional()?;
     Ok(matches!(action.as_deref(), Some("allow")))
+}
+
+fn sandbox_trust_zone_limits(
+    db: &SparseKernelDb,
+    trust_zone_id: &str,
+) -> Result<Option<TrustZoneSandboxLimits>> {
+    db.conn
+        .query_row(
+            "SELECT max_processes, max_runtime_seconds FROM trust_zones WHERE id = ?",
+            params![trust_zone_id],
+            |row| {
+                Ok(TrustZoneSandboxLimits {
+                    max_processes: row.get(0)?,
+                    max_runtime_seconds: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(SparseKernelError::from)
 }
 
 fn hard_egress_helper_args() -> Result<Vec<String>> {
@@ -3146,7 +3171,66 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
         if let Some(docker_image) = docker_image {
             metadata["dockerImage"] = json!(docker_image);
         }
-        let max_runtime_ms = max_runtime_ms.map(|value| value.max(1));
+        let limits = sandbox_trust_zone_limits(self.db, trust_zone_id)?.unwrap_or_default();
+        let budget = self.db.resource_budgets()?;
+        let active_sandboxes: i64 = self.db.conn.query_row(
+            "SELECT COUNT(*) FROM resource_leases WHERE resource_type = 'sandbox' AND status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_sandboxes >= budget.heavy_sandboxes_max {
+            self.db.record_audit(AuditInput {
+                actor_type: agent_id.map(|_| "agent".to_string()),
+                actor_id: agent_id.map(str::to_string),
+                action: "resource_lease.denied_budget_exhausted".to_string(),
+                object_type: Some("trust_zone".to_string()),
+                object_id: Some(trust_zone_id.to_string()),
+                payload: Some(json!({
+                    "trustZoneId": trust_zone_id,
+                    "resourceType": "sandbox",
+                    "budget": "heavy_sandboxes",
+                    "active": active_sandboxes,
+                    "limit": budget.heavy_sandboxes_max,
+                })),
+            })?;
+            return Err(SparseKernelError::Denied(format!(
+                "heavy sandbox budget exhausted: {}/{} active",
+                active_sandboxes, budget.heavy_sandboxes_max
+            )));
+        }
+        if let Some(max_processes) = limits.max_processes.filter(|value| *value >= 0) {
+            let active_in_zone: i64 = self.db.conn.query_row(
+                "SELECT COUNT(*) FROM resource_leases WHERE trust_zone_id = ? AND resource_type = 'sandbox' AND status = 'active'",
+                params![trust_zone_id],
+                |row| row.get(0),
+            )?;
+            if active_in_zone >= max_processes {
+                self.db.record_audit(AuditInput {
+                    actor_type: agent_id.map(|_| "agent".to_string()),
+                    actor_id: agent_id.map(str::to_string),
+                    action: "resource_lease.denied_budget_exhausted".to_string(),
+                    object_type: Some("trust_zone".to_string()),
+                    object_id: Some(trust_zone_id.to_string()),
+                    payload: Some(json!({
+                        "trustZoneId": trust_zone_id,
+                        "resourceType": "sandbox",
+                        "active": active_in_zone,
+                        "limit": max_processes,
+                    })),
+                })?;
+                return Err(SparseKernelError::Denied(format!(
+                    "trust zone {trust_zone_id} sandbox budget exhausted: {active_in_zone}/{max_processes} active"
+                )));
+            }
+        }
+        let mut max_runtime_ms = max_runtime_ms.map(|value| value.max(1));
+        if let Some(max_runtime_seconds) = limits.max_runtime_seconds {
+            let trust_zone_max_ms = max_runtime_seconds.saturating_mul(1_000).max(1);
+            max_runtime_ms = Some(match max_runtime_ms {
+                Some(value) => value.min(trust_zone_max_ms).max(1),
+                None => trust_zone_max_ms,
+            });
+        }
         let max_bytes_out = max_bytes_out.map(|value| value.max(1));
         let lease_until =
             max_runtime_ms.map(|value| (now_dt + ChronoDuration::milliseconds(value)).to_rfc3339());
@@ -3198,32 +3282,6 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
                     )));
                 }
             }
-        }
-        let budget = self.db.resource_budgets()?;
-        let active_sandboxes: i64 = self.db.conn.query_row(
-            "SELECT COUNT(*) FROM resource_leases WHERE resource_type = 'sandbox' AND status = 'active'",
-            [],
-            |row| row.get(0),
-        )?;
-        if active_sandboxes >= budget.heavy_sandboxes_max {
-            self.db.record_audit(AuditInput {
-                actor_type: agent_id.map(|_| "agent".to_string()),
-                actor_id: agent_id.map(str::to_string),
-                action: "resource_lease.denied_budget_exhausted".to_string(),
-                object_type: Some("trust_zone".to_string()),
-                object_id: Some(trust_zone_id.to_string()),
-                payload: Some(json!({
-                    "trustZoneId": trust_zone_id,
-                    "resourceType": "sandbox",
-                    "budget": "heavy_sandboxes",
-                    "active": active_sandboxes,
-                    "limit": budget.heavy_sandboxes_max,
-                })),
-            })?;
-            return Err(SparseKernelError::Denied(format!(
-                "heavy sandbox budget exhausted: {}/{} active",
-                active_sandboxes, budget.heavy_sandboxes_max
-            )));
         }
         self.db.conn.execute(
             "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, lease_until, max_runtime_ms, max_bytes_out, metadata_json, created_at, updated_at)
@@ -3710,6 +3768,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(denied.contains("heavy sandbox budget exhausted"));
+    }
+
+    #[test]
+    fn sandbox_allocations_enforce_trust_zone_budget_and_runtime_clamp() {
+        let (_dir, mut db) = temp_db();
+        db.update_resource_budgets(ResourceBudgetUpdateInput {
+            heavy_sandboxes_max: Some(5),
+            ..ResourceBudgetUpdateInput::default()
+        })
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE trust_zones SET max_processes = 1, max_runtime_seconds = 2 WHERE id = ?",
+                params!["code_execution"],
+            )
+            .unwrap();
+        let broker = LocalSandboxBroker { db: &db };
+        let first = broker
+            .allocate_sandbox(SandboxAllocateInput {
+                max_runtime_ms: Some(10_000),
+                ..sandbox_input("code_execution", Some("local/no_isolation"))
+            })
+            .unwrap();
+        assert_eq!(first.max_runtime_ms, Some(2_000));
+        let lease_until =
+            chrono::DateTime::parse_from_rfc3339(first.lease_until.as_deref().unwrap()).unwrap();
+        let created_at = chrono::DateTime::parse_from_rfc3339(&first.created_at).unwrap();
+        assert_eq!((lease_until - created_at).num_milliseconds(), 2_000);
+
+        let denied = broker
+            .allocate_sandbox(sandbox_input("code_execution", Some("local/no_isolation")))
+            .unwrap_err()
+            .to_string();
+        assert!(denied.contains("trust zone code_execution sandbox budget exhausted"));
+        let audit = db.list_audit(1).unwrap().into_iter().next().unwrap();
+        assert_eq!(audit.action, "resource_lease.denied_budget_exhausted");
+        assert_eq!(
+            audit.payload,
+            Some(json!({
+                "trustZoneId": "code_execution",
+                "resourceType": "sandbox",
+                "active": 1,
+                "limit": 1,
+            }))
+        );
+
+        assert!(broker.release_sandbox(&first.id).unwrap());
+        let second = broker
+            .allocate_sandbox(sandbox_input("code_execution", Some("local/no_isolation")))
+            .unwrap();
+        assert_eq!(second.max_runtime_ms, Some(2_000));
     }
 
     #[test]

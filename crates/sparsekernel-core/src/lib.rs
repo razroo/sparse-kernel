@@ -1006,7 +1006,7 @@ impl SparseKernelDb {
     pub fn list_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, kind, priority, status, lease_owner, lease_until, attempts, result_artifact_id, created_at, updated_at
-             FROM tasks ORDER BY created_at DESC, id ASC LIMIT ?",
+             FROM tasks ORDER BY priority DESC, created_at DESC, id ASC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit.max(0)], task_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3559,15 +3559,15 @@ mod tests {
     }
 
     #[test]
-    fn task_claiming_breaks_equal_priority_timestamp_ties_by_id() {
+    fn task_listing_and_claiming_use_priority_and_stable_ties() {
         let (_dir, mut db) = temp_db();
-        for id in ["task-b", "task-a"] {
+        for (id, priority) in [("task-b", 5), ("task-a", 5), ("task-c", 10)] {
             db.enqueue_task(EnqueueTaskInput {
                 id: Some(id.to_string()),
                 agent_id: None,
                 session_id: None,
                 kind: "demo".to_string(),
-                priority: 5,
+                priority,
                 idempotency_key: None,
                 input: None,
             })
@@ -3575,7 +3575,7 @@ mod tests {
         }
         db.conn
             .execute(
-                "UPDATE tasks SET created_at = ?, updated_at = ? WHERE id IN ('task-a', 'task-b')",
+                "UPDATE tasks SET created_at = ?, updated_at = ? WHERE id IN ('task-a', 'task-b', 'task-c')",
                 params!["2026-04-29T00:00:00Z", "2026-04-29T00:00:00Z"],
             )
             .unwrap();
@@ -3586,7 +3586,16 @@ mod tests {
             .into_iter()
             .map(|task| task.id)
             .collect();
-        assert_eq!(listed, vec!["task-a".to_string(), "task-b".to_string()]);
+        assert_eq!(
+            listed,
+            vec![
+                "task-c".to_string(),
+                "task-a".to_string(),
+                "task-b".to_string()
+            ]
+        );
+        let claimed = db.claim_next_task("worker-a", &[], 60).unwrap().unwrap();
+        assert_eq!(claimed.id, "task-c");
         let claimed = db.claim_next_task("worker-a", &[], 60).unwrap().unwrap();
         assert_eq!(claimed.id, "task-a");
     }

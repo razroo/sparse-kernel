@@ -510,6 +510,14 @@ pub struct SandboxAllocationRecord {
     pub trust_zone_id: String,
     pub backend: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_runtime_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes_out: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_image: Option<String>,
     pub created_at: String,
 }
 
@@ -2893,14 +2901,18 @@ impl BrowserBroker for MockBrowserBroker<'_> {
 }
 
 pub trait SandboxBroker {
-    fn allocate_sandbox(
-        &self,
-        agent_id: Option<&str>,
-        task_id: Option<&str>,
-        trust_zone_id: &str,
-        backend: Option<&str>,
-    ) -> Result<SandboxAllocationRecord>;
+    fn allocate_sandbox(&self, input: SandboxAllocateInput<'_>) -> Result<SandboxAllocationRecord>;
     fn release_sandbox(&self, allocation_id: &str) -> Result<bool>;
+}
+
+pub struct SandboxAllocateInput<'a> {
+    pub agent_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub trust_zone_id: &'a str,
+    pub backend: Option<&'a str>,
+    pub docker_image: Option<&'a str>,
+    pub max_runtime_ms: Option<i64>,
+    pub max_bytes_out: Option<i64>,
 }
 
 pub struct LocalSandboxBroker<'a> {
@@ -3086,13 +3098,16 @@ fn run_builtin_hard_egress_helper(
 }
 
 impl SandboxBroker for LocalSandboxBroker<'_> {
-    fn allocate_sandbox(
-        &self,
-        agent_id: Option<&str>,
-        task_id: Option<&str>,
-        trust_zone_id: &str,
-        backend: Option<&str>,
-    ) -> Result<SandboxAllocationRecord> {
+    fn allocate_sandbox(&self, input: SandboxAllocateInput<'_>) -> Result<SandboxAllocationRecord> {
+        let SandboxAllocateInput {
+            agent_id,
+            task_id,
+            trust_zone_id,
+            backend,
+            docker_image,
+            max_runtime_ms,
+            max_bytes_out,
+        } = input;
         if let Some(agent_id) = agent_id {
             self.db.ensure_agent(agent_id)?;
             let allowed = self.db.check_capability(CapabilityCheck {
@@ -3111,9 +3126,17 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
             }
         }
         let allocation_id = format!("sandbox_{}", Uuid::new_v4());
-        let now = now_iso();
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
         let backend = backend.unwrap_or("local/no_isolation").to_string();
         let mut metadata = json!({ "backend": backend.clone() });
+        if let Some(docker_image) = docker_image {
+            metadata["dockerImage"] = json!(docker_image);
+        }
+        let max_runtime_ms = max_runtime_ms.map(|value| value.max(1));
+        let max_bytes_out = max_bytes_out.map(|value| value.max(1));
+        let lease_until =
+            max_runtime_ms.map(|value| (now_dt + ChronoDuration::milliseconds(value)).to_rfc3339());
         if truthy_env_flag("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS")
             && trust_zone_allows_network(self.db, trust_zone_id)?
         {
@@ -3190,14 +3213,17 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
             )));
         }
         self.db.conn.execute(
-            "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, metadata_json, created_at, updated_at)
-             VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?, ?)",
+            "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, lease_until, max_runtime_ms, max_bytes_out, metadata_json, created_at, updated_at)
+             VALUES(?, 'sandbox', ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
             params![
                 allocation_id,
                 allocation_id,
                 task_id,
                 agent_id,
                 trust_zone_id,
+                lease_until,
+                max_runtime_ms,
+                max_bytes_out,
                 metadata.to_string(),
                 now,
                 now
@@ -3217,6 +3243,10 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
             trust_zone_id: trust_zone_id.to_string(),
             backend,
             status: "active".to_string(),
+            lease_until,
+            max_runtime_ms,
+            max_bytes_out,
+            docker_image: docker_image.map(str::to_string),
             created_at: now,
         })
     }
@@ -3301,6 +3331,21 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let db = SparseKernelDb::open(dir.path().join("runtime.sqlite")).expect("db");
         (dir, db)
+    }
+
+    fn sandbox_input<'a>(
+        trust_zone_id: &'a str,
+        backend: Option<&'a str>,
+    ) -> SandboxAllocateInput<'a> {
+        SandboxAllocateInput {
+            agent_id: None,
+            task_id: None,
+            trust_zone_id,
+            backend,
+            docker_image: None,
+            max_runtime_ms: None,
+            max_bytes_out: None,
+        }
     }
 
     #[test]
@@ -3581,13 +3626,58 @@ mod tests {
         .unwrap();
         let broker = LocalSandboxBroker { db: &db };
         assert!(broker
-            .allocate_sandbox(None, None, "code_execution", Some("local/no_isolation"))
+            .allocate_sandbox(sandbox_input("code_execution", Some("local/no_isolation")))
             .is_ok());
         let denied = broker
-            .allocate_sandbox(None, None, "plugin_untrusted", Some("local/no_isolation"))
+            .allocate_sandbox(sandbox_input(
+                "plugin_untrusted",
+                Some("local/no_isolation"),
+            ))
             .unwrap_err()
             .to_string();
         assert!(denied.contains("heavy sandbox budget exhausted"));
+    }
+
+    #[test]
+    fn sandbox_allocations_persist_runtime_limits_and_docker_metadata() {
+        let (_dir, db) = temp_db();
+        let broker = LocalSandboxBroker { db: &db };
+        let allocation = broker
+            .allocate_sandbox(SandboxAllocateInput {
+                docker_image: Some("openclaw/plugin-worker:test"),
+                max_runtime_ms: Some(2_500),
+                max_bytes_out: Some(16_384),
+                ..sandbox_input("plugin_untrusted", Some("docker"))
+            })
+            .unwrap();
+        assert_eq!(allocation.backend, "docker");
+        assert_eq!(
+            allocation.docker_image.as_deref(),
+            Some("openclaw/plugin-worker:test")
+        );
+        assert_eq!(allocation.max_runtime_ms, Some(2_500));
+        assert_eq!(allocation.max_bytes_out, Some(16_384));
+        assert!(allocation.lease_until.is_some());
+
+        let (lease_until, max_runtime_ms, max_bytes_out, metadata_json): (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = db
+            .conn
+            .query_row(
+                "SELECT lease_until, max_runtime_ms, max_bytes_out, metadata_json FROM resource_leases WHERE id = ?",
+                params![allocation.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(lease_until, allocation.lease_until);
+        assert_eq!(max_runtime_ms, Some(2_500));
+        assert_eq!(max_bytes_out, Some(16_384));
+        let metadata: Value = serde_json::from_str(&metadata_json.unwrap()).unwrap();
+        assert_eq!(metadata["backend"], "docker");
+        assert_eq!(metadata["dockerImage"], "openclaw/plugin-worker:test");
     }
 
     #[test]
@@ -3834,7 +3924,10 @@ mod tests {
         assert!(browser.release_context(&context.id).unwrap());
         let sandbox = LocalSandboxBroker { db: &db };
         let allocation = sandbox
-            .allocate_sandbox(Some("main"), None, "code_execution", None)
+            .allocate_sandbox(SandboxAllocateInput {
+                agent_id: Some("main"),
+                ..sandbox_input("code_execution", None)
+            })
             .unwrap();
         assert_eq!(allocation.backend, "local/no_isolation");
         assert!(sandbox.release_sandbox(&allocation.id).unwrap());
@@ -3851,12 +3944,8 @@ mod tests {
         env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", "1");
         env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER");
         env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS");
-        let result = LocalSandboxBroker { db: &db }.allocate_sandbox(
-            None,
-            None,
-            "public_web",
-            Some("local/no_isolation"),
-        );
+        let result = LocalSandboxBroker { db: &db }
+            .allocate_sandbox(sandbox_input("public_web", Some("local/no_isolation")));
         match previous {
             Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
             None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
@@ -3889,12 +3978,8 @@ mod tests {
             "builtin-firewall",
         );
         env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS");
-        let result = LocalSandboxBroker { db: &db }.allocate_sandbox(
-            None,
-            None,
-            "public_web",
-            Some("local/no_isolation"),
-        );
+        let result = LocalSandboxBroker { db: &db }
+            .allocate_sandbox(sandbox_input("public_web", Some("local/no_isolation")));
         match previous {
             Some(value) => env::set_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS", value),
             None => env::remove_var("OPENCLAW_RUNTIME_SANDBOX_REQUIRE_HARD_EGRESS"),
@@ -3938,7 +4023,7 @@ mod tests {
         );
         let sandbox = LocalSandboxBroker { db: &db };
         let allocation =
-            sandbox.allocate_sandbox(None, None, "public_web", Some("local/no_isolation"));
+            sandbox.allocate_sandbox(sandbox_input("public_web", Some("local/no_isolation")));
         let release_result = allocation
             .as_ref()
             .ok()
@@ -3976,7 +4061,7 @@ mod tests {
         env::set_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER", "builtin");
         env::remove_var("OPENCLAW_RUNTIME_SANDBOX_HARD_EGRESS_HELPER_ARGS");
         let sandbox = LocalSandboxBroker { db: &db };
-        let allocation = sandbox.allocate_sandbox(None, None, "public_web", Some("bwrap"));
+        let allocation = sandbox.allocate_sandbox(sandbox_input("public_web", Some("bwrap")));
         let release_result = allocation
             .as_ref()
             .ok()

@@ -370,6 +370,10 @@ export type SparseKernelSandboxAllocation = {
   trust_zone_id: string;
   backend: string;
   status: string;
+  lease_until?: string | null;
+  max_runtime_ms?: number | null;
+  max_bytes_out?: number | null;
+  docker_image?: string | null;
   created_at: string;
 };
 

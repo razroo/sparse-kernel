@@ -9,8 +9,8 @@ use sparsekernel_core::{
     CreateToolCallInput, EnqueueTaskInput, GrantCapabilityInput, LedgerToolBroker,
     ListBrowserObservationsInput, ListBrowserTargetsInput, LocalSandboxBroker, MockBrowserBroker,
     RecordBrowserObservationInput, RecordBrowserTargetInput, ResourceBudgetUpdateInput,
-    SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
-    SPARSEKERNEL_PROTOCOL_VERSION,
+    SandboxAllocateInput, SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker,
+    UpsertSessionInput, SPARSEKERNEL_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -349,6 +349,9 @@ struct AllocateSandboxRequest {
     task_id: Option<String>,
     trust_zone_id: String,
     backend: Option<String>,
+    docker_image: Option<String>,
+    max_runtime_ms: Option<i64>,
+    max_bytes_out: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1643,12 +1646,15 @@ pub fn handle_api_request_with_daemon_state(
             let broker = LocalSandboxBroker { db };
             ApiReply {
                 status_code: 200,
-                body: serde_json::to_value(broker.allocate_sandbox(
-                    input.agent_id.as_deref(),
-                    input.task_id.as_deref(),
-                    &input.trust_zone_id,
-                    input.backend.as_deref(),
-                )?)?,
+                body: serde_json::to_value(broker.allocate_sandbox(SandboxAllocateInput {
+                    agent_id: input.agent_id.as_deref(),
+                    task_id: input.task_id.as_deref(),
+                    trust_zone_id: &input.trust_zone_id,
+                    backend: input.backend.as_deref(),
+                    docker_image: input.docker_image.as_deref(),
+                    max_runtime_ms: input.max_runtime_ms,
+                    max_bytes_out: input.max_bytes_out,
+                })?)?,
             }
         }
         ("POST", "/sandbox/release") => {
@@ -2500,10 +2506,17 @@ mod tests {
                 "task_id": "task-sandbox",
                 "trust_zone_id": "code_execution",
                 "backend": "local/no_isolation",
+                "docker_image": "openclaw/plugin-worker:test",
+                "max_runtime_ms": 2500,
+                "max_bytes_out": 16384,
             }),
         );
         let allocation_id = allocation["id"].as_str().unwrap().to_string();
         assert_eq!(allocation["backend"], "local/no_isolation");
+        assert_eq!(allocation["docker_image"], "openclaw/plugin-worker:test");
+        assert_eq!(allocation["max_runtime_ms"], 2500);
+        assert_eq!(allocation["max_bytes_out"], 16384);
+        assert!(allocation["lease_until"].as_str().is_some());
 
         let released = json_call(
             &mut db,

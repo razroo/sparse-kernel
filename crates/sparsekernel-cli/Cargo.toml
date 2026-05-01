@@ -9,14 +9,14 @@ rust-version.workspace = true
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = ">=4.5.0, <4.6.0", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sparsekernel-core = { path = "../sparsekernel-core" }
 tiny_http = "0.12"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { version = "3", default-features = false }
 
 [[bin]]
 name = "sparsekernel"

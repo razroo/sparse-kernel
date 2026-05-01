@@ -460,6 +460,8 @@ jobs:
     if: ${{ !cancelled() && always() && needs.preflight.outputs.run_rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      OPENCLAW_RUST_MSRV: "1.80.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -470,22 +472,26 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Show Rust toolchain
+      - name: Install Rust MSRV toolchain
         run: |
-          rustc --version
-          cargo --version
+          rustup toolchain install "$OPENCLAW_RUST_MSRV" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
 
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
+      - name: Show Rust MSRV toolchain
+        run: |
+          rustc +"$OPENCLAW_RUST_MSRV" --version
+          cargo +"$OPENCLAW_RUST_MSRV" --version
 
       - name: Check Rust formatting
-        run: cargo fmt --all --check
+        run: cargo +"$OPENCLAW_RUST_MSRV" fmt --all --check
 
       - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo +"$OPENCLAW_RUST_MSRV" clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test Rust workspace
-        run: cargo test --workspace --locked
+        run: cargo +"$OPENCLAW_RUST_MSRV" test --workspace --locked
 
   # Build dist once for Node-relevant changes and share it with downstream jobs.
   # Keep this overlapping with the fast correctness lanes so green PRs get heavy

@@ -15,9 +15,16 @@ export type InstallSmokeScope = {
 
 export function detectChangedScope(changedPaths: string[]): ChangedScope;
 export function detectInstallSmokeScope(changedPaths: string[]): InstallSmokeScope;
+export function detectRustScope(changedPaths: string[]): boolean;
 export function listChangedPaths(base: string, head?: string): string[];
 export function writeGitHubOutput(
   scope: ChangedScope,
   outputPath?: string,
   installSmokeScope?: InstallSmokeScope,
+  nodeFastScope?: {
+    runFastOnly: boolean;
+    runPluginContracts: boolean;
+    runCiRouting: boolean;
+  },
+  runRust?: boolean,
 ): void;

@@ -40,6 +40,7 @@ jobs:
       docs_only: ${{ steps.manifest.outputs.docs_only }}
       docs_changed: ${{ steps.manifest.outputs.docs_changed }}
       run_node: ${{ steps.manifest.outputs.run_node }}
+      run_rust: ${{ steps.manifest.outputs.run_rust }}
       run_macos: ${{ steps.manifest.outputs.run_macos }}
       run_android: ${{ steps.manifest.outputs.run_android }}
       run_skills_python: ${{ steps.manifest.outputs.run_skills_python }}
@@ -116,6 +117,7 @@ jobs:
           OPENCLAW_CI_DOCS_ONLY: ${{ github.event_name == 'workflow_dispatch' && 'false' || steps.docs_scope.outputs.docs_only }}
           OPENCLAW_CI_DOCS_CHANGED: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.docs_scope.outputs.docs_changed }}
           OPENCLAW_CI_RUN_NODE: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_node || 'false' }}
+          OPENCLAW_CI_RUN_RUST: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_rust || 'false' }}
           OPENCLAW_CI_RUN_MACOS: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_macos || 'false' }}
           OPENCLAW_CI_RUN_ANDROID: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_android || 'false' }}
           OPENCLAW_CI_RUN_WINDOWS: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.changed_scope.outputs.run_windows || 'false' }}
@@ -153,6 +155,7 @@ jobs:
           const docsOnly = parseBoolean(process.env.OPENCLAW_CI_DOCS_ONLY);
           const docsChanged = parseBoolean(process.env.OPENCLAW_CI_DOCS_CHANGED);
           const runNode = parseBoolean(process.env.OPENCLAW_CI_RUN_NODE) && !docsOnly;
+          const runRust = parseBoolean(process.env.OPENCLAW_CI_RUN_RUST) && !docsOnly;
           const runNodeFastOnly =
             runNode && parseBoolean(process.env.OPENCLAW_CI_RUN_NODE_FAST_ONLY);
           const runNodeFull = runNode && !runNodeFastOnly;
@@ -238,6 +241,7 @@ jobs:
             docs_only: docsOnly,
             docs_changed: docsChanged,
             run_node: runNode,
+            run_rust: runRust,
             run_macos: runMacos,
             run_android: runAndroid,
             run_skills_python: runSkillsPython,
@@ -448,6 +452,31 @@ jobs:
           done
 
           exit "$failed"
+
+  rust:
+    permissions:
+      contents: read
+    needs: [preflight]
+    if: ${{ !cancelled() && always() && needs.preflight.outputs.run_rust == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_sha }}
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Show Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Test Rust workspace
+        run: cargo test --workspace
 
   # Build dist once for Node-relevant changes and share it with downstream jobs.
   # Keep this overlapping with the fast correctness lanes so green PRs get heavy

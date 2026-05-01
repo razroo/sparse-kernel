@@ -26,6 +26,7 @@ const EMPTY_SCOPE = {
 };
 
 const DOCS_PATH_RE = /^(docs\/|.*\.mdx?$)/;
+const RUST_SCOPE_RE = /^(?:Cargo\.toml$|Cargo\.lock$|crates\/)/;
 const SKILLS_PYTHON_SCOPE_RE = /^(skills\/|pyproject\.toml$)/;
 const INSTALL_SMOKE_WORKFLOW_SCOPE_RE = /^\.github\/workflows\/install-smoke\.yml$/;
 const MACOS_PROTOCOL_GEN_RE =
@@ -225,6 +226,20 @@ export function detectInstallSmokeScope(changedPaths) {
 }
 
 /**
+ * @param {string[]} changedPaths
+ * @returns {boolean}
+ */
+export function detectRustScope(changedPaths) {
+  if (!Array.isArray(changedPaths) || changedPaths.length === 0) {
+    return true;
+  }
+  return changedPaths.some((rawPath) => {
+    const path = rawPath.trim();
+    return path.length > 0 && !DOCS_PATH_RE.test(path) && RUST_SCOPE_RE.test(path);
+  });
+}
+
+/**
  * @param {string} base
  * @param {string} [head]
  * @returns {string[]}
@@ -256,6 +271,7 @@ export function writeGitHubOutput(
     runFullInstallSmoke: scope.runChangedSmoke,
   },
   nodeFastScope = { runFastOnly: false, runPluginContracts: false, runCiRouting: false },
+  runRust = false,
 ) {
   if (!outputPath) {
     throw new Error("GITHUB_OUTPUT is required");
@@ -284,6 +300,7 @@ export function writeGitHubOutput(
     "utf8",
   );
   appendFileSync(outputPath, `run_control_ui_i18n=${scope.runControlUiI18n}\n`, "utf8");
+  appendFileSync(outputPath, `run_rust=${runRust}\n`, "utf8");
 }
 
 function isDirectRun() {
@@ -313,7 +330,7 @@ if (isDirectRun()) {
   try {
     const changedPaths = listChangedPaths(args.base, args.head);
     if (changedPaths.length === 0) {
-      writeGitHubOutput(EMPTY_SCOPE);
+      writeGitHubOutput(EMPTY_SCOPE, process.env.GITHUB_OUTPUT, undefined, undefined, false);
       process.exit(0);
     }
     writeGitHubOutput(
@@ -321,8 +338,9 @@ if (isDirectRun()) {
       process.env.GITHUB_OUTPUT,
       detectInstallSmokeScope(changedPaths),
       detectNodeFastScope(changedPaths),
+      detectRustScope(changedPaths),
     );
   } catch {
-    writeGitHubOutput(FULL_SCOPE);
+    writeGitHubOutput(FULL_SCOPE, process.env.GITHUB_OUTPUT, undefined, undefined, true);
   }
 }

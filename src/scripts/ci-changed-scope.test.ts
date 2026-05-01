@@ -5,28 +5,34 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { bundledPluginFile } from "../../test/helpers/bundled-plugin-paths.js";
 
-const { detectChangedScope, detectInstallSmokeScope, detectNodeFastScope, listChangedPaths } =
-  (await import("../../scripts/ci-changed-scope.mjs")) as unknown as {
-    detectChangedScope: (paths: string[]) => {
-      runNode: boolean;
-      runMacos: boolean;
-      runAndroid: boolean;
-      runWindows: boolean;
-      runSkillsPython: boolean;
-      runChangedSmoke: boolean;
-      runControlUiI18n: boolean;
-    };
-    detectInstallSmokeScope: (paths: string[]) => {
-      runFastInstallSmoke: boolean;
-      runFullInstallSmoke: boolean;
-    };
-    detectNodeFastScope: (paths: string[]) => {
-      runFastOnly: boolean;
-      runPluginContracts: boolean;
-      runCiRouting: boolean;
-    };
-    listChangedPaths: (base: string, head?: string) => string[];
+const {
+  detectChangedScope,
+  detectInstallSmokeScope,
+  detectNodeFastScope,
+  detectRustScope,
+  listChangedPaths,
+} = (await import("../../scripts/ci-changed-scope.mjs")) as unknown as {
+  detectChangedScope: (paths: string[]) => {
+    runNode: boolean;
+    runMacos: boolean;
+    runAndroid: boolean;
+    runWindows: boolean;
+    runSkillsPython: boolean;
+    runChangedSmoke: boolean;
+    runControlUiI18n: boolean;
   };
+  detectInstallSmokeScope: (paths: string[]) => {
+    runFastInstallSmoke: boolean;
+    runFullInstallSmoke: boolean;
+  };
+  detectNodeFastScope: (paths: string[]) => {
+    runFastOnly: boolean;
+    runPluginContracts: boolean;
+    runCiRouting: boolean;
+  };
+  detectRustScope: (paths: string[]) => boolean;
+  listChangedPaths: (base: string, head?: string) => string[];
+};
 
 const markerPaths: string[] = [];
 const tempDirs: string[] = [];
@@ -475,6 +481,15 @@ describe("detectChangedScope", () => {
     });
   });
 
+  it("runs Rust CI only for Rust workspace surfaces", () => {
+    expect(detectRustScope([])).toBe(true);
+    expect(detectRustScope(["Cargo.toml"])).toBe(true);
+    expect(detectRustScope(["Cargo.lock"])).toBe(true);
+    expect(detectRustScope(["crates/sparsekernel-cli/src/lib.rs"])).toBe(true);
+    expect(detectRustScope(["docs/architecture/sparsekernel.md"])).toBe(false);
+    expect(detectRustScope(["src/commands/runtime.ts"])).toBe(false);
+  });
+
   it("keeps changed-smoke off for runtime-surface tests", () => {
     expect(detectChangedScope(["src/plugins/loader.test.ts"])).toEqual({
       runNode: true,
@@ -614,6 +629,7 @@ describe("detectChangedScope", () => {
       run_fast_install_smoke: "false",
       run_full_install_smoke: "false",
       run_control_ui_i18n: "false",
+      run_rust: "false",
     });
   });
 });

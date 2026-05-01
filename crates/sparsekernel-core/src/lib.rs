@@ -1589,7 +1589,7 @@ impl SparseKernelDb {
     ) -> Result<Vec<CapabilityRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, subject_type, subject_id, resource_type, resource_id, action, constraints_json, expires_at, created_at
-             FROM capabilities WHERE subject_type = ? AND subject_id = ? ORDER BY created_at DESC",
+             FROM capabilities WHERE subject_type = ? AND subject_id = ? ORDER BY created_at DESC, id ASC",
         )?;
         let rows = stmt.query_map(params![subject_type, subject_id], capability_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1675,7 +1675,7 @@ impl SparseKernelDb {
     pub fn list_tool_calls(&self, limit: i64) -> Result<Vec<ToolCallRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, session_id, agent_id, tool_name, status, input_json, output_json, error, started_at, ended_at, created_at
-             FROM tool_calls ORDER BY created_at DESC LIMIT ?",
+             FROM tool_calls ORDER BY created_at DESC, id ASC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit.max(0)], tool_call_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1765,7 +1765,7 @@ impl SparseKernelDb {
     pub fn list_browser_contexts(&self, limit: i64) -> Result<Vec<BrowserContextRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pool_id, agent_id, session_id, task_id, profile_mode, allowed_origins_json, status, created_at
-             FROM browser_contexts ORDER BY created_at DESC LIMIT ?",
+             FROM browser_contexts ORDER BY created_at DESC, id ASC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit.max(0)], browser_context_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1775,7 +1775,7 @@ impl SparseKernelDb {
     pub fn list_browser_pools(&self) -> Result<Vec<BrowserPoolRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, trust_zone_id, browser_kind, status, max_contexts, cdp_endpoint, created_at, updated_at
-             FROM browser_pools ORDER BY trust_zone_id ASC, browser_kind ASC",
+             FROM browser_pools ORDER BY trust_zone_id ASC, browser_kind ASC, id ASC",
         )?;
         let rows = stmt.query_map([], browser_pool_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -4020,6 +4020,91 @@ mod tests {
         assert!(actions.contains(&"capability.denied".to_string()));
         assert!(actions.contains(&"capability.granted".to_string()));
         assert!(actions.contains(&"capability.revoked".to_string()));
+    }
+
+    #[test]
+    fn ledger_list_queries_use_stable_tie_breakers() {
+        let (_dir, db) = temp_db();
+        let created_at = "2026-04-29T00:00:00Z";
+        for id in ["cap-b", "cap-a"] {
+            db.conn
+                .execute(
+                    "INSERT INTO capabilities(id, subject_type, subject_id, resource_type, resource_id, action, created_at)
+                     VALUES(?, 'agent', 'main', 'tool', ?, 'invoke', ?)",
+                    params![id, id, created_at],
+                )
+                .unwrap();
+        }
+        let capability_ids: Vec<String> = db
+            .list_capabilities("agent", "main")
+            .unwrap()
+            .into_iter()
+            .map(|capability| capability.id)
+            .collect();
+        assert_eq!(
+            capability_ids,
+            vec!["cap-a".to_string(), "cap-b".to_string()]
+        );
+
+        for id in ["tool-b", "tool-a"] {
+            db.conn
+                .execute(
+                    "INSERT INTO tool_calls(id, tool_name, status, created_at)
+                     VALUES(?, ?, 'created', ?)",
+                    params![id, id, created_at],
+                )
+                .unwrap();
+        }
+        let tool_call_ids: Vec<String> = db
+            .list_tool_calls(10)
+            .unwrap()
+            .into_iter()
+            .map(|call| call.id)
+            .collect();
+        assert_eq!(
+            tool_call_ids,
+            vec!["tool-a".to_string(), "tool-b".to_string()]
+        );
+
+        for id in ["pool-b", "pool-a"] {
+            db.conn
+                .execute(
+                    "INSERT INTO browser_pools(id, trust_zone_id, browser_kind, status, max_contexts, created_at, updated_at)
+                     VALUES(?, 'public_web', 'mock', 'active', 2, ?, ?)",
+                    params![id, created_at, created_at],
+                )
+                .unwrap();
+        }
+        let browser_pool_ids: Vec<String> = db
+            .list_browser_pools()
+            .unwrap()
+            .into_iter()
+            .map(|pool| pool.id)
+            .collect();
+        assert_eq!(
+            browser_pool_ids,
+            vec!["pool-a".to_string(), "pool-b".to_string()]
+        );
+
+        for id in ["context-b", "context-a"] {
+            db.conn
+                .execute(
+                    "INSERT INTO browser_contexts(id, pool_id, profile_mode, status, created_at)
+                     VALUES(?, 'pool-a', 'ephemeral', 'active', ?)",
+                    params![id, created_at],
+                )
+                .unwrap();
+        }
+        let browser_context_ids: Vec<String> = db
+            .list_browser_contexts(10)
+            .unwrap()
+            .into_iter()
+            .map(|context| context.id)
+            .collect();
+        assert_eq!(
+            browser_context_ids,
+            vec!["context-a".to_string(), "context-b".to_string()]
+        );
     }
 
     #[test]

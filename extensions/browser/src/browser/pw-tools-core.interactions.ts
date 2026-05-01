@@ -619,7 +619,7 @@ export async function clickCoordsViaPlaywright(opts: {
           delay: resolveBoundedDelayMs(opts.delayMs, "clickCoords delayMs", ACT_MAX_CLICK_DELAY_MS),
         });
       } finally {
-        for (const modifier of [...modifiers].reverse()) {
+        for (const modifier of modifiers.toReversed()) {
           await page.keyboard.up(modifier);
         }
       }
@@ -749,7 +749,7 @@ export async function pressKeyViaPlaywright(opts: {
           delay: Math.max(0, Math.floor(opts.delayMs ?? 0)),
         });
       } finally {
-        for (const modifier of [...modifiers].reverse()) {
+        for (const modifier of modifiers.toReversed()) {
           await page.keyboard.up(modifier);
         }
       }

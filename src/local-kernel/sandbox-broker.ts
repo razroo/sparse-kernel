@@ -6,30 +6,25 @@ import type { LocalKernelDatabase } from "./database.js";
 import {
   isBuiltinFirewallHardEgressHelper,
   runBuiltinFirewallHardEgressHelper,
-  type BuiltinFirewallCommand,
-  type BuiltinFirewallPlatform,
-  type SandboxWorkerIdentitySnapshot,
 } from "./hard-egress-firewall.js";
 import { resolveNetworkPolicyProxyRef } from "./network-policy.js";
+import type {
+  DockerSandboxPolicy,
+  HardEgressEnforcementSnapshot,
+  SandboxBackendKind,
+  SandboxIsolationProfileId,
+  SandboxPolicySnapshot,
+  SandboxWorkerIdentitySnapshot,
+} from "./sandbox-contracts.js";
 import type { SandboxAllocationRecord } from "./types.js";
 
-export type SandboxBackendKind =
-  | "local/no_isolation"
-  | "docker"
-  | "bwrap"
-  | "minijail"
-  | "ssh"
-  | "openshell"
-  | "vm"
-  | "other";
-
-export type SandboxIsolationProfileId =
-  | "trusted_local"
-  | "web_brokered"
-  | "readonly_workspace"
-  | "rw_workspace"
-  | "code_execution"
-  | "plugin_untrusted";
+export type {
+  DockerSandboxPolicy,
+  HardEgressEnforcementSnapshot,
+  SandboxBackendKind,
+  SandboxIsolationProfileId,
+  SandboxPolicySnapshot,
+} from "./sandbox-contracts.js";
 
 export type SandboxAllocationRequest = {
   taskId: string;
@@ -58,52 +53,6 @@ export type SandboxCommandRequest = {
   signal?: AbortSignal;
   timeoutMs?: number;
   maxOutputBytes?: number;
-};
-
-export type DockerSandboxPolicy = {
-  networkMode: "none" | "bridge";
-  proxyServer?: string;
-  memoryMb?: number;
-  pidsLimit?: number;
-  readOnlyRoot?: boolean;
-  tmpfs?: string[];
-};
-
-export type SandboxPolicySnapshot = {
-  trustZoneId: string;
-  backend: SandboxBackendKind;
-  isolationProfile?: SandboxIsolationProfileId;
-  filesystemPolicy?: unknown;
-  maxProcesses?: number;
-  maxMemoryMb?: number;
-  maxRuntimeSeconds?: number;
-  networkPolicy?: {
-    id: string;
-    defaultAction: "allow" | "deny";
-    allowPrivateNetwork: boolean;
-    allowedHosts?: string[];
-    deniedCidrs?: string[];
-    proxyRef?: string;
-  };
-  docker?: DockerSandboxPolicy;
-};
-
-export type HardEgressEnforcementSnapshot = {
-  helper: string;
-  enforcementId: string;
-  boundary: "host_firewall" | "egress_proxy" | "vm_firewall" | "platform_enforcer";
-  description?: string;
-  firewall?: {
-    platform: BuiltinFirewallPlatform | string;
-    scope: string;
-    allowedCidrs?: string[];
-    proxyDelegatedHosts?: string[];
-    protocolCoverage?: string;
-    releaseCommands?: BuiltinFirewallCommand[];
-    applied?: boolean;
-    limitations?: string[];
-  };
-  workerIdentity?: SandboxWorkerIdentitySnapshot;
 };
 
 export type SandboxCommandResult = {

@@ -2,32 +2,20 @@ import { spawnSync } from "node:child_process";
 import net from "node:net";
 import { resolveNetworkPolicyProxyRef } from "./network-policy.js";
 import type {
+  BuiltinFirewallCommand,
+  BuiltinFirewallPlatform,
+  BuiltinFirewallScope,
   HardEgressEnforcementSnapshot,
   SandboxBackendKind,
   SandboxPolicySnapshot,
-} from "./sandbox-broker.js";
-
-export type BuiltinFirewallPlatform = "linux_iptables" | "darwin_pf" | "windows_advfirewall";
-
-export type BuiltinFirewallScope =
-  | { kind: "uid"; value: string }
-  | { kind: "gid"; value: string }
-  | { kind: "program"; value: string }
-  | { kind: "sid"; value: string };
-
-export type SandboxWorkerIdentitySnapshot = {
-  id: string;
-  source: "managed_pool";
-  uid?: number;
-  gid?: number;
-  sid?: string;
-  scope: BuiltinFirewallScope;
-};
-
-export type BuiltinFirewallCommand = {
-  command: string;
-  args: string[];
-};
+  SandboxWorkerIdentitySnapshot,
+} from "./sandbox-contracts.js";
+export type {
+  BuiltinFirewallCommand,
+  BuiltinFirewallPlatform,
+  BuiltinFirewallScope,
+  SandboxWorkerIdentitySnapshot,
+} from "./sandbox-contracts.js";
 
 export type BuiltinFirewallEgressPlan = {
   platform: BuiltinFirewallPlatform;

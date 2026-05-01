@@ -194,6 +194,19 @@ pub fn run_daemon_from_env() -> Result<(), Box<dyn Error>> {
     run_daemon("127.0.0.1:8765")
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "sparsekerneld")]
+#[command(about = "Run the SparseKernel local daemon")]
+struct DaemonCli {
+    #[arg(long, default_value = "127.0.0.1:8765")]
+    listen: String,
+}
+
+pub fn run_daemon_cli() -> Result<(), Box<dyn Error>> {
+    let args = DaemonCli::parse();
+    run_daemon(&args.listen)
+}
+
 pub fn run_daemon(listen: &str) -> Result<(), Box<dyn Error>> {
     let addr = listen
         .to_socket_addrs()?
@@ -1980,6 +1993,13 @@ mod tests {
         )
         .unwrap()
         .body
+    }
+
+    #[test]
+    fn sparsekerneld_help_is_handled_by_parser() {
+        let err = DaemonCli::try_parse_from(["sparsekerneld", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(err.to_string().contains("Usage: sparsekerneld"));
     }
 
     #[test]

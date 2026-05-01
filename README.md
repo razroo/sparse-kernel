@@ -50,6 +50,8 @@ The goal is to make local multi-agent systems practical on ordinary machines, in
 - `schemas/`: API and event schema definitions.
 - `docs/architecture/`: architecture notes for the ledger, brokers, artifact store, trust zones, security boundaries, and small-VM resource model.
 
+The Rust crates are workspace-internal for now (`publish = false`); run them from this repository until a crates.io release path exists.
+
 ## Quick Start
 
 Runtime requirements:

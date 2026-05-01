@@ -3,17 +3,13 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type {
   SparseKernelArtifact,
+  SparseKernelArtifactRetentionPolicy,
   SparseKernelArtifactSubject,
   SparseKernelClient,
   SparseKernelExportArtifactFileResult,
 } from "./index.js";
 
-export type SparseKernelArtifactRetentionPolicy =
-  | "ephemeral"
-  | "session"
-  | "durable"
-  | "debug"
-  | string;
+export type { SparseKernelArtifactRetentionPolicy } from "./index.js";
 
 export type SparseKernelCreateArtifactFromLocalFileInput = {
   filePath: string;

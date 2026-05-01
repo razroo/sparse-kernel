@@ -72,7 +72,7 @@ export type HardEgressEnforcementSnapshot = {
   boundary: "host_firewall" | "egress_proxy" | "vm_firewall" | "platform_enforcer";
   description?: string;
   firewall?: {
-    platform: BuiltinFirewallPlatform | string;
+    platform: BuiltinFirewallPlatform | (string & {});
     scope: string;
     allowedCidrs?: string[];
     proxyDelegatedHosts?: string[];

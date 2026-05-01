@@ -167,7 +167,7 @@ export async function acquireNativeBrowserProcess(
       crashes: current.crashes + (cleanStop ? 0 : 1),
       lastExitAt: new Date().toISOString(),
       ...(typeof code === "number" ? { lastExitCode: code } : {}),
-      ...(signal ? { lastExitSignal: String(signal) } : {}),
+      ...(signal ? { lastExitSignal: signal } : {}),
     }));
     pool.exited = true;
     pools.delete(key);

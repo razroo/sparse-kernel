@@ -183,6 +183,7 @@ export function isSandboxBackendAvailable(backend: SandboxBackendKind): boolean 
     case "other":
       return Boolean(resolveExternalSandboxWrapper(backend));
   }
+  throw new Error("Unknown sandbox backend");
 }
 
 export function probeSandboxBackends(
@@ -527,6 +528,7 @@ function describeSandboxBackend(backend: SandboxBackendKind): string {
     case "other":
       return "operator-supplied custom sandbox command wrapper";
   }
+  throw new Error("Unknown sandbox backend");
 }
 
 function validDockerEnvName(name: string): boolean {
@@ -767,7 +769,12 @@ function readInteger(value: unknown, name: string): number | undefined {
   if (value === undefined || value === null || value === "") {
     return undefined;
   }
-  const parsed = typeof value === "number" ? value : Number.parseInt(String(value).trim(), 10);
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value.trim(), 10)
+        : Number.NaN;
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`${name} must be a non-negative integer`);
   }
@@ -917,7 +924,11 @@ export function buildSandboxProcessEnv(params: {
         }
       : {};
   if (params.backend === "local/no_isolation") {
-    return { ...process.env, ...proxyEnv, ...(params.env ?? {}) };
+    const env = { ...process.env, ...proxyEnv };
+    if (params.env) {
+      Object.assign(env, params.env);
+    }
+    return env;
   }
   const base: NodeJS.ProcessEnv = {
     PATH: readHostEnv("PATH") ?? "/usr/local/bin:/usr/bin:/bin",
@@ -933,7 +944,10 @@ export function buildSandboxProcessEnv(params: {
       }
     }
   }
-  return { ...base, ...(params.env ?? {}) };
+  if (params.env) {
+    Object.assign(base, params.env);
+  }
+  return base;
 }
 
 export function buildSandboxSpawnPlan(params: {
@@ -1052,7 +1066,7 @@ export function buildSandboxSpawnPlan(params: {
       if (dockerPolicy.pidsLimit) {
         args.push("--pids-limit", String(Math.max(1, Math.trunc(dockerPolicy.pidsLimit))));
       }
-      const env = { ...(params.env ?? {}) };
+      const env = params.env ? { ...params.env } : {};
       if (dockerPolicy.proxyServer) {
         const dockerProxy = dockerContainerProxyServer(dockerPolicy.proxyServer);
         if (dockerProxy.addHostGateway) {
@@ -1116,6 +1130,7 @@ export function buildSandboxSpawnPlan(params: {
       };
     }
   }
+  throw new Error("Unknown sandbox backend");
 }
 
 export async function runSandboxSpawnPlan(
@@ -1445,7 +1460,7 @@ export class LocalSandboxBroker implements SandboxBroker {
             enforcement: metadata.hardEgress,
           },
         });
-        throw new Error(`Sandbox hard egress release failed: ${reason}`);
+        throw new Error(`Sandbox hard egress release failed: ${reason}`, { cause: error });
       }
     }
     const released = this.db.releaseResourceLease(allocationId);
@@ -1534,11 +1549,11 @@ export class LocalSandboxBroker implements SandboxBroker {
       });
       throw error;
     }
-    const requestedTimeoutMs = request.timeoutMs ?? Number(lease.maxRuntimeMs ?? 30_000);
-    const leaseTimeoutMs = Number(lease.maxRuntimeMs ?? requestedTimeoutMs);
+    const requestedTimeoutMs = request.timeoutMs ?? lease.maxRuntimeMs ?? 30_000;
+    const leaseTimeoutMs = lease.maxRuntimeMs ?? requestedTimeoutMs;
     const timeoutMs = Math.max(1, Math.min(requestedTimeoutMs || 30_000, leaseTimeoutMs || 30_000));
-    const requestedOutputBytes = request.maxOutputBytes ?? Number(lease.maxBytesOut ?? 256 * 1024);
-    const leaseOutputBytes = Number(lease.maxBytesOut ?? requestedOutputBytes);
+    const requestedOutputBytes = request.maxOutputBytes ?? lease.maxBytesOut ?? 256 * 1024;
+    const leaseOutputBytes = lease.maxBytesOut ?? requestedOutputBytes;
     const maxOutputBytes = Math.max(
       1,
       Math.min(requestedOutputBytes || 256 * 1024, leaseOutputBytes || 256 * 1024),
@@ -1569,7 +1584,7 @@ export class LocalSandboxBroker implements SandboxBroker {
                 HTTPS_PROXY: metadata.policy.docker.proxyServer,
                 ALL_PROXY: metadata.policy.docker.proxyServer,
                 NO_PROXY: "127.0.0.1,localhost,::1",
-                ...(request.env ?? {}),
+                ...request.env,
               }
             : request.env,
         stdin: request.stdin,

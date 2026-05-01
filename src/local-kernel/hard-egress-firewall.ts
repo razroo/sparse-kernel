@@ -221,8 +221,8 @@ function collectFirewallDestinations(
     );
   }
   return {
-    allowedCidrs: [...allowed].sort(),
-    proxyDelegatedHosts: [...proxyDelegatedHosts].sort(),
+    allowedCidrs: Array.from(allowed).toSorted(),
+    proxyDelegatedHosts: Array.from(proxyDelegatedHosts).toSorted(),
   };
 }
 
@@ -678,13 +678,12 @@ function readReleaseCommands(
   if (!Array.isArray(releaseCommands)) {
     return [];
   }
-  return releaseCommands.filter((entry): entry is BuiltinFirewallCommand =>
-    Boolean(
-      entry &&
+  return releaseCommands.filter(
+    (entry): entry is BuiltinFirewallCommand =>
+      Boolean(entry) &&
       typeof entry.command === "string" &&
       Array.isArray(entry.args) &&
       entry.args.every((arg) => typeof arg === "string"),
-    ),
   );
 }
 

@@ -1744,7 +1744,7 @@ describe("local runtime kernel database", () => {
         .prepare("SELECT status, owner_task_id FROM resource_leases WHERE id = ?")
         .get(allocation.id) as { status: string; owner_task_id: string | null };
       expect(lease).toEqual({ status: "active", owner_task_id: null });
-      run.release();
+      void run.release();
       const released = db.db
         .prepare("SELECT status FROM resource_leases WHERE id = ?")
         .get(allocation.id) as { status: string };

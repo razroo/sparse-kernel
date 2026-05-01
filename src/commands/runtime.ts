@@ -286,7 +286,7 @@ function tailOutput(value: string | undefined): string | undefined {
   if (!value) {
     return undefined;
   }
-  return value.length <= 4_000 ? value : value.slice(value.length - 4_000);
+  return value.length <= 4_000 ? value : value.slice(-4_000);
 }
 
 function runAcceptanceLaneCommand(

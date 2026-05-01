@@ -21,6 +21,25 @@ import {
   SparseKernelCdpBrowserBroker,
 } from "./index.js";
 
+function fetchInputUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.href;
+  }
+  return input.url;
+}
+
+function readParamString(
+  params: Record<string, unknown> | undefined,
+  key: string,
+  fallback: string,
+): string {
+  const value = params?.[key];
+  return typeof value === "string" ? value : fallback;
+}
+
 class FakeKernel implements SparseKernelBrowserKernelClient {
   readonly artifactInputs: SparseKernelCreateArtifactInput[] = [];
   readonly observations: SparseKernelBrowserObservationInput[] = [];
@@ -136,7 +155,7 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { browserContextId: "cdp-context-1" });
         break;
       case "Target.createTarget":
-        this.currentUrl = String(message.params?.url ?? this.currentUrl);
+        this.currentUrl = readParamString(message.params, "url", this.currentUrl);
         this.targetUrls.set("target-1", this.currentUrl);
         this.respond(message.id, { targetId: "target-1" });
         break;
@@ -168,7 +187,7 @@ class FakeCdpTransport implements CdpTransport {
         break;
       case "Page.navigate":
         this.respond(message.id, { frameId: "frame-1" });
-        this.handleNavigate(String(message.params?.url ?? ""), message.sessionId);
+        this.handleNavigate(readParamString(message.params, "url", ""), message.sessionId);
         break;
       case "Page.getNavigationHistory":
         this.respond(message.id, {
@@ -218,7 +237,7 @@ class FakeCdpTransport implements CdpTransport {
         this.respond(message.id, { nodeId: 2 });
         break;
       case "Target.closeTarget":
-        this.closeTarget(String(message.params?.targetId ?? ""));
+        this.closeTarget(readParamString(message.params, "targetId", ""));
         this.respond(message.id, { success: true });
         break;
       case "Target.disposeBrowserContext":
@@ -306,7 +325,7 @@ class FakeCdpTransport implements CdpTransport {
     params?: Record<string, unknown>;
     sessionId?: string;
   }): void {
-    const expression = String(message.params?.expression ?? "");
+    const expression = readParamString(message.params, "expression", "");
     const url = this.urlForSession(
       typeof message.sessionId === "string" ? message.sessionId : "session-1",
     );
@@ -386,7 +405,7 @@ class FakeCdpTransport implements CdpTransport {
   }
 
   private respondAttachToTarget(message: { id: number; params?: Record<string, unknown> }): void {
-    const targetId = String(message.params?.targetId ?? "target-1");
+    const targetId = readParamString(message.params, "targetId", "target-1");
     const sessionId = targetId === "target-1" ? "session-1" : `session-${targetId}`;
     this.sessionTargets.set(sessionId, targetId);
     this.respond(message.id, { sessionId });
@@ -487,7 +506,7 @@ class FakeCdpTransport implements CdpTransport {
 
   private closeTarget(targetId: string): void {
     this.targetUrls.delete(targetId);
-    for (const [sessionId, mappedTargetId] of [...this.sessionTargets.entries()]) {
+    for (const [sessionId, mappedTargetId] of Array.from(this.sessionTargets.entries())) {
       if (mappedTargetId === targetId) {
         this.sessionTargets.delete(sessionId);
       }
@@ -1479,7 +1498,7 @@ describe("@openclaw/sparsekernel-browser-broker", () => {
       baseUrl: "http://127.0.0.1:8765",
       artifactStagingDir: stageRoot,
       fetchImpl: async (input, init) => {
-        const url = input.toString();
+        const url = fetchInputUrl(input);
         const body =
           typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, string>) : {};
         calls.push({ url, body });

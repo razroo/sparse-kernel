@@ -27,7 +27,7 @@ export type OpenClawSparseKernelTool = {
     toolCallId: string,
     params: unknown,
     signal?: AbortSignal,
-    onUpdate?: OpenClawSparseKernelToolUpdateCallback<unknown>,
+    onUpdate?: OpenClawSparseKernelToolUpdateCallback,
   ) => Promise<unknown>;
 };
 

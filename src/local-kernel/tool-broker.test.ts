@@ -45,6 +45,16 @@ function makeTool(name = "sensitive_tool"): AnyAgentTool {
   } as AnyAgentTool;
 }
 
+function fetchInputUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.href;
+  }
+  return input.url;
+}
+
 class FakeDaemonKernel implements OpenClawSparseKernelToolBrokerClient {
   readonly sessions: SparseKernelUpsertSessionInput[] = [];
   readonly grants: SparseKernelGrantCapabilityInput[] = [];
@@ -1431,7 +1441,7 @@ describe("CapabilityToolBroker", () => {
         OPENCLAW_SPARSEKERNEL_BROWSER_CONTROL_URL: "http://127.0.0.1:18791",
       } as NodeJS.ProcessEnv,
       browserControlFetch: (async (input, init) => {
-        fetchCalls.push({ url: input.toString(), method: init?.method });
+        fetchCalls.push({ url: fetchInputUrl(input), method: init?.method });
         return Response.json({
           running: true,
           cdpReady: true,

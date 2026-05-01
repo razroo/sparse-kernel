@@ -204,7 +204,7 @@ function sanitizeProxyHeaders(
     if (value === undefined || HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
       continue;
     }
-    sanitized[name] = Array.isArray(value) ? value.map(String) : String(value);
+    sanitized[name] = value;
   }
   return sanitized;
 }

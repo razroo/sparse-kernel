@@ -354,6 +354,7 @@ function taskBudgetDefault(kind: TaskBudgetKind): number {
     case "test_jobs":
       return 4;
   }
+  throw new Error("Unknown task budget kind");
 }
 
 const RESOURCE_BUDGET_INFO_KEYS = {

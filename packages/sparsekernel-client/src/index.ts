@@ -32,9 +32,17 @@ export type SparseKernelResourceBudgets = {
 
 export type SparseKernelResourceBudgetUpdate = Partial<SparseKernelResourceBudgets>;
 
+export type SparseKernelNetworkDefaultAction = "allow" | "deny" | (string & {});
+export type SparseKernelArtifactRetentionPolicy =
+  | "ephemeral"
+  | "session"
+  | "durable"
+  | "debug"
+  | (string & {});
+
 export type SparseKernelNetworkPolicy = {
   id: string;
-  default_action: "allow" | "deny" | string;
+  default_action: SparseKernelNetworkDefaultAction;
   allow_private_network: boolean;
   allowed_hosts?: string[];
   denied_cidrs?: string[];
@@ -164,14 +172,14 @@ export type SparseKernelCreateArtifactInput = {
   content_base64?: string;
   content_text?: string;
   mime_type?: string | null;
-  retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string | null;
+  retention_policy?: SparseKernelArtifactRetentionPolicy | null;
   subject?: SparseKernelArtifactSubject;
 };
 
 export type SparseKernelImportArtifactFileInput = {
   staged_path: string;
   mime_type?: string | null;
-  retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string | null;
+  retention_policy?: SparseKernelArtifactRetentionPolicy | null;
   subject?: SparseKernelArtifactSubject;
 };
 

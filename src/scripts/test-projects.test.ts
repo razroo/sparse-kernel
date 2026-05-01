@@ -106,11 +106,16 @@ const VITEST_NODE_PREFIX = [
 
 describe("test-projects args", () => {
   it("drops a pnpm passthrough separator while preserving targeted filters", () => {
-    expect(parseTestProjectsArgs(["--", "src/foo.test.ts", "-t", "target"])).toEqual({
-      forwardedArgs: ["src/foo.test.ts", "-t", "target"],
-      targetArgs: ["src/foo.test.ts"],
-      watchMode: false,
-    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-test-projects-args-"));
+    try {
+      expect(parseTestProjectsArgs(["--", "src/foo.test.ts", "-t", "target"], cwd)).toEqual({
+        forwardedArgs: ["src/foo.test.ts", "-t", "target"],
+        targetArgs: ["src/foo.test.ts"],
+        watchMode: false,
+      });
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("keeps watch mode explicit without leaking the sentinel to Vitest", () => {
@@ -390,7 +395,7 @@ describe("test-projects args", () => {
   it("routes gateway targets to the gateway config", () => {
     expect(buildVitestRunPlans(["src/gateway/call.test.ts"])).toEqual([
       {
-        config: "test/vitest/vitest.gateway.config.ts",
+        config: "test/vitest/vitest.gateway-core.config.ts",
         forwardedArgs: [],
         includePatterns: ["src/gateway/call.test.ts"],
         watchMode: false,
@@ -614,7 +619,7 @@ describe("test-projects args", () => {
   it("widens non-test helper file targets to sibling tests inside the routed suite", () => {
     expect(buildVitestRunPlans(["src/gateway/gateway-connection.test-mocks.ts"])).toEqual([
       {
-        config: "test/vitest/vitest.gateway.config.ts",
+        config: "test/vitest/vitest.gateway-core.config.ts",
         forwardedArgs: [],
         includePatterns: ["src/gateway/**/*.test.ts"],
         watchMode: false,

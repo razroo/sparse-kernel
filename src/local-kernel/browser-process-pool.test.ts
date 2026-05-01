@@ -20,6 +20,16 @@ class FakeBrowserProcess extends EventEmitter {
   readonly unref = vi.fn();
 }
 
+function fetchInputUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.href;
+  }
+  return input.url;
+}
+
 describe("native browser process pool", () => {
   afterEach(async () => {
     await stopAllNativeBrowserProcesses();
@@ -42,7 +52,7 @@ describe("native browser process pool", () => {
       return fakeProcess as unknown as ChildProcess;
     }) as unknown as typeof spawn;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-      expect(input.toString()).toBe("http://127.0.0.1:19222/json/version");
+      expect(fetchInputUrl(input)).toBe("http://127.0.0.1:19222/json/version");
       return Response.json({ Browser: "Chrome/123" });
     }) as unknown as typeof fetch;
 

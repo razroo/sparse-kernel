@@ -16,7 +16,7 @@ export type WorkerIdentityProvisionPlan = {
 };
 
 export type WorkerIdentityProvisionOptions = {
-  platform?: WorkerIdentityProvisionPlatform | NodeJS.Platform | string;
+  platform?: string;
   count?: number;
   prefix?: string;
   uidStart?: number;
@@ -40,9 +40,7 @@ const DEFAULT_GID = 62_000;
 function normalizePlatform(
   raw: WorkerIdentityProvisionOptions["platform"],
 ): WorkerIdentityProvisionPlatform {
-  const value = String(raw ?? process.platform)
-    .trim()
-    .toLowerCase();
+  const value = (raw ?? process.platform).trim().toLowerCase();
   if (value === "linux") {
     return "linux";
   }
@@ -52,7 +50,7 @@ function normalizePlatform(
   if (value === "win32" || value === "windows") {
     return "windows";
   }
-  throw new Error(`Unsupported worker identity platform: ${String(raw ?? process.platform)}`);
+  throw new Error(`Unsupported worker identity platform: ${raw ?? process.platform}`);
 }
 
 function readPositiveInteger(value: number | undefined, fallback: number, label: string): number {

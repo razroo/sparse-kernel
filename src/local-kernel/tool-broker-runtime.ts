@@ -9,11 +9,7 @@ import { getPluginToolMeta } from "../plugins/tools.js";
 import { resolveSparseKernelBrowserCdpEndpoint } from "./browser-managed-cdp.js";
 import type { acquireNativeBrowserProcess } from "./browser-process-pool.js";
 import { openLocalKernelDatabase, type LocalKernelDatabase } from "./database.js";
-import {
-  buildSandboxSpawnPlan,
-  runSandboxSpawnPlan,
-  type SandboxBackendKind,
-} from "./sandbox-broker.js";
+import { buildSandboxSpawnPlan, runSandboxSpawnPlan } from "./sandbox-broker.js";
 import {
   CapabilityToolBroker,
   isSandboxCommandToolName,
@@ -406,7 +402,7 @@ async function runDaemonPluginToolSubprocess(params: {
     });
     const result = await runSandboxSpawnPlan({
       allocationId: allocation.id,
-      backend: sandboxConfig.backend as SandboxBackendKind,
+      backend: sandboxConfig.backend,
       spawnPlan,
       cwd: params.plan.cwd,
       stdin: payload,

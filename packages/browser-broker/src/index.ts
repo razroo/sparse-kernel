@@ -7,6 +7,7 @@ import {
   type SparseKernelClientOptions,
   type SparseKernelAcquireBrowserContextInput,
   type SparseKernelArtifact,
+  type SparseKernelArtifactRetentionPolicy,
   type SparseKernelArtifactSubject,
   type SparseKernelBrowserContext,
   type SparseKernelBrowserEndpointProbe,
@@ -97,7 +98,7 @@ export type CaptureScreenshotArtifactInput = {
   url?: string;
   format?: "png" | "jpeg";
   full_page?: boolean;
-  retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
+  retention_policy?: SparseKernelArtifactRetentionPolicy;
   subject?: SparseKernelArtifactSubject;
   timeout_ms?: number;
 };
@@ -106,7 +107,7 @@ export type CaptureDownloadArtifactInput = {
   url: string;
   mime_type?: string;
   filename?: string;
-  retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
+  retention_policy?: SparseKernelArtifactRetentionPolicy;
   subject?: SparseKernelArtifactSubject;
   timeout_ms?: number;
 };
@@ -620,7 +621,7 @@ export class SparseKernelCdpBrowserBroker {
   async capturePdfArtifact(
     contextId: string,
     input: {
-      retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
+      retention_policy?: SparseKernelArtifactRetentionPolicy;
       subject?: SparseKernelArtifactSubject;
     } = {},
   ): Promise<BrowserArtifactResult> {
@@ -652,7 +653,7 @@ export class SparseKernelCdpBrowserBroker {
   private async createArtifactFromBytes(input: {
     bytes: Buffer;
     mime_type: string;
-    retention_policy?: "ephemeral" | "session" | "durable" | "debug" | string;
+    retention_policy?: SparseKernelArtifactRetentionPolicy;
     subject?: SparseKernelArtifactSubject;
   }): Promise<SparseKernelArtifact> {
     if (!this.kernel.importArtifactFile || this.artifactStagingDir === false) {
@@ -820,7 +821,7 @@ export class SparseKernelCdpBrowserBroker {
       return { ok: true, targetId, releasedContext: true };
     }
     if (context.target_id === targetId) {
-      const next = context.pages.values().next().value as LiveBrowserPage | undefined;
+      const next = context.pages.values().next().value;
       if (next) {
         context.target_id = next.target_id;
         context.page_session_id = next.page_session_id;
@@ -1136,6 +1137,7 @@ export class SparseKernelCdpBrowserBroker {
           }),
         };
     }
+    throw new Error("Unsupported browser action kind");
   }
 
   async releaseContext(contextId: string): Promise<boolean> {
@@ -1758,7 +1760,7 @@ class CdpConnection {
     return new CdpConnection(await factory(webSocketUrl));
   }
 
-  command<T = JsonRecord>(
+  command<T = unknown>(
     method: string,
     params: JsonRecord = {},
     sessionId?: string,
@@ -1914,7 +1916,7 @@ class CdpConnection {
         // CDP event observers are best-effort side channels such as console capture.
       }
     }
-    for (const waiter of [...this.eventWaiters]) {
+    for (const waiter of Array.from(this.eventWaiters)) {
       if (waiter.method === method && waiter.predicate(event)) {
         this.removeEventWaiter(waiter);
         clearTimeout(waiter.timeout);
@@ -2143,7 +2145,7 @@ function normalizeAllowedOrigins(value: unknown): string[] {
       origins.add(origin);
     }
   }
-  return [...origins].sort();
+  return Array.from(origins).toSorted();
 }
 
 function normalizeAllowedOrigin(raw: string): string | undefined {
@@ -2174,9 +2176,7 @@ function assertUrlAllowedByOrigins(url: string, allowedOrigins: string[], label:
   if (allowedOrigins.length === 0) {
     return;
   }
-  try {
-    new URL(url);
-  } catch {
+  if (!URL.canParse(url)) {
     throw new Error(`SparseKernel browser ${label} URL is not valid: ${url}`);
   }
   throw new Error(
@@ -2285,9 +2285,8 @@ function recordConsoleEvent(
       page.console_messages.splice(0, page.console_messages.length - 500);
     }
     return { targetId: page.target_id, message };
-  } else {
-    return undefined;
   }
+  return undefined;
 }
 
 function recordNetworkEvent(
@@ -2361,7 +2360,7 @@ function readNumber(value: unknown): number | undefined {
 function sanitizeDownloadName(url: string): string {
   try {
     const parsed = new URL(url);
-    const last = parsed.pathname.split("/").filter(Boolean).pop();
+    const last = parsed.pathname.split("/").findLast(Boolean);
     if (last) {
       return last.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128) || "download.bin";
     }
@@ -2409,11 +2408,12 @@ function buildSnapshotExpression(input: {
   selector?: string;
 }): string {
   const selector = JSON.stringify(input.selector ?? "");
+  const escapedQuoteReplacement = JSON.stringify(String.raw`\"`);
   return `(() => {
   const limit = ${input.limit};
   const maxChars = ${input.maxChars};
   const selector = ${selector};
-  const quote = (value) => String(value || "").replace(/\\\\/g, "\\\\\\\\").replace(/"/g, "\\\\\"");
+  const quote = (value) => String(value || "").replace(/\\\\/g, "\\\\\\\\").replace(/"/g, ${escapedQuoteReplacement});
   const clean = (value) => String(value || "").replace(/\\s+/g, " ").trim();
   const selectorFor = (node) => {
     if (!node || !node.tagName) return "";

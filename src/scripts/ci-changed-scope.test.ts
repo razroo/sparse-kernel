@@ -486,6 +486,8 @@ describe("detectChangedScope", () => {
     expect(detectRustScope(["Cargo.toml"])).toBe(true);
     expect(detectRustScope(["Cargo.lock"])).toBe(true);
     expect(detectRustScope(["crates/sparsekernel-cli/src/lib.rs"])).toBe(true);
+    expect(detectRustScope([".github/workflows/ci.yml"])).toBe(true);
+    expect(detectRustScope(["scripts/ci-changed-scope.mjs"])).toBe(true);
     expect(detectRustScope(["docs/architecture/sparsekernel.md"])).toBe(false);
     expect(detectRustScope(["src/commands/runtime.ts"])).toBe(false);
   });

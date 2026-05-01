@@ -392,30 +392,6 @@ export type SparseKernelAllocateSandboxInput = {
   max_bytes_out?: number | null;
 };
 
-export type SparseKernelRunSandboxCommandInput = {
-  allocation_id: string;
-  backend?: string | null;
-  docker_image?: string | null;
-  command: string;
-  args?: string[];
-  cwd?: string | null;
-  env?: Record<string, string>;
-  stdin_text?: string;
-  stdin_base64?: string;
-  timeout_ms?: number | null;
-  max_output_bytes?: number | null;
-};
-
-export type SparseKernelRunSandboxCommandResult = {
-  allocation_id: string;
-  exit_code: number | null;
-  signal?: string | null;
-  stdout: string;
-  stderr: string;
-  timed_out: boolean;
-  duration_ms: number;
-};
-
 export type SparseKernelCreateToolCallInput = {
   id?: string;
   task_id?: string | null;
@@ -726,12 +702,6 @@ export class SparseKernelClient {
     return response.released;
   }
 
-  async runSandboxCommand(
-    input: SparseKernelRunSandboxCommandInput,
-  ): Promise<SparseKernelRunSandboxCommandResult> {
-    return await this.postJson<SparseKernelRunSandboxCommandResult>("/sandbox/run-command", input);
-  }
-
   async probeSandboxBackends(): Promise<SparseKernelSandboxBackendProbe[]> {
     return await this.getJson<SparseKernelSandboxBackendProbe[]>("/sandbox/backends/probe");
   }
@@ -779,7 +749,7 @@ export class SparseKernelClient {
       headers: { accept: "application/json" },
     });
     if (!response.ok) {
-      throw new Error(`SparseKernel request failed: ${response.status} ${response.statusText}`);
+      throw await sparseKernelRequestError(response);
     }
     return (await response.json()) as T;
   }
@@ -794,8 +764,64 @@ export class SparseKernelClient {
       body: JSON.stringify(body),
     });
     if (!response.ok) {
-      throw new Error(`SparseKernel request failed: ${response.status} ${response.statusText}`);
+      throw await sparseKernelRequestError(response);
     }
     return (await response.json()) as T;
   }
+}
+
+const MAX_ERROR_DETAIL_LENGTH = 1000;
+
+async function sparseKernelRequestError(response: Response): Promise<Error> {
+  const detail = await responseErrorDetail(response);
+  const status = [response.status, response.statusText.trim()].filter(Boolean).join(" ");
+  return new Error(
+    `SparseKernel request failed: ${status}${detail ? `: ${truncateErrorDetail(detail)}` : ""}`,
+  );
+}
+
+async function responseErrorDetail(response: Response): Promise<string | undefined> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return undefined;
+  }
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return formatErrorPayload(parsed);
+  } catch {
+    return trimmed;
+  }
+}
+
+function formatErrorPayload(payload: unknown): string | undefined {
+  if (typeof payload === "string") {
+    return payload.trim() || undefined;
+  }
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const record = payload as Record<string, unknown>;
+  for (const key of ["error", "message", "detail"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return undefined;
+  }
+}
+
+function truncateErrorDetail(detail: string): string {
+  return detail.length > MAX_ERROR_DETAIL_LENGTH
+    ? `${detail.slice(0, MAX_ERROR_DETAIL_LENGTH)}...`
+    : detail;
 }

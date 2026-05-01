@@ -42,6 +42,40 @@ describe("SparseKernelClient protocol compatibility", () => {
     );
   });
 
+  it("includes daemon JSON error details in failed requests", async () => {
+    const fetchImpl = vi.fn(async () =>
+      Response.json(
+        { error: "artifact access denied: artifact-a" },
+        {
+          status: 403,
+          statusText: "Forbidden",
+        },
+      ),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      new SparseKernelClient({ fetchImpl }).artifactMetadata({ id: "artifact-a" }),
+    ).rejects.toThrow(
+      "SparseKernel request failed: 403 Forbidden: artifact access denied: artifact-a",
+    );
+  });
+
+  it("includes daemon text error details in failed requests", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response("base64 artifact read is disabled; use /artifacts/export-file", {
+          status: 400,
+          statusText: "Bad Request",
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      new SparseKernelClient({ fetchImpl }).readArtifact({ id: "artifact-a" }),
+    ).rejects.toThrow(
+      "SparseKernel request failed: 400 Bad Request: base64 artifact read is disabled; use /artifacts/export-file",
+    );
+  });
+
   it("posts staged artifact import and export requests", async () => {
     const artifact = {
       id: "artifact-a",

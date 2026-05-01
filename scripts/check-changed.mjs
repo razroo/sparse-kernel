@@ -130,11 +130,12 @@ export function createChangedCheckPlan(result, options = {}) {
       "clippy",
       "--workspace",
       "--all-targets",
+      "--locked",
       "--",
       "-D",
       "warnings",
     ]);
-    addCommand("rust tests", "cargo", ["test", "--workspace"]);
+    addCommand("rust tests", "cargo", ["test", "--workspace", "--locked"]);
   }
   if (lanes.apps) {
     addLint("lint apps", ["lint:apps"]);

@@ -482,10 +482,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test Rust workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # Build dist once for Node-relevant changes and share it with downstream jobs.
   # Keep this overlapping with the fast correctness lanes so green PRs get heavy

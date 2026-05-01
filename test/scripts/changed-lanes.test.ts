@@ -251,11 +251,11 @@ describe("scripts/changed-lanes", () => {
     });
     expect(plan.commands.find((command) => command.name === "rust lint")).toMatchObject({
       bin: "cargo",
-      args: ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+      args: ["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"],
     });
     expect(plan.commands.find((command) => command.name === "rust tests")).toMatchObject({
       bin: "cargo",
-      args: ["test", "--workspace"],
+      args: ["test", "--workspace", "--locked"],
     });
   });
 

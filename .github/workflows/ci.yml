@@ -475,6 +475,15 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Test Rust workspace
         run: cargo test --workspace
 

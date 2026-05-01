@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{
@@ -199,8 +199,7 @@ pub fn run_daemon(listen: &str) -> Result<(), Box<dyn Error>> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| format!("invalid listen address: {listen}"))?;
-    let server = Server::http(addr)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+    let server = Server::http(addr).map_err(|err| std::io::Error::other(err.to_string()))?;
     eprintln!("sparsekerneld listening on http://{addr}");
     let mut daemon_state = DaemonState::default();
     for mut request in server.incoming_requests() {
@@ -1225,10 +1224,18 @@ fn is_private_ip(ip: &IpAddr) -> bool {
         IpAddr::V6(ip) => {
             ip.is_loopback()
                 || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
+                || is_ipv6_unique_local(ip)
+                || is_ipv6_unicast_link_local(ip)
         }
     }
+}
+
+fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_ipv6_unicast_link_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 fn cidr_contains_host(cidr: &str, host: &str) -> bool {
@@ -2035,6 +2042,15 @@ mod tests {
             json!({ "trust_zone_id": "public_web" }),
         );
         assert_eq!(policy["proxy_ref"], "http://127.0.0.1:18080/");
+    }
+
+    #[test]
+    fn private_host_detection_covers_ipv6_private_ranges_on_msrv() {
+        assert!(is_private_or_local_host("fc00::1"));
+        assert!(is_private_or_local_host("fd00::1"));
+        assert!(is_private_or_local_host("fe80::1"));
+        assert!(is_private_or_local_host("::1"));
+        assert!(!is_private_or_local_host("2001:4860:4860::8888"));
     }
 
     #[test]

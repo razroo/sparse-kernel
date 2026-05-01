@@ -21,6 +21,12 @@ const MIGRATION_0002: &str =
     include_str!("../../../migrations/0002_browser_targets_observations.sql");
 const MIGRATION_0003: &str = include_str!("../../../migrations/0003_resource_lease_metadata.sql");
 const MIGRATION_0004: &str = include_str!("../../../migrations/0004_resource_budgets.sql");
+type SandboxLeaseReleaseRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 pub type Result<T> = std::result::Result<T, SparseKernelError>;
 
@@ -3198,7 +3204,7 @@ impl SandboxBroker for LocalSandboxBroker<'_> {
 
     fn release_sandbox(&self, allocation_id: &str) -> Result<bool> {
         let now = now_iso();
-        let lease: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = self
+        let lease: Option<SandboxLeaseReleaseRow> = self
             .db
             .conn
             .query_row(

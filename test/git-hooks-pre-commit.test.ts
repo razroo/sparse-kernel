@@ -127,6 +127,23 @@ describe("git-hooks/pre-commit (integration)", () => {
     expect(staged).toEqual([".agents/skills/discord-clawd/SKILL.md", ".gitignore"]);
   });
 
+  it("handles force-staged ignored paths without restageable files", () => {
+    const dir = makeTempRepoRoot(tempDirs, "openclaw-pre-commit-only-ignored-staged-");
+    run(dir, "git", ["init", "-q", "--initial-branch=main"]);
+
+    const fakeBinDir = installPreCommitFixture(dir);
+    writeFileSync(path.join(dir, ".gitignore"), "pnpm-lock.yaml\n", "utf8");
+    writeFileSync(path.join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+
+    run(dir, "git", ["add", "-f", "--", "pnpm-lock.yaml"]);
+
+    run(dir, "bash", ["git-hooks/pre-commit"], {
+      PATH: `${fakeBinDir}:${process.env.PATH ?? ""}`,
+    });
+
+    expect(run(dir, "git", ["diff", "--cached", "--name-only"])).toBe("pnpm-lock.yaml");
+  });
+
   it("ignores FAST_COMMIT because the hook is already formatting-only", () => {
     const dir = makeTempRepoRoot(tempDirs, "openclaw-pre-commit-fast-");
     run(dir, "git", ["init", "-q", "--initial-branch=main"]);

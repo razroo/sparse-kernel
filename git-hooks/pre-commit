@@ -36,9 +36,11 @@ for file in "${files[@]}"; do
 done
 
 format_files=()
-while IFS= read -r -d '' file; do
-  format_files+=("$file")
-done < <(node "$FILTER_FILES" format -- "${restage_files[@]}")
+if [ "${#restage_files[@]}" -gt 0 ]; then
+  while IFS= read -r -d '' file; do
+    format_files+=("$file")
+  done < <(node "$FILTER_FILES" format -- "${restage_files[@]}")
+fi
 
 if [ "${#format_files[@]}" -gt 0 ]; then
   "$RUN_NODE_TOOL" oxfmt --write --no-error-on-unmatched-pattern "${format_files[@]}"

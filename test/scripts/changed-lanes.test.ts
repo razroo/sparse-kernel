@@ -242,6 +242,7 @@ describe("scripts/changed-lanes", () => {
       "changelog attributions",
       "plugin-sdk wildcard re-exports",
       "rust format",
+      "rust package",
       "rust lint",
       "rust tests",
     ]);
@@ -252,6 +253,10 @@ describe("scripts/changed-lanes", () => {
     expect(plan.commands.find((command) => command.name === "rust lint")).toMatchObject({
       bin: "cargo",
       args: ["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"],
+    });
+    expect(plan.commands.find((command) => command.name === "rust package")).toMatchObject({
+      bin: "cargo",
+      args: ["package", "-p", "sparsekernel-core", "--locked"],
     });
     expect(plan.commands.find((command) => command.name === "rust tests")).toMatchObject({
       bin: "cargo",
@@ -272,7 +277,7 @@ describe("scripts/changed-lanes", () => {
       "lint:scripts",
     );
     expect(plan.commands.map((command) => command.name)).toEqual(
-      expect.arrayContaining(["rust format", "rust lint", "rust tests"]),
+      expect.arrayContaining(["rust format", "rust package", "rust lint", "rust tests"]),
     );
   });
 

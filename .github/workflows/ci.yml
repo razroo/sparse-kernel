@@ -487,6 +487,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo +"$OPENCLAW_RUST_MSRV" fmt --all --check
 
+      - name: Package Rust core crate
+        run: cargo +"$OPENCLAW_RUST_MSRV" package -p sparsekernel-core --locked
+
       - name: Lint Rust workspace
         run: cargo +"$OPENCLAW_RUST_MSRV" clippy --workspace --all-targets --locked -- -D warnings
 

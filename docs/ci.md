@@ -230,7 +230,7 @@ gh workflow run duplicate-after-merge.yml \
 | `security-scm-fast`              | Private key detection and workflow audit via `zizmor`                                        | Always on non-draft pushes and PRs |
 | `security-dependency-audit`      | Dependency-free production lockfile audit against npm advisories                             | Always on non-draft pushes and PRs |
 | `security-fast`                  | Required aggregate for the fast security jobs                                                | Always on non-draft pushes and PRs |
-| `rust`                           | Rust MSRV format, clippy, and test gate for the SparseKernel crates                          | Rust-relevant changes              |
+| `rust`                           | Rust MSRV format, core package, clippy, and test gate for the SparseKernel crates            | Rust-relevant changes              |
 | `build-artifacts`                | Build `dist/`, Control UI, built-artifact checks, and reusable downstream artifacts          | Node-relevant changes              |
 | `checks-fast-core`               | Fast Linux correctness lanes such as bundled/plugin-contract/protocol checks                 | Node-relevant changes              |
 | `checks-fast-contracts-channels` | Sharded channel contract checks with a stable aggregate check result                         | Node-relevant changes              |

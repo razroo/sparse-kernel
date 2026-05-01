@@ -259,6 +259,23 @@ describe("scripts/changed-lanes", () => {
     });
   });
 
+  it("runs Cargo checks for Rust CI routing changes", () => {
+    const result = detectChangedLanes([".github/workflows/ci.yml", "scripts/ci-changed-scope.mjs"]);
+    const plan = createChangedCheckPlan(result);
+
+    expect(result.lanes).toMatchObject({
+      tooling: true,
+      rust: true,
+      all: false,
+    });
+    expect(plan.commands.map((command) => command.args?.[0] ?? command.name)).toContain(
+      "lint:scripts",
+    );
+    expect(plan.commands.map((command) => command.name)).toEqual(
+      expect.arrayContaining(["rust format", "rust lint", "rust tests"]),
+    );
+  });
+
   it("routes gitignore changes to tooling instead of all lanes", () => {
     const result = detectChangedLanes([".gitignore"]);
     const plan = createChangedCheckPlan(result);

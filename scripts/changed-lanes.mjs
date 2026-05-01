@@ -8,7 +8,8 @@ const DOCS_PATH_RE = /^(?:docs\/|README\.md$|AGENTS\.md$|.*\.mdx?$)/u;
 const APP_PATH_RE = /^(?:apps\/|Swabble\/|appcast\.xml$)/u;
 const EXTENSION_PATH_RE = /^extensions\/[^/]+(?:\/|$)/u;
 const CORE_PATH_RE = /^(?:src\/|ui\/|packages\/)/u;
-const RUST_PATH_RE = /^(?:Cargo\.toml$|Cargo\.lock$|crates\/)/u;
+const RUST_PATH_RE =
+  /^(?:Cargo\.toml$|Cargo\.lock$|crates\/|scripts\/ci-changed-scope(?:\.d\.mts|\.mjs)$|\.github\/workflows\/ci\.yml$)/u;
 const TOOLING_PATH_RE =
   /^(?:scripts\/|test\/vitest\/|\.github\/|git-hooks\/|vitest(?:\..+)?\.config\.ts$|tsconfig.*\.json$|\.gitignore$|\.oxlint.*|\.oxfmt.*)/u;
 const ROOT_GLOBAL_PATH_RE =
@@ -141,10 +142,13 @@ export function detectChangedLanes(changedPaths, options = {}) {
       continue;
     }
 
-    if (RUST_PATH_RE.test(changedPath)) {
+    const rustRelevantPath = RUST_PATH_RE.test(changedPath);
+    if (rustRelevantPath) {
       lanes.rust = true;
-      reasons.push(`${changedPath}: Rust workspace`);
-      continue;
+      reasons.push(`${changedPath}: Rust workspace/check routing`);
+      if (!TOOLING_PATH_RE.test(changedPath)) {
+        continue;
+      }
     }
 
     if (PUBLIC_EXTENSION_CONTRACT_RE.test(changedPath)) {

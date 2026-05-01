@@ -124,6 +124,18 @@ export function createChangedCheckPlan(result, options = {}) {
   if (lanes.tooling || lanes.liveDockerTooling) {
     addLint("lint scripts", ["lint:scripts"]);
   }
+  if (lanes.rust) {
+    addCommand("rust format", "cargo", ["fmt", "--all", "--check"]);
+    addCommand("rust lint", "cargo", [
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings",
+    ]);
+    addCommand("rust tests", "cargo", ["test", "--workspace"]);
+  }
   if (lanes.apps) {
     addLint("lint apps", ["lint:apps"]);
   }

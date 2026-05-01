@@ -228,6 +228,37 @@ describe("scripts/changed-lanes", () => {
     expect(plan.commands.map((command) => command.args[0])).not.toContain("test");
   });
 
+  it("routes Rust workspace changes through Cargo checks", () => {
+    const result = detectChangedLanes(["crates/sparsekernel-core/src/lib.rs", "Cargo.lock"]);
+    const plan = createChangedCheckPlan(result);
+
+    expect(result.lanes).toMatchObject({
+      rust: true,
+      all: false,
+    });
+    expect(result.extensionImpactFromCore).toBe(false);
+    expect(plan.commands.map((command) => command.name)).toEqual([
+      "conflict markers",
+      "changelog attributions",
+      "plugin-sdk wildcard re-exports",
+      "rust format",
+      "rust lint",
+      "rust tests",
+    ]);
+    expect(plan.commands.find((command) => command.name === "rust format")).toMatchObject({
+      bin: "cargo",
+      args: ["fmt", "--all", "--check"],
+    });
+    expect(plan.commands.find((command) => command.name === "rust lint")).toMatchObject({
+      bin: "cargo",
+      args: ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+    });
+    expect(plan.commands.find((command) => command.name === "rust tests")).toMatchObject({
+      bin: "cargo",
+      args: ["test", "--workspace"],
+    });
+  });
+
   it("routes gitignore changes to tooling instead of all lanes", () => {
     const result = detectChangedLanes([".gitignore"]);
     const plan = createChangedCheckPlan(result);
@@ -672,6 +703,7 @@ describe("scripts/changed-lanes", () => {
       apps: false,
       docs: false,
       tooling: false,
+      rust: false,
       liveDockerTooling: false,
       releaseMetadata: false,
       all: false,

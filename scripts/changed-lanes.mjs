@@ -8,6 +8,7 @@ const DOCS_PATH_RE = /^(?:docs\/|README\.md$|AGENTS\.md$|.*\.mdx?$)/u;
 const APP_PATH_RE = /^(?:apps\/|Swabble\/|appcast\.xml$)/u;
 const EXTENSION_PATH_RE = /^extensions\/[^/]+(?:\/|$)/u;
 const CORE_PATH_RE = /^(?:src\/|ui\/|packages\/)/u;
+const RUST_PATH_RE = /^(?:Cargo\.toml$|Cargo\.lock$|crates\/)/u;
 const TOOLING_PATH_RE =
   /^(?:scripts\/|test\/vitest\/|\.github\/|git-hooks\/|vitest(?:\..+)?\.config\.ts$|tsconfig.*\.json$|\.gitignore$|\.oxlint.*|\.oxfmt.*)/u;
 const ROOT_GLOBAL_PATH_RE =
@@ -33,7 +34,7 @@ export const RELEASE_METADATA_PATHS = new Set([
   "src/config/schema.base.generated.ts",
 ]);
 
-/** @typedef {"core" | "coreTests" | "extensions" | "extensionTests" | "apps" | "docs" | "tooling" | "liveDockerTooling" | "releaseMetadata" | "all"} ChangedLane */
+/** @typedef {"core" | "coreTests" | "extensions" | "extensionTests" | "apps" | "docs" | "tooling" | "rust" | "liveDockerTooling" | "releaseMetadata" | "all"} ChangedLane */
 
 /**
  * @typedef {{
@@ -61,6 +62,7 @@ export function createEmptyChangedLanes() {
     apps: false,
     docs: false,
     tooling: false,
+    rust: false,
     liveDockerTooling: false,
     releaseMetadata: false,
     all: false,
@@ -136,6 +138,12 @@ export function detectChangedLanes(changedPaths, options = {}) {
       lanes.all = true;
       extensionImpactFromCore = true;
       reasons.push(`${changedPath}: root config/package surface`);
+      continue;
+    }
+
+    if (RUST_PATH_RE.test(changedPath)) {
+      lanes.rust = true;
+      reasons.push(`${changedPath}: Rust workspace`);
       continue;
     }
 

@@ -715,6 +715,7 @@ function runHardEgressHelper(params: {
       `hard egress helper returned invalid JSON: ${
         error instanceof Error ? error.message : String(error)
       }`,
+      { cause: error },
     );
   }
   if (!isRecord(parsed) || parsed.ok !== true) {
@@ -1299,7 +1300,9 @@ export class LocalSandboxBroker implements SandboxBroker {
             ...(workerIdentity ? { workerIdentity } : {}),
           },
         });
-        throw new Error(`Sandbox requires host-level egress enforcement: ${reason}`);
+        throw new Error(`Sandbox requires host-level egress enforcement: ${reason}`, {
+          cause: error,
+        });
       }
       this.db.recordAudit({
         actor: request.agentId ? { type: "agent", id: request.agentId } : { type: "runtime" },

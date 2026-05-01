@@ -428,6 +428,7 @@ async function runDaemonPluginToolSubprocess(params: {
         `Plugin subprocess returned invalid JSON: ${
           err instanceof Error ? err.message : String(err)
         }`,
+        { cause: err },
       );
     }
   } finally {

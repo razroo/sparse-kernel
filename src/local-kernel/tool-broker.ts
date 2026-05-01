@@ -33,7 +33,13 @@ const DEFAULT_COMMAND_SANDBOX_BACKENDS: SandboxBackendKind[] = [
   "docker",
   "vm",
 ];
-const PLUGIN_SANDBOX_BACKENDS = new Set<SandboxBackendKind>([
+const DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKEND_SET = new Set<SandboxBackendKind>(
+  DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS,
+);
+const DEFAULT_COMMAND_SANDBOX_BACKEND_SET = new Set<SandboxBackendKind>(
+  DEFAULT_COMMAND_SANDBOX_BACKENDS,
+);
+const PLUGIN_SANDBOX_BACKENDS: ReadonlySet<string> = new Set<SandboxBackendKind>([
   "local/no_isolation",
   "docker",
   "bwrap",
@@ -285,7 +291,7 @@ export function resolvePluginSubprocessPlan(
 }
 
 function isPluginSandboxBackend(value: string): value is SandboxBackendKind {
-  return PLUGIN_SANDBOX_BACKENDS.has(value as SandboxBackendKind);
+  return PLUGIN_SANDBOX_BACKENDS.has(value);
 }
 
 function readPluginSandboxBackend(
@@ -327,10 +333,7 @@ function isAutoSelectablePluginBackend(params: {
   if (params.requireIsolated && params.backend === "local/no_isolation") {
     return false;
   }
-  if (
-    params.requireIsolated &&
-    !DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKENDS.includes(params.backend)
-  ) {
+  if (params.requireIsolated && !DEFAULT_PLUGIN_ISOLATED_SANDBOX_BACKEND_SET.has(params.backend)) {
     return false;
   }
   if (params.backend === "docker" && !params.dockerImage) {
@@ -357,11 +360,10 @@ export function resolvePluginSandboxConfig(params: {
         params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_SANDBOX_BACKEND,
       "environment",
     );
-  const requireIsolated =
+  const requireIsolated = !(
     sandbox?.requireIsolated === false ||
     isTruthyToolFlag(params.env.OPENCLAW_RUNTIME_PLUGIN_ALLOW_NO_ISOLATION)
-      ? false
-      : true;
+  );
   const candidateBackends = readPluginSandboxBackendCandidates(
     params.env.OPENCLAW_RUNTIME_PLUGIN_SANDBOX_BACKENDS ??
       params.env.OPENCLAW_SPARSEKERNEL_PLUGIN_SANDBOX_BACKENDS,
@@ -429,7 +431,7 @@ function resolveCommandSandboxBackend(params: {
     params.env.OPENCLAW_RUNTIME_TOOL_SANDBOX_BACKENDS ??
       params.env.OPENCLAW_SPARSEKERNEL_TOOL_SANDBOX_BACKENDS,
   )) {
-    if (!DEFAULT_COMMAND_SANDBOX_BACKENDS.includes(backend)) {
+    if (!DEFAULT_COMMAND_SANDBOX_BACKEND_SET.has(backend)) {
       continue;
     }
     if (backend === "docker" && !dockerImage?.trim()) {
@@ -705,6 +707,7 @@ export class CapabilityToolBroker {
           `Plugin subprocess returned invalid JSON: ${
             error instanceof Error ? error.message : String(error)
           }`,
+          { cause: error },
         );
       }
     } catch (error) {

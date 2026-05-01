@@ -216,7 +216,7 @@ export async function sweepNativeBrowserProcesses(
 ): Promise<NativeBrowserPoolSweepResult> {
   const fetchImpl = input.fetchImpl ?? fetch;
   const stalePools: string[] = [];
-  for (const pool of [...pools.values()]) {
+  for (const pool of Array.from(pools.values())) {
     if (!input.includeActive && pool.refs > 0) {
       continue;
     }
@@ -234,8 +234,8 @@ export async function sweepNativeBrowserProcesses(
 }
 
 export function inspectNativeBrowserPools(): NativeBrowserPoolSnapshot[] {
-  return [...pools.values()]
-    .map((pool) => ({
+  return Array.from(pools.values(), (pool) => {
+    const snapshot: NativeBrowserPoolSnapshot = {
       key: pool.key,
       trustZoneId: pool.trustZoneId,
       profile: pool.profile,
@@ -244,12 +244,15 @@ export function inspectNativeBrowserPools(): NativeBrowserPoolSnapshot[] {
       maxContexts: pool.maxContexts,
       idleTimeoutMs: pool.idleTimeoutMs,
       exited: pool.exited,
-      ...(pool.proc.pid ? { pid: pool.proc.pid } : {}),
       userDataDir: pool.userDataDir,
       startedAt: pool.startedAt,
       lastActivityAt: pool.lastActivityAt,
-    }))
-    .toSorted((left, right) => left.key.localeCompare(right.key));
+    };
+    if (pool.proc.pid) {
+      snapshot.pid = pool.proc.pid;
+    }
+    return snapshot;
+  }).toSorted((left, right) => left.key.localeCompare(right.key));
 }
 
 export function inspectNativeBrowserPoolStats(): NativeBrowserPoolStatsSnapshot[] {

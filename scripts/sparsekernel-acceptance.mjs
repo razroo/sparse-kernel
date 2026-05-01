@@ -78,8 +78,10 @@ const runnable = selected.filter(
 );
 
 function tail(value) {
-  if (!value) return undefined;
-  return value.length <= 4000 ? value : value.slice(value.length - 4000);
+  if (!value) {
+    return undefined;
+  }
+  return value.length <= 4000 ? value : value.slice(-4000);
 }
 
 function runLane(lane) {

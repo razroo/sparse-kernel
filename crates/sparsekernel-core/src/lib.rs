@@ -1186,6 +1186,8 @@ impl SparseKernelDb {
         lease_seconds: i64,
     ) -> Result<Option<TaskRecord>> {
         let tx = self.conn.transaction()?;
+        let now = now_iso();
+        let mut global_budget_blocked = false;
         let selected: Option<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, kind FROM tasks WHERE status = 'queued' ORDER BY priority DESC, created_at ASC, id ASC",
@@ -1197,26 +1199,34 @@ impl SparseKernelDb {
             for row in rows {
                 let (id, kind) = row?;
                 if kinds.is_empty() || kinds.iter().any(|entry| entry == &kind) {
+                    if let Some(payload) = Self::task_claim_budget_denial(&tx, &kind, worker_id)? {
+                        let global_budget_denied = payload.get("budget").and_then(Value::as_str)
+                            == Some(task_budget_name(TaskBudgetKind::ActiveAgentSteps));
+                        tx.execute(
+                            "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+                             VALUES('worker', ?, 'task.claim_denied_resource_budget', 'task', ?, ?, ?)",
+                            params![worker_id, id, payload.to_string(), now],
+                        )?;
+                        if global_budget_denied {
+                            global_budget_blocked = true;
+                            break;
+                        }
+                        continue;
+                    }
                     found = Some((id, kind));
                     break;
                 }
             }
             found
         };
+        if global_budget_blocked {
+            tx.commit()?;
+            return Ok(None);
+        }
         let Some((id, kind)) = selected else {
             tx.commit()?;
             return Ok(None);
         };
-        let now = now_iso();
-        if let Some(payload) = Self::task_claim_budget_denial(&tx, &kind, worker_id)? {
-            tx.execute(
-                "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
-                 VALUES('worker', ?, 'task.claim_denied_resource_budget', 'task', ?, ?, ?)",
-                params![worker_id, id, payload.to_string(), now],
-            )?;
-            tx.commit()?;
-            return Ok(None);
-        }
         let lease_until = future_iso(lease_seconds.max(1));
         let updated = tx.execute(
             "UPDATE tasks
@@ -3709,7 +3719,7 @@ mod tests {
             agent_id: None,
             session_id: None,
             kind: "test.vitest".to_string(),
-            priority: 2,
+            priority: 3,
             idempotency_key: None,
             input: None,
         })
@@ -3719,6 +3729,16 @@ mod tests {
             agent_id: None,
             session_id: None,
             kind: "test.vitest".to_string(),
+            priority: 2,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("demo-c".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "demo".to_string(),
             priority: 1,
             idempotency_key: None,
             input: None,
@@ -3729,6 +3749,8 @@ mod tests {
             .claim_next_task("worker-b", &["test.vitest".to_string()], 60)
             .unwrap()
             .is_none());
+        let claimed = db.claim_next_task("worker-c", &[], 60).unwrap().unwrap();
+        assert_eq!(claimed.id, "demo-c");
         let latest = db.list_audit(10).unwrap();
         assert!(latest.iter().any(|entry| {
             entry.action == "task.claim_denied_resource_budget"

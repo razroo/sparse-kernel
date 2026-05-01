@@ -1424,30 +1424,38 @@ export class LocalKernelDatabase {
     return this.withTransaction(() => {
       const kinds = (input.kinds ?? []).map((kind) => kind.trim()).filter(Boolean);
       const whereKind = kinds.length > 0 ? ` AND kind IN (${kinds.map(() => "?").join(", ")})` : "";
-      const row = this.db
+      const rows = this.db
         .prepare(
           `SELECT * FROM tasks
            WHERE status = 'queued'${whereKind}
            ORDER BY priority DESC, created_at ASC, id ASC
-           LIMIT 1`,
+           `,
         )
-        .get(...(kinds as SQLInputValue[])) as TaskRow | undefined;
-      if (!row) {
-        return null;
-      }
-      const budgetDenial = this.resolveTaskClaimBudgetDenial({
-        kind: row.kind,
-        workerId: input.workerId,
-      });
-      if (budgetDenial) {
-        this.recordAudit({
-          actor: { type: "worker", id: input.workerId },
-          action: "task.claim_denied_resource_budget",
-          objectType: "task",
-          objectId: row.id,
-          payload: budgetDenial,
-          createdAt: now,
+        .all(...(kinds as SQLInputValue[])) as TaskRow[];
+      let row: TaskRow | undefined;
+      for (const candidate of rows) {
+        const budgetDenial = this.resolveTaskClaimBudgetDenial({
+          kind: candidate.kind,
+          workerId: input.workerId,
         });
+        if (budgetDenial) {
+          this.recordAudit({
+            actor: { type: "worker", id: input.workerId },
+            action: "task.claim_denied_resource_budget",
+            objectType: "task",
+            objectId: candidate.id,
+            payload: budgetDenial,
+            createdAt: now,
+          });
+          if (budgetDenial.budget === "active_agent_steps") {
+            return null;
+          }
+          continue;
+        }
+        row = candidate;
+        break;
+      }
+      if (!row) {
         return null;
       }
       const updated = changes(

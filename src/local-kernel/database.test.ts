@@ -176,13 +176,18 @@ describe("local runtime kernel database", () => {
   it("enforces active task budgets through atomic task claiming", () => {
     const db = openTempDb();
     db.setRuntimeInfo("resource_budget.test_jobs_max", "1");
-    db.enqueueTask({ id: "test-a", kind: "test.vitest", priority: 2 });
-    db.enqueueTask({ id: "test-b", kind: "test.vitest", priority: 1 });
+    db.enqueueTask({ id: "test-a", kind: "test.vitest", priority: 3 });
+    db.enqueueTask({ id: "test-b", kind: "test.vitest", priority: 2 });
+    db.enqueueTask({ id: "demo-c", kind: "demo", priority: 1 });
     expect(db.claimTask({ taskId: "test-a", workerId: "worker-a" })).toMatchObject({
       id: "test-a",
       status: "running",
     });
     expect(db.claimNextTask({ workerId: "worker-b", kinds: ["test.vitest"] })).toBeNull();
+    expect(db.claimNextTask({ workerId: "worker-c" })).toMatchObject({
+      id: "demo-c",
+      status: "running",
+    });
     expect(db.listAudit({ limit: 20 })).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

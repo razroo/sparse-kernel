@@ -865,7 +865,7 @@ impl SparseKernelDb {
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_key, channel, status, current_token_count, last_activity_at, created_at, updated_at
-             FROM sessions ORDER BY updated_at DESC LIMIT ?",
+             FROM sessions ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, id ASC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit.max(0)], session_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3451,6 +3451,40 @@ mod tests {
         assert_eq!(session.agent_id, "agent-a");
         assert_eq!(session.current_token_count, 42);
         assert_eq!(db.list_sessions(10).unwrap().len(), 1);
+        db.upsert_session(UpsertSessionInput {
+            id: "session-b".to_string(),
+            agent_id: "agent-a".to_string(),
+            session_key: Some("agent:agent-a:secondary".to_string()),
+            channel: Some("telegram".to_string()),
+            status: Some("active".to_string()),
+            current_token_count: Some(7),
+            last_activity_at: Some("2026-04-28T00:00:00Z".to_string()),
+        })
+        .unwrap();
+        db.upsert_session(UpsertSessionInput {
+            id: "session-c".to_string(),
+            agent_id: "agent-a".to_string(),
+            session_key: Some("agent:agent-a:tertiary".to_string()),
+            channel: Some("telegram".to_string()),
+            status: Some("active".to_string()),
+            current_token_count: Some(9),
+            last_activity_at: Some("2026-04-28T00:00:00Z".to_string()),
+        })
+        .unwrap();
+        let sessions: Vec<String> = db
+            .list_sessions(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(
+            sessions,
+            vec![
+                "session-b".to_string(),
+                "session-c".to_string(),
+                "session-a".to_string()
+            ]
+        );
         let first_event = db
             .append_transcript_event(AppendTranscriptEventInput {
                 session_id: "session-a".to_string(),

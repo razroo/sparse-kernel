@@ -1358,7 +1358,7 @@ impl SparseKernelDb {
         let task_ids: Vec<String> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM tasks WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until < ?")?;
+                .prepare("SELECT id FROM tasks WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until <= ?")?;
             let rows = stmt.query_map(params![now], |row| row.get(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -1370,9 +1370,22 @@ impl SparseKernelDb {
             self.record_task_event(id, "lease_expired", json!({}))?;
         }
         let resource_count = self.conn.execute(
-            "UPDATE resource_leases SET status = 'expired', updated_at = ? WHERE status = 'active' AND lease_until IS NOT NULL AND lease_until < ?",
+            "UPDATE resource_leases SET status = 'expired', updated_at = ? WHERE status = 'active' AND lease_until IS NOT NULL AND lease_until <= ?",
             params![now, now],
         )?;
+        if !task_ids.is_empty() || resource_count > 0 {
+            self.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "leases.expired_released".to_string(),
+                object_type: None,
+                object_id: None,
+                payload: Some(json!({
+                    "tasks": task_ids.len(),
+                    "resourceLeases": resource_count,
+                })),
+            })?;
+        }
         Ok((task_ids.len(), resource_count))
     }
 
@@ -3479,6 +3492,67 @@ mod tests {
         assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
         assert!(db.complete_task("task-b", "worker-b", None).unwrap());
         assert_eq!(db.get_task("task-b").unwrap().status, "completed");
+    }
+
+    #[test]
+    fn lease_expiration_includes_exact_deadlines_and_audits() {
+        let (_dir, mut db) = temp_db();
+        let now = "2026-04-29T00:00:00Z";
+        db.enqueue_task(EnqueueTaskInput {
+            id: Some("task-expired".to_string()),
+            agent_id: None,
+            session_id: None,
+            kind: "demo".to_string(),
+            priority: 1,
+            idempotency_key: None,
+            input: None,
+        })
+        .unwrap();
+        db.claim_task("task-expired", "worker-a", 60)
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET lease_until = ? WHERE id = ?",
+                params![now, "task-expired"],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO resource_leases(
+                    id, resource_type, resource_id, owner_task_id, trust_zone_id,
+                    status, lease_until, created_at, updated_at
+                 ) VALUES(?, 'sandbox', ?, ?, 'code_execution', 'active', ?, ?, ?)",
+                params![
+                    "lease-expired",
+                    "sandbox-expired",
+                    "task-expired",
+                    now,
+                    now,
+                    now
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(db.release_expired_leases(now).unwrap(), (1, 1));
+        let task = db.get_task("task-expired").unwrap();
+        assert_eq!(task.status, "queued");
+        assert_eq!(task.lease_until, None);
+        let resource_status: String = db
+            .conn
+            .query_row(
+                "SELECT status FROM resource_leases WHERE id = ?",
+                params!["lease-expired"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resource_status, "expired");
+        let audit = db.list_audit(1).unwrap().into_iter().next().unwrap();
+        assert_eq!(audit.action, "leases.expired_released");
+        assert_eq!(
+            audit.payload,
+            Some(json!({ "tasks": 1, "resourceLeases": 1 }))
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 type PackageJson = {
   name?: string;
@@ -152,7 +153,7 @@ export function syncPluginVersions(rootDir = resolve(".")) {
   };
 }
 
-if (import.meta.main) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const summary = syncPluginVersions();
   console.log(
     `Synced plugin versions to ${summary.targetVersion}. Updated: ${summary.updated.length}. Changelogged: ${summary.changelogged.length}. Skipped: ${summary.skipped.length}.`,

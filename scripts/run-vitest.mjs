@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { resolveLocalVitestEnv } from "./lib/vitest-local-scheduling.mjs";
 import { spawnPnpmRunner } from "./pnpm-runner.mjs";
 import {
@@ -288,6 +289,6 @@ function main(argv = process.argv.slice(2), env = process.env) {
   });
 }
 
-if (import.meta.main) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   main();
 }

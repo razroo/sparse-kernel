@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { appendUnreleasedChangelogEntry } from "../src/infra/changelog-unreleased.js";
 
 type SectionArg = "breaking" | "changes" | "fixes";
@@ -51,7 +52,7 @@ function parseArgs(argv: string[]): {
   };
 }
 
-if (import.meta.main) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const { changelogPath, section, entry } = parseArgs(process.argv.slice(2));
   const content = readFileSync(changelogPath, "utf8");
   const next = appendUnreleasedChangelogEntry(content, {

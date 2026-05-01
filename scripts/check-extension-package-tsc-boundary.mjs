@@ -13,6 +13,7 @@ import {
 import { createRequire } from "node:module";
 import os from "node:os";
 import path, { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -817,6 +818,6 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (import.meta.main) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   await main();
 }

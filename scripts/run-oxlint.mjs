@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   acquireLocalHeavyCheckLockSync,
   applyLocalOxlintPolicy,
@@ -197,6 +198,6 @@ export async function main(argv = process.argv.slice(2), runtimeEnv = process.en
   }
 }
 
-if (import.meta.main) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   await main();
 }

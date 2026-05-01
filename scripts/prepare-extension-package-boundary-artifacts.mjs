@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path, { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { isLocalCheckEnabled } from "./lib/local-heavy-check-runtime.mjs";
 
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -330,6 +331,6 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (import.meta.main) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   await main();
 }

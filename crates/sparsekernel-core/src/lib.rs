@@ -1006,7 +1006,7 @@ impl SparseKernelDb {
     pub fn list_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, kind, priority, status, lease_owner, lease_until, attempts, result_artifact_id, created_at, updated_at
-             FROM tasks ORDER BY created_at DESC LIMIT ?",
+             FROM tasks ORDER BY created_at DESC, id ASC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit.max(0)], task_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1188,7 +1188,7 @@ impl SparseKernelDb {
         let tx = self.conn.transaction()?;
         let selected: Option<(String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, kind FROM tasks WHERE status = 'queued' ORDER BY priority DESC, created_at ASC",
+                "SELECT id, kind FROM tasks WHERE status = 'queued' ORDER BY priority DESC, created_at ASC, id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -3556,6 +3556,39 @@ mod tests {
         assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
         assert!(db.complete_task("task-b", "worker-b", None).unwrap());
         assert_eq!(db.get_task("task-b").unwrap().status, "completed");
+    }
+
+    #[test]
+    fn task_claiming_breaks_equal_priority_timestamp_ties_by_id() {
+        let (_dir, mut db) = temp_db();
+        for id in ["task-b", "task-a"] {
+            db.enqueue_task(EnqueueTaskInput {
+                id: Some(id.to_string()),
+                agent_id: None,
+                session_id: None,
+                kind: "demo".to_string(),
+                priority: 5,
+                idempotency_key: None,
+                input: None,
+            })
+            .unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE tasks SET created_at = ?, updated_at = ? WHERE id IN ('task-a', 'task-b')",
+                params!["2026-04-29T00:00:00Z", "2026-04-29T00:00:00Z"],
+            )
+            .unwrap();
+
+        let listed: Vec<String> = db
+            .list_tasks(10)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(listed, vec!["task-a".to_string(), "task-b".to_string()]);
+        let claimed = db.claim_next_task("worker-a", &[], 60).unwrap().unwrap();
+        assert_eq!(claimed.id, "task-a");
     }
 
     #[test]

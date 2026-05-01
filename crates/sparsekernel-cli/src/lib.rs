@@ -5,11 +5,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sparsekernel_core::{
     probe_browser_endpoint, probe_sandbox_backends, AppendTranscriptEventInput, ArtifactStore,
-    AuditInput, BrowserBroker, CapabilityCheck, CompleteToolCallInput, CreateToolCallInput,
-    EnqueueTaskInput, GrantCapabilityInput, LedgerToolBroker, ListBrowserObservationsInput,
-    ListBrowserTargetsInput, LocalSandboxBroker, MockBrowserBroker, RecordBrowserObservationInput,
-    RecordBrowserTargetInput, ResourceBudgetUpdateInput, SandboxBroker, SparseKernelDb,
-    SparseKernelPaths, ToolBroker, UpsertSessionInput, SPARSEKERNEL_PROTOCOL_VERSION,
+    AuditInput, BrowserBroker, BrowserContextAcquireInput, CapabilityCheck, CompleteToolCallInput,
+    CreateToolCallInput, EnqueueTaskInput, GrantCapabilityInput, LedgerToolBroker,
+    ListBrowserObservationsInput, ListBrowserTargetsInput, LocalSandboxBroker, MockBrowserBroker,
+    RecordBrowserObservationInput, RecordBrowserTargetInput, ResourceBudgetUpdateInput,
+    SandboxBroker, SparseKernelDb, SparseKernelPaths, ToolBroker, UpsertSessionInput,
+    SPARSEKERNEL_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -317,6 +318,7 @@ struct AcquireBrowserContextRequest {
     trust_zone_id: String,
     max_contexts: Option<i64>,
     cdp_endpoint: Option<String>,
+    allowed_origins: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1497,12 +1499,15 @@ pub fn handle_api_request_with_daemon_state(
             ApiReply {
                 status_code: 200,
                 body: serde_json::to_value(broker.acquire_context(
-                    input.agent_id.as_deref(),
-                    input.session_id.as_deref(),
-                    input.task_id.as_deref(),
-                    &input.trust_zone_id,
-                    input.max_contexts.unwrap_or(2),
-                    input.cdp_endpoint.as_deref(),
+                    BrowserContextAcquireInput {
+                        agent_id: input.agent_id.as_deref(),
+                        session_id: input.session_id.as_deref(),
+                        task_id: input.task_id.as_deref(),
+                        trust_zone_id: &input.trust_zone_id,
+                        max_contexts: input.max_contexts.unwrap_or(2),
+                        cdp_endpoint: input.cdp_endpoint.as_deref(),
+                        allowed_origins: input.allowed_origins.as_ref(),
+                    },
                 )?)?,
             }
         }
@@ -2371,10 +2376,12 @@ mod tests {
                 "trust_zone_id": "public_web",
                 "max_contexts": 1,
                 "cdp_endpoint": "http://127.0.0.1:9222",
+                "allowed_origins": ["https://example.com"],
             }),
         );
         let context_id = context["id"].as_str().unwrap().to_string();
         assert_eq!(context["status"], "active");
+        assert_eq!(context["allowed_origins"][0], "https://example.com");
 
         let observed = json_call(
             &mut db,
@@ -2438,6 +2445,7 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(contexts.as_array().unwrap().len(), 1);
+        assert_eq!(contexts[0]["allowed_origins"][0], "https://example.com");
 
         let pools = handle_api_request(&mut db, "GET", "/browser/pools", &[])
             .unwrap()

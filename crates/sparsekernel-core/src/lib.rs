@@ -397,6 +397,7 @@ pub struct BrowserContextRecord {
     pub session_id: Option<String>,
     pub task_id: Option<String>,
     pub profile_mode: String,
+    pub allowed_origins: Option<Value>,
     pub status: String,
     pub created_at: String,
 }
@@ -1736,7 +1737,7 @@ impl SparseKernelDb {
 
     pub fn list_browser_contexts(&self, limit: i64) -> Result<Vec<BrowserContextRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, pool_id, agent_id, session_id, task_id, profile_mode, status, created_at
+            "SELECT id, pool_id, agent_id, session_id, task_id, profile_mode, allowed_origins_json, status, created_at
              FROM browser_contexts ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit.max(0)], browser_context_from_row)?;
@@ -2108,8 +2109,9 @@ fn browser_context_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Browser
         session_id: row.get(3)?,
         task_id: row.get(4)?,
         profile_mode: row.get(5)?,
-        status: row.get(6)?,
-        created_at: row.get(7)?,
+        allowed_origins: parse_json(row.get(6)?),
+        status: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -2715,14 +2717,19 @@ impl ToolBroker for LedgerToolBroker<'_> {
 pub trait BrowserBroker {
     fn acquire_context(
         &self,
-        agent_id: Option<&str>,
-        session_id: Option<&str>,
-        task_id: Option<&str>,
-        trust_zone_id: &str,
-        max_contexts: i64,
-        cdp_endpoint: Option<&str>,
+        input: BrowserContextAcquireInput<'_>,
     ) -> Result<BrowserContextRecord>;
     fn release_context(&self, context_id: &str) -> Result<bool>;
+}
+
+pub struct BrowserContextAcquireInput<'a> {
+    pub agent_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub trust_zone_id: &'a str,
+    pub max_contexts: i64,
+    pub cdp_endpoint: Option<&'a str>,
+    pub allowed_origins: Option<&'a Value>,
 }
 
 pub struct MockBrowserBroker<'a> {
@@ -2732,13 +2739,17 @@ pub struct MockBrowserBroker<'a> {
 impl BrowserBroker for MockBrowserBroker<'_> {
     fn acquire_context(
         &self,
-        agent_id: Option<&str>,
-        session_id: Option<&str>,
-        task_id: Option<&str>,
-        trust_zone_id: &str,
-        max_contexts: i64,
-        cdp_endpoint: Option<&str>,
+        input: BrowserContextAcquireInput<'_>,
     ) -> Result<BrowserContextRecord> {
+        let BrowserContextAcquireInput {
+            agent_id,
+            session_id,
+            task_id,
+            trust_zone_id,
+            max_contexts,
+            cdp_endpoint,
+            allowed_origins,
+        } = input;
         if let Some(endpoint) = cdp_endpoint {
             validate_browser_cdp_endpoint(endpoint)?;
         }
@@ -2815,9 +2826,17 @@ impl BrowserBroker for MockBrowserBroker<'_> {
         }
         let context_id = format!("browser_ctx_{}", Uuid::new_v4());
         self.db.conn.execute(
-            "INSERT INTO browser_contexts(id, pool_id, agent_id, session_id, task_id, profile_mode, status, created_at)
-             VALUES(?, ?, ?, ?, ?, 'ephemeral', 'active', ?)",
-            params![context_id, pool_id, agent_id, session_id, task_id, now],
+            "INSERT INTO browser_contexts(id, pool_id, agent_id, session_id, task_id, profile_mode, allowed_origins_json, status, created_at)
+             VALUES(?, ?, ?, ?, ?, 'ephemeral', ?, 'active', ?)",
+            params![
+                context_id,
+                pool_id,
+                agent_id,
+                session_id,
+                task_id,
+                json_text(allowed_origins),
+                now
+            ],
         )?;
         self.db.conn.execute(
             "INSERT INTO resource_leases(id, resource_type, resource_id, owner_task_id, owner_agent_id, trust_zone_id, status, created_at, updated_at)
@@ -2843,6 +2862,7 @@ impl BrowserBroker for MockBrowserBroker<'_> {
             session_id: session_id.map(str::to_string),
             task_id: task_id.map(str::to_string),
             profile_mode: "ephemeral".to_string(),
+            allowed_origins: allowed_origins.cloned(),
             status: "active".to_string(),
             created_at: now,
         })
@@ -3526,10 +3546,26 @@ mod tests {
         .unwrap();
         let broker = MockBrowserBroker { db: &db };
         assert!(broker
-            .acquire_context(Some("agent-a"), None, None, "public_web", 10, None)
+            .acquire_context(BrowserContextAcquireInput {
+                agent_id: Some("agent-a"),
+                session_id: None,
+                task_id: None,
+                trust_zone_id: "public_web",
+                max_contexts: 10,
+                cdp_endpoint: None,
+                allowed_origins: None,
+            })
             .is_ok());
         let denied = broker
-            .acquire_context(Some("agent-a"), None, None, "authenticated_web", 10, None)
+            .acquire_context(BrowserContextAcquireInput {
+                agent_id: Some("agent-a"),
+                session_id: None,
+                task_id: None,
+                trust_zone_id: "authenticated_web",
+                max_contexts: 10,
+                cdp_endpoint: None,
+                allowed_origins: None,
+            })
             .unwrap_err()
             .to_string();
         assert!(denied.contains("browser context budget exhausted"));
@@ -3768,14 +3804,15 @@ mod tests {
         .unwrap();
         let browser = MockBrowserBroker { db: &db };
         let context = browser
-            .acquire_context(
-                Some("main"),
-                None,
-                None,
-                "public_web",
-                1,
-                Some("http://127.0.0.1:9222"),
-            )
+            .acquire_context(BrowserContextAcquireInput {
+                agent_id: Some("main"),
+                session_id: None,
+                task_id: None,
+                trust_zone_id: "public_web",
+                max_contexts: 1,
+                cdp_endpoint: Some("http://127.0.0.1:9222"),
+                allowed_origins: None,
+            })
             .unwrap();
         let pools = db.list_browser_pools().unwrap();
         assert_eq!(pools[0].browser_kind, "cdp");
@@ -3784,7 +3821,15 @@ mod tests {
             Some("http://127.0.0.1:9222")
         );
         assert!(browser
-            .acquire_context(Some("main"), None, None, "public_web", 1, None)
+            .acquire_context(BrowserContextAcquireInput {
+                agent_id: Some("main"),
+                session_id: None,
+                task_id: None,
+                trust_zone_id: "public_web",
+                max_contexts: 1,
+                cdp_endpoint: None,
+                allowed_origins: None,
+            })
             .is_err());
         assert!(browser.release_context(&context.id).unwrap());
         let sandbox = LocalSandboxBroker { db: &db };

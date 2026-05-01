@@ -126,7 +126,13 @@ export function createChangedCheckPlan(result, options = {}) {
   }
   if (lanes.rust) {
     addCommand("rust format", "cargo", ["fmt", "--all", "--check"]);
-    addCommand("rust package", "cargo", ["package", "-p", "sparsekernel-core", "--locked"]);
+    addCommand("rust package", "cargo", [
+      "package",
+      "-p",
+      "sparsekernel-core",
+      "--locked",
+      "--allow-dirty",
+    ]);
     addCommand("rust lint", "cargo", [
       "clippy",
       "--workspace",

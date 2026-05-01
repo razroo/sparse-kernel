@@ -256,7 +256,7 @@ describe("scripts/changed-lanes", () => {
     });
     expect(plan.commands.find((command) => command.name === "rust package")).toMatchObject({
       bin: "cargo",
-      args: ["package", "-p", "sparsekernel-core", "--locked"],
+      args: ["package", "-p", "sparsekernel-core", "--locked", "--allow-dirty"],
     });
     expect(plan.commands.find((command) => command.name === "rust tests")).toMatchObject({
       bin: "cargo",

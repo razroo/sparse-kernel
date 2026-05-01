@@ -2196,7 +2196,6 @@ mod tests {
                 "resource_type": "tool",
                 "resource_id": "browser",
                 "action": "invoke",
-                "audit_denied": true,
             }),
         );
         assert_eq!(check["allowed"], true);
@@ -2216,6 +2215,23 @@ mod tests {
             json!({ "id": capability_id }),
         );
         assert_eq!(revoked["revoked"], true);
+
+        let denied = json_call(
+            &mut db,
+            "POST",
+            "/capabilities/check",
+            json!({
+                "subject_type": "agent",
+                "subject_id": "main",
+                "resource_type": "tool",
+                "resource_id": "browser",
+                "action": "invoke",
+            }),
+        );
+        assert_eq!(denied["allowed"], false);
+        let audit = db.list_audit(1).unwrap().into_iter().next().unwrap();
+        assert_eq!(audit.action, "capability.denied");
+        assert_eq!(audit.object_id.as_deref(), Some("browser"));
     }
 
     #[test]

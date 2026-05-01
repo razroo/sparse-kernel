@@ -88,6 +88,10 @@ fn parse_json(raw: Option<String>) -> Option<Value> {
     raw.and_then(|text| serde_json::from_str(&text).ok())
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn truthy_env_flag(name: &str) -> bool {
     matches!(
         env::var(name).ok().as_deref(),
@@ -387,6 +391,7 @@ pub struct CapabilityCheck {
     pub resource_id: Option<String>,
     pub action: String,
     pub context: Option<Value>,
+    #[serde(default = "default_true")]
     pub audit_denied: bool,
 }
 

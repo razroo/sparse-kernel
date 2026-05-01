@@ -9,6 +9,9 @@ import { resolveNpmRunner } from "./npm-runner.mjs";
 const TRANSIENT_TEMP_REMOVE_ERROR_CODES = new Set(["EBUSY", "ENOTEMPTY", "EPERM"]);
 const TEMP_REMOVE_RETRY_DELAYS_MS = [10, 25, 50];
 const TEMP_OWNER_FILE = "owner.json";
+const RUNTIME_DEPS_LOCK_DIR = ".openclaw-runtime-deps.lock";
+const RUNTIME_DEPS_LOCK_STALE_MS = 10 * 60_000;
+const RUNTIME_DEPS_OWNERLESS_LOCK_STALE_MS = 30_000;
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -979,6 +982,37 @@ function readRuntimeDepsTempOwner(tempDir) {
   }
 }
 
+function readRuntimeDepsLockOwner(lockDir) {
+  const ownerFilePath = path.join(lockDir, TEMP_OWNER_FILE);
+  let owner = null;
+  let ownerFileMtimeMs;
+  try {
+    ownerFileMtimeMs = fs.lstatSync(ownerFilePath).mtimeMs;
+  } catch {
+    // Missing or unreadable owner files are handled by ownerless stale-lock logic.
+  }
+  try {
+    const parsed = readJson(ownerFilePath);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      owner = parsed;
+    }
+  } catch {
+    // Invalid owner files are treated as ownerless after the grace window.
+  }
+  let lockDirMtimeMs;
+  try {
+    lockDirMtimeMs = fs.statSync(lockDir).mtimeMs;
+  } catch {
+    // The lock may disappear while another process is cleaning it.
+  }
+  return {
+    pid: typeof owner?.pid === "number" ? owner.pid : undefined,
+    createdAtMs: typeof owner?.createdAtMs === "number" ? owner.createdAtMs : undefined,
+    ownerFileMtimeMs,
+    lockDirMtimeMs,
+  };
+}
+
 function isLiveProcess(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
@@ -991,6 +1025,19 @@ function isLiveProcess(pid) {
   }
 }
 
+function latestFiniteMs(values) {
+  let latest;
+  for (const value of values) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      continue;
+    }
+    if (latest === undefined || value > latest) {
+      latest = value;
+    }
+  }
+  return latest;
+}
+
 function shouldRemoveRuntimeDepsTempDir(tempDir) {
   const owner = readRuntimeDepsTempOwner(tempDir);
   if (!owner || typeof owner.pid !== "number") {
@@ -999,14 +1046,35 @@ function shouldRemoveRuntimeDepsTempDir(tempDir) {
   return !isLiveProcess(owner.pid);
 }
 
+function shouldRemoveRuntimeDepsLockDir(lockDir, nowMs = Date.now()) {
+  const owner = readRuntimeDepsLockOwner(lockDir);
+  if (typeof owner.pid === "number") {
+    return !isLiveProcess(owner.pid);
+  }
+
+  if (typeof owner.createdAtMs === "number") {
+    return nowMs - owner.createdAtMs > RUNTIME_DEPS_LOCK_STALE_MS;
+  }
+
+  const ownerlessObservedAtMs = latestFiniteMs([owner.lockDirMtimeMs, owner.ownerFileMtimeMs]);
+  return (
+    typeof ownerlessObservedAtMs === "number" &&
+    nowMs - ownerlessObservedAtMs > RUNTIME_DEPS_OWNERLESS_LOCK_STALE_MS
+  );
+}
+
 function removeStaleRuntimeDepsTempDirs(pluginDir) {
   if (!fs.existsSync(pluginDir)) {
     return;
   }
   for (const entry of fs.readdirSync(pluginDir, { withFileTypes: true })) {
-    if (entry.name.startsWith(".openclaw-runtime-deps-")) {
+    if (entry.name.startsWith(".openclaw-runtime-deps-") || entry.name === RUNTIME_DEPS_LOCK_DIR) {
       const targetPath = path.join(pluginDir, entry.name);
-      if (!shouldRemoveRuntimeDepsTempDir(targetPath)) {
+      const shouldRemove =
+        entry.name === RUNTIME_DEPS_LOCK_DIR
+          ? shouldRemoveRuntimeDepsLockDir(targetPath)
+          : shouldRemoveRuntimeDepsTempDir(targetPath);
+      if (!shouldRemove) {
         continue;
       }
       for (let attempt = 0; attempt <= TEMP_REMOVE_RETRY_DELAYS_MS.length; attempt += 1) {

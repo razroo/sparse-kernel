@@ -226,6 +226,7 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
     openapiRouteKeys,
   );
   checkOpenApiOperationIds(errors, paths);
+  checkOpenApiJsonResponseSchemas(errors, paths);
 
   const schemas = openapi.components?.schemas;
   const schemaNames = new Set(
@@ -346,6 +347,45 @@ function operationIdFor(operation) {
   return typeof operation.operationId === "string" && operation.operationId.trim()
     ? operation.operationId
     : undefined;
+}
+
+function checkOpenApiJsonResponseSchemas(errors, paths) {
+  const missingResponseSchemas = collectOpenApiMissingJsonResponseSchemaRoutes(paths);
+  if (missingResponseSchemas.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel OpenAPI operations missing 200 JSON response schema",
+        missingResponseSchemas.toSorted(compareStrings),
+      ),
+    );
+  }
+}
+
+export function collectOpenApiMissingJsonResponseSchemaRoutes(paths) {
+  const routes = [];
+  for (const [routePath, operations] of Object.entries(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const [method, operation] of Object.entries(operations)) {
+      const schema = jsonResponseSchema(operation);
+      if (!schema) {
+        routes.push(`${method.toUpperCase()} ${routePath}`);
+      }
+    }
+  }
+  return routes;
+}
+
+function jsonResponseSchema(operation) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+    return undefined;
+  }
+  const schema = operation.responses?.["200"]?.content?.["application/json"]?.schema;
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return undefined;
+  }
+  return schema;
 }
 
 export function collectOpenApiRequestBodySchemaNames(paths) {

@@ -63,8 +63,24 @@ export function collectDaemonRoutes(source) {
   );
 }
 
+export function collectDaemonRouteKeys(source) {
+  return new Set(
+    [...source.matchAll(/\("(GET|POST|PUT|PATCH|DELETE)",\s*"([^"]+)"\)/gu)].map(
+      (match) => `${match[1]} ${match[2]}`,
+    ),
+  );
+}
+
 export function collectClientPaths(source) {
   return new Set([...source.matchAll(/["'](\/[a-zA-Z0-9][^"']*)["']/gu)].map((match) => match[1]));
+}
+
+export function collectClientRouteKeys(source) {
+  return new Set(
+    [...source.matchAll(/\b(getJson|postJson)<[^>]+>\("([^"]+)"/gu)].map(
+      (match) => `${methodForClientCall(match[1])} ${match[2]}`,
+    ),
+  );
 }
 
 export function collectClientTypeProperties(source, typeName) {
@@ -113,7 +129,10 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
 
   const openapiPaths = new Set(Object.keys(paths));
   const daemonRoutes = collectDaemonRoutes(daemonSource);
+  const daemonRouteKeys = collectDaemonRouteKeys(daemonSource);
   const clientPaths = collectClientPaths(clientSource);
+  const clientRouteKeys = collectClientRouteKeys(clientSource);
+  const openapiRouteKeys = collectOpenApiRouteKeys(paths);
 
   pushSetDiff(
     errors,
@@ -128,6 +147,24 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
     daemonRoutes,
   );
   pushSetDiff(errors, "Client paths missing from SparseKernel OpenAPI", clientPaths, openapiPaths);
+  pushSetDiff(
+    errors,
+    "Daemon route methods missing from SparseKernel OpenAPI",
+    daemonRouteKeys,
+    openapiRouteKeys,
+  );
+  pushSetDiff(
+    errors,
+    "SparseKernel OpenAPI route methods without daemon route literals",
+    openapiRouteKeys,
+    daemonRouteKeys,
+  );
+  pushSetDiff(
+    errors,
+    "Client route methods missing from SparseKernel OpenAPI",
+    clientRouteKeys,
+    openapiRouteKeys,
+  );
 
   const schemas = openapi.components?.schemas;
   const schemaNames = new Set(
@@ -148,11 +185,31 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
     errors,
     counts: {
       daemonRoutes: daemonRoutes.size,
+      daemonRouteMethods: daemonRouteKeys.size,
       clientPaths: clientPaths.size,
+      clientRouteMethods: clientRouteKeys.size,
       openapiPaths: openapiPaths.size,
+      openapiRouteMethods: openapiRouteKeys.size,
       schemaRefs: collectSchemaRefs(openapi).size,
     },
   };
+}
+
+function collectOpenApiRouteKeys(paths) {
+  const routeKeys = new Set();
+  for (const [routePath, operations] of Object.entries(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const method of Object.keys(operations)) {
+      routeKeys.add(`${method.toUpperCase()} ${routePath}`);
+    }
+  }
+  return routeKeys;
+}
+
+function methodForClientCall(callName) {
+  return callName === "getJson" ? "GET" : "POST";
 }
 
 function checkClientSchemaProperties(errors, clientSource, schemas) {

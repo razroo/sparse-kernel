@@ -224,11 +224,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [session_id]
-              properties:
-                session_id: { type: string }
-                limit: { type: integer }
+              $ref: "#/components/schemas/ListTranscriptEventsInput"
       responses:
         "200":
           description: Session transcript events
@@ -483,10 +479,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [context_id]
-              properties:
-                context_id: { type: string }
+              $ref: "#/components/schemas/ReleaseBrowserContextInput"
       responses:
         "200":
           description: Release result
@@ -614,10 +607,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [allocation_id]
-              properties:
-                allocation_id: { type: string }
+              $ref: "#/components/schemas/ReleaseSandboxInput"
       responses:
         "200":
           description: Release result
@@ -649,9 +639,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                now: { type: string }
+              $ref: "#/components/schemas/ReleaseExpiredLeasesInput"
       responses:
         "200":
           description: Expired lease release counts
@@ -702,10 +690,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [id]
-              properties:
-                id: { type: string }
+              $ref: "#/components/schemas/CapabilityIdInput"
       responses:
         "200":
           description: Revoke result
@@ -724,11 +709,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [subject_type, subject_id]
-              properties:
-                subject_type: { type: string }
-                subject_id: { type: string }
+              $ref: "#/components/schemas/ListCapabilitiesInput"
       responses:
         "200":
           description: Subject capabilities
@@ -1049,6 +1030,12 @@ components:
         tool_call_id: { type: [string, "null"] }
         token_count: { type: [integer, "null"] }
         created_at: { type: [string, "null"] }
+    ListTranscriptEventsInput:
+      type: object
+      required: [session_id]
+      properties:
+        session_id: { type: string }
+        limit: { type: integer }
     ToolCall:
       type: object
       required: [id, tool_name, status, created_at]
@@ -1200,6 +1187,11 @@ components:
         max_contexts: { type: integer }
         cdp_endpoint: { type: [string, "null"] }
         allowed_origins: true
+    ReleaseBrowserContextInput:
+      type: object
+      required: [context_id]
+      properties:
+        context_id: { type: string }
     BrowserObservationInput:
       type: object
       required: [context_id, observation_type]
@@ -1253,6 +1245,10 @@ components:
       properties:
         tasks: { type: integer }
         resources: { type: integer }
+    ReleaseExpiredLeasesInput:
+      type: object
+      properties:
+        now: { type: string }
     SandboxAllocation:
       type: object
       required: [id, trust_zone_id, backend, status, created_at]
@@ -1290,6 +1286,11 @@ components:
         docker_image: { type: [string, "null"] }
         max_runtime_ms: { type: [integer, "null"] }
         max_bytes_out: { type: [integer, "null"] }
+    ReleaseSandboxInput:
+      type: object
+      required: [allocation_id]
+      properties:
+        allocation_id: { type: string }
     Capability:
       type: object
       required: [id, subject_type, subject_id, resource_type, action, created_at]
@@ -1325,6 +1326,17 @@ components:
         action: { type: string }
         context: true
         audit_denied: { type: boolean }
+    CapabilityIdInput:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+    ListCapabilitiesInput:
+      type: object
+      required: [subject_type, subject_id]
+      properties:
+        subject_type: { type: string }
+        subject_id: { type: string }
     Artifact:
       type: object
       required: [id, sha256, size_bytes, storage_ref, created_at]

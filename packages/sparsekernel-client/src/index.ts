@@ -149,6 +149,11 @@ export type SparseKernelAppendTranscriptEventInput = {
   created_at?: string | null;
 };
 
+export type SparseKernelListTranscriptEventsInput = {
+  session_id: string;
+  limit?: number;
+};
+
 export type SparseKernelToolCall = {
   id: string;
   task_id?: string | null;
@@ -300,6 +305,10 @@ export type SparseKernelAcquireBrowserContextInput = {
   allowed_origins?: unknown;
 };
 
+export type SparseKernelReleaseBrowserContextInput = {
+  context_id: string;
+};
+
 export type SparseKernelBrowserObservationInput = {
   context_id: string;
   target_id?: string | null;
@@ -425,6 +434,10 @@ export type SparseKernelAllocateSandboxInput = {
   max_bytes_out?: number | null;
 };
 
+export type SparseKernelReleaseSandboxInput = {
+  allocation_id: string;
+};
+
 export type SparseKernelCreateToolCallInput = {
   id?: string;
   task_id?: string | null;
@@ -438,6 +451,15 @@ export type SparseKernelCompleteToolCallInput = {
   id: string;
   output?: unknown;
   artifact_ids?: string[];
+};
+
+export type SparseKernelToolCallIdInput = {
+  id: string;
+};
+
+export type SparseKernelFailToolCallInput = {
+  id: string;
+  error: string;
 };
 
 export type SparseKernelCapability = {
@@ -470,6 +492,15 @@ export type SparseKernelCapabilityCheckInput = {
   action: string;
   context?: unknown;
   audit_denied?: boolean;
+};
+
+export type SparseKernelCapabilityIdInput = {
+  id: string;
+};
+
+export type SparseKernelListCapabilitiesInput = {
+  subject_type: string;
+  subject_id: string;
 };
 
 function protocolMajor(version: string): string {
@@ -578,10 +609,9 @@ export class SparseKernelClient {
     return await this.postJson<SparseKernelTranscriptEvent>("/transcript-events/append", input);
   }
 
-  async transcriptEvents(input: {
-    session_id: string;
-    limit?: number;
-  }): Promise<SparseKernelTranscriptEvent[]> {
+  async transcriptEvents(
+    input: SparseKernelListTranscriptEventsInput,
+  ): Promise<SparseKernelTranscriptEvent[]> {
     return await this.postJson<SparseKernelTranscriptEvent[]>("/transcript-events/list", input);
   }
 
@@ -643,9 +673,10 @@ export class SparseKernelClient {
   }
 
   async releaseBrowserContext(contextId: string): Promise<boolean> {
-    const response = await this.postJson<{ released: boolean }>("/browser/contexts/release", {
+    const input: SparseKernelReleaseBrowserContextInput = {
       context_id: contextId,
-    });
+    };
+    const response = await this.postJson<{ released: boolean }>("/browser/contexts/release", input);
     return response.released;
   }
 
@@ -723,9 +754,10 @@ export class SparseKernelClient {
   }
 
   async releaseSandbox(allocationId: string): Promise<boolean> {
-    const response = await this.postJson<{ released: boolean }>("/sandbox/release", {
+    const input: SparseKernelReleaseSandboxInput = {
       allocation_id: allocationId,
-    });
+    };
+    const response = await this.postJson<{ released: boolean }>("/sandbox/release", input);
     return response.released;
   }
 
@@ -738,7 +770,8 @@ export class SparseKernelClient {
   }
 
   async startToolCall(id: string): Promise<SparseKernelToolCall> {
-    return await this.postJson<SparseKernelToolCall>("/tool-calls/start", { id });
+    const input: SparseKernelToolCallIdInput = { id };
+    return await this.postJson<SparseKernelToolCall>("/tool-calls/start", input);
   }
 
   async completeToolCall(input: SparseKernelCompleteToolCallInput): Promise<SparseKernelToolCall> {
@@ -746,7 +779,8 @@ export class SparseKernelClient {
   }
 
   async failToolCall(id: string, error: string): Promise<SparseKernelToolCall> {
-    return await this.postJson<SparseKernelToolCall>("/tool-calls/fail", { id, error });
+    const input: SparseKernelFailToolCallInput = { id, error };
+    return await this.postJson<SparseKernelToolCall>("/tool-calls/fail", input);
   }
 
   async grantCapability(input: SparseKernelGrantCapabilityInput): Promise<SparseKernelCapability> {
@@ -759,14 +793,14 @@ export class SparseKernelClient {
   }
 
   async revokeCapability(id: string): Promise<boolean> {
-    const response = await this.postJson<{ revoked: boolean }>("/capabilities/revoke", { id });
+    const input: SparseKernelCapabilityIdInput = { id };
+    const response = await this.postJson<{ revoked: boolean }>("/capabilities/revoke", input);
     return response.revoked;
   }
 
-  async listCapabilities(subject: {
-    subject_type: string;
-    subject_id: string;
-  }): Promise<SparseKernelCapability[]> {
+  async listCapabilities(
+    subject: SparseKernelListCapabilitiesInput,
+  ): Promise<SparseKernelCapability[]> {
     return await this.postJson<SparseKernelCapability[]>("/capabilities/list", subject);
   }
 

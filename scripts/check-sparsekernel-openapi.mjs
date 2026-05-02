@@ -7,6 +7,7 @@ const DAEMON_PATH = "crates/sparsekernel-cli/src/lib.rs";
 const CLIENT_PATH = "packages/sparsekernel-client/src/index.ts";
 const CLIENT_SCHEMA_MAPPINGS = [
   mapping("SparseKernelResourceBudgets", "RuntimeResourceBudgets"),
+  mapping("SparseKernelResourceBudgetUpdateInput", "RuntimeResourceBudgetUpdateInput"),
   mapping("SparseKernelNetworkPolicy", "NetworkPolicy"),
   mapping("SparseKernelTrustZoneInput", "TrustZoneInput"),
   mapping("SparseKernelTrustZoneProxyAttachment", "TrustZoneProxyAttachment"),

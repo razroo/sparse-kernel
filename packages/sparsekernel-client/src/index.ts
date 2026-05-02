@@ -30,7 +30,17 @@ export type SparseKernelResourceBudgets = {
   heavy_sandboxes_max: number;
 };
 
-export type SparseKernelResourceBudgetUpdate = Partial<SparseKernelResourceBudgets>;
+export type SparseKernelResourceBudgetUpdateInput = {
+  logical_agents_max?: number;
+  active_agent_steps_max?: number;
+  model_calls_in_flight_max?: number;
+  file_patch_jobs_max?: number;
+  test_jobs_max?: number;
+  browser_contexts_max?: number;
+  heavy_sandboxes_max?: number;
+};
+
+export type SparseKernelResourceBudgetUpdate = SparseKernelResourceBudgetUpdateInput;
 
 export type SparseKernelNetworkDefaultAction = "allow" | "deny" | (string & {});
 export type SparseKernelArtifactRetentionPolicy =
@@ -552,7 +562,7 @@ export class SparseKernelClient {
   }
 
   async updateResourceBudgets(
-    input: SparseKernelResourceBudgetUpdate,
+    input: SparseKernelResourceBudgetUpdateInput,
   ): Promise<SparseKernelResourceBudgets> {
     return await this.postJson<SparseKernelResourceBudgets>("/runtime/budgets/update", input);
   }

@@ -2434,6 +2434,13 @@ mod tests {
         let context_id = context["id"].as_str().unwrap().to_string();
         assert_eq!(context["status"], "active");
         assert_eq!(context["allowed_origins"][0], "https://example.com");
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "browser_context.acquired");
+        assert_eq!(audit[0].object_id.as_deref(), Some(context_id.as_str()));
+        assert_eq!(
+            audit[0].payload.as_ref().unwrap()["trustZoneId"],
+            "public_web"
+        );
 
         let observed = json_call(
             &mut db,
@@ -2514,6 +2521,9 @@ mod tests {
             json!({ "context_id": context_id }),
         );
         assert_eq!(released["released"], true);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "browser_context.released");
+        assert_eq!(audit[0].object_id.as_deref(), Some(context_id.as_str()));
         let contexts = handle_api_request(&mut db, "GET", "/browser/contexts", &[])
             .unwrap()
             .body;
@@ -2564,6 +2574,13 @@ mod tests {
         assert_eq!(allocation["max_runtime_ms"], 2500);
         assert_eq!(allocation["max_bytes_out"], 16384);
         assert!(allocation["lease_until"].as_str().is_some());
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "sandbox.allocated");
+        assert_eq!(audit[0].object_id.as_deref(), Some(allocation_id.as_str()));
+        assert_eq!(
+            audit[0].payload.as_ref().unwrap()["trustZoneId"],
+            "code_execution"
+        );
 
         let released = json_call(
             &mut db,
@@ -2572,6 +2589,9 @@ mod tests {
             json!({ "allocation_id": allocation_id }),
         );
         assert_eq!(released["released"], true);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "sandbox.released");
+        assert_eq!(audit[0].object_id.as_deref(), Some(allocation_id.as_str()));
     }
 
     #[test]

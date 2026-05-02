@@ -60,6 +60,7 @@ export type SparseKernelSupervisedEgressProxy = {
   trust_zone_id: string;
   proxy_ref: string;
   pid?: number;
+  mode?: string | null;
   already_running?: boolean;
   stopped?: boolean;
 };

@@ -137,7 +137,20 @@ describe("SparseKernelClient protocol compatibility", () => {
         ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
       });
       if (url.pathname === "/egress-proxies") {
-        return Response.json([]);
+        return Response.json([
+          {
+            trust_zone_id: "public_web",
+            proxy_ref: "http://127.0.0.1:18080/",
+            mode: "builtin",
+          },
+        ]);
+      }
+      if (url.pathname.startsWith("/egress-proxies/")) {
+        return Response.json({
+          trust_zone_id: "public_web",
+          proxy_ref: "http://127.0.0.1:18080/",
+          mode: "builtin",
+        });
       }
       return Response.json({
         trust_zone_id: "public_web",
@@ -151,9 +164,15 @@ describe("SparseKernelClient protocol compatibility", () => {
       trust_zone_id: "public_web",
       proxy_ref: "http://127.0.0.1:18080/",
     });
-    await client.startEgressProxy({ trust_zone_id: "public_web", port: 18080 });
-    await client.egressProxies();
-    await client.stopEgressProxy({ trust_zone_id: "public_web", clear_proxy_ref: true });
+    await expect(
+      client.startEgressProxy({ trust_zone_id: "public_web", port: 18080 }),
+    ).resolves.toMatchObject({ mode: "builtin" });
+    await expect(client.egressProxies()).resolves.toEqual([
+      expect.objectContaining({ mode: "builtin" }),
+    ]);
+    await expect(
+      client.stopEgressProxy({ trust_zone_id: "public_web", clear_proxy_ref: true }),
+    ).resolves.toMatchObject({ mode: "builtin" });
 
     expect(requests.map((request) => request.path)).toEqual([
       "/trust-zones/proxy-ref",

@@ -240,13 +240,10 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
   }
 
   const mappedSchemaNames = new Set(CLIENT_SCHEMA_MAPPINGS.map((item) => item.schemaName));
-  const referencedSchemaNames = [...collectSchemaRefs(openapi)]
-    .filter((ref) => ref.startsWith("#/components/schemas/"))
-    .map((ref) => ref.slice("#/components/schemas/".length));
   pushSetDiff(
     errors,
     "SparseKernel OpenAPI referenced schemas missing client parity mapping",
-    new Set(referencedSchemaNames),
+    collectOpenApiReferencedSchemaNames(openapi),
     mappedSchemaNames,
   );
 
@@ -309,6 +306,14 @@ export function collectOpenApiRequestBodySchemaNames(paths) {
     }
   }
   return schemaNames;
+}
+
+export function collectOpenApiReferencedSchemaNames(openapi) {
+  return new Set(
+    [...collectSchemaRefs(openapi)]
+      .filter((ref) => ref.startsWith("#/components/schemas/"))
+      .map((ref) => ref.slice("#/components/schemas/".length)),
+  );
 }
 
 export function collectOpenApiInlineRequestBodyRoutes(paths) {

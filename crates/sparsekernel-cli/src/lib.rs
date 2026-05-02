@@ -2202,6 +2202,21 @@ mod tests {
         );
         assert!(empty_claim.is_null());
 
+        let heartbeat = json_call(
+            &mut db,
+            "POST",
+            "/tasks/heartbeat",
+            json!({ "task_id": task_id, "worker_id": "worker-a", "lease_seconds": 120 }),
+        );
+        assert_eq!(heartbeat["ok"], true);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "task.heartbeat");
+        assert_eq!(audit[0].actor_id.as_deref(), Some("worker-a"));
+        assert_eq!(audit[0].object_id.as_deref(), Some(task_id.as_str()));
+        assert!(audit[0].payload.as_ref().unwrap()["leaseUntil"]
+            .as_str()
+            .is_some());
+
         let completed = json_call(
             &mut db,
             "POST",

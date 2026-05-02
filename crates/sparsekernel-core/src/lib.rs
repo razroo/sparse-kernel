@@ -1343,11 +1343,27 @@ impl SparseKernelDb {
         worker_id: &str,
         lease_seconds: i64,
     ) -> Result<bool> {
+        let now = now_iso();
         let lease_until = future_iso(lease_seconds.max(1));
         let updated = self.conn.execute(
             "UPDATE tasks SET lease_until = ?, updated_at = ? WHERE id = ? AND status = 'running' AND lease_owner = ?",
-            params![lease_until, now_iso(), task_id, worker_id],
+            params![lease_until, now, task_id, worker_id],
         )?;
+        if updated > 0 {
+            self.record_task_event(
+                task_id,
+                "heartbeat",
+                json!({ "workerId": worker_id, "leaseUntil": lease_until }),
+            )?;
+            self.record_audit(AuditInput {
+                actor_type: Some("worker".to_string()),
+                actor_id: Some(worker_id.to_string()),
+                action: "task.heartbeat".to_string(),
+                object_type: Some("task".to_string()),
+                object_id: Some(task_id.to_string()),
+                payload: Some(json!({ "leaseUntil": lease_until })),
+            })?;
+        }
         Ok(updated > 0)
     }
 

@@ -198,6 +198,7 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
   const clientPaths = collectClientPaths(clientSource);
   const clientRouteKeys = collectClientRouteKeys(clientSource);
   const openapiRouteKeys = collectOpenApiRouteKeys(paths);
+  checkClientSchemaMappingUniqueness(errors, CLIENT_SCHEMA_MAPPINGS);
 
   pushSetDiff(
     errors,
@@ -572,6 +573,48 @@ function checkClientSchemaProperties(errors, clientSource, schemas) {
       filteredClientRequiredProperties,
     );
   }
+}
+
+function checkClientSchemaMappingUniqueness(errors, mappings) {
+  const { duplicateClientTypes, duplicateSchemaNames } =
+    collectClientSchemaMappingProblems(mappings);
+  if (duplicateClientTypes.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel client parity mappings duplicate client types",
+        duplicateClientTypes,
+      ),
+    );
+  }
+  if (duplicateSchemaNames.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel client parity mappings duplicate schema names",
+        duplicateSchemaNames,
+      ),
+    );
+  }
+}
+
+export function collectClientSchemaMappingProblems(mappings) {
+  return {
+    duplicateClientTypes: collectDuplicateMappingValues(mappings, "clientType"),
+    duplicateSchemaNames: collectDuplicateMappingValues(mappings, "schemaName"),
+  };
+}
+
+function collectDuplicateMappingValues(mappings, key) {
+  const firstSeen = new Set();
+  const duplicates = new Set();
+  for (const item of mappings) {
+    const value = item[key];
+    if (firstSeen.has(value)) {
+      duplicates.add(value);
+      continue;
+    }
+    firstSeen.add(value);
+  }
+  return [...duplicates].toSorted(compareStrings);
 }
 
 function schemaPropertiesFor(schemas, schemaName) {

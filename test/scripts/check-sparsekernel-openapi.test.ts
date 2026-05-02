@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  collectClientSchemaMappingProblems,
   collectOpenApiInlineArrayResponseItemRoutes,
   collectOpenApiInlineObjectResponseSchemaRoutes,
   collectOpenApiInlineRequestBodyRoutes,
@@ -10,6 +11,20 @@ import {
 } from "../../scripts/check-sparsekernel-openapi.mjs";
 
 describe("scripts/check-sparsekernel-openapi", () => {
+  it("finds duplicate client parity mappings", () => {
+    expect(
+      collectClientSchemaMappingProblems([
+        { clientType: "SparseKernelTask", schemaName: "Task" },
+        { clientType: "SparseKernelSession", schemaName: "Session" },
+        { clientType: "SparseKernelTask", schemaName: "TaskInput" },
+        { clientType: "SparseKernelTaskInput", schemaName: "Task" },
+      ]),
+    ).toEqual({
+      duplicateClientTypes: ["SparseKernelTask"],
+      duplicateSchemaNames: ["Task"],
+    });
+  });
+
   it("collects component-backed request body schema names", () => {
     const paths = {
       "/tasks/enqueue": {

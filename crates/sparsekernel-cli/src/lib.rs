@@ -2077,6 +2077,13 @@ mod tests {
         );
         assert_eq!(attached["network_policy_id"], "public_web_default");
         assert_eq!(attached["proxy_ref"], "http://127.0.0.1:18080/");
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "network_policy.proxy_ref_attached");
+        assert_eq!(audit[0].object_id.as_deref(), Some("public_web"));
+        assert_eq!(
+            audit[0].payload.as_ref().unwrap()["proxyRef"],
+            "http://127.0.0.1:18080/"
+        );
 
         let policy = json_call(
             &mut db,
@@ -2085,6 +2092,21 @@ mod tests {
             json!({ "trust_zone_id": "public_web" }),
         );
         assert_eq!(policy["proxy_ref"], "http://127.0.0.1:18080/");
+
+        let cleared = json_call(
+            &mut db,
+            "POST",
+            "/trust-zones/proxy-ref",
+            json!({
+                "trust_zone_id": "public_web",
+                "proxy_ref": null,
+            }),
+        );
+        assert!(cleared["proxy_ref"].is_null());
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "network_policy.proxy_ref_cleared");
+        assert_eq!(audit[0].object_id.as_deref(), Some("public_web"));
+        assert!(audit[0].payload.as_ref().unwrap()["proxyRef"].is_null());
     }
 
     #[test]

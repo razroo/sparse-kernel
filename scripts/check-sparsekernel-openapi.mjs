@@ -6,6 +6,7 @@ const OPENAPI_PATH = "schemas/sparsekernel.openapi.yaml";
 const DAEMON_PATH = "crates/sparsekernel-cli/src/lib.rs";
 const CLIENT_PATH = "packages/sparsekernel-client/src/index.ts";
 const CLIENT_SCHEMA_MAPPINGS = [
+  mapping("SparseKernelBooleanResult", "BooleanResult"),
   mapping("SparseKernelResourceBudgets", "RuntimeResourceBudgets"),
   mapping("SparseKernelResourceBudgetUpdateInput", "RuntimeResourceBudgetUpdateInput"),
   mapping("SparseKernelNetworkPolicy", "NetworkPolicy"),
@@ -238,6 +239,17 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
     errors.push(formatList("Unresolved SparseKernel OpenAPI schema refs", unresolvedSchemaRefs));
   }
 
+  const mappedSchemaNames = new Set(CLIENT_SCHEMA_MAPPINGS.map((item) => item.schemaName));
+  const referencedSchemaNames = [...collectSchemaRefs(openapi)]
+    .filter((ref) => ref.startsWith("#/components/schemas/"))
+    .map((ref) => ref.slice("#/components/schemas/".length));
+  pushSetDiff(
+    errors,
+    "SparseKernel OpenAPI referenced schemas missing client parity mapping",
+    new Set(referencedSchemaNames),
+    mappedSchemaNames,
+  );
+
   const inlineRequestBodies = collectOpenApiInlineRequestBodyRoutes(paths);
   if (inlineRequestBodies.size > 0) {
     errors.push(
@@ -247,7 +259,6 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
       ),
     );
   }
-  const mappedSchemaNames = new Set(CLIENT_SCHEMA_MAPPINGS.map((item) => item.schemaName));
   pushSetDiff(
     errors,
     "SparseKernel OpenAPI request body schemas missing client parity mapping",

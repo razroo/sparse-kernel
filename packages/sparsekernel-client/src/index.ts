@@ -20,6 +20,10 @@ export type SparseKernelInspect = {
   counts: Record<string, number>;
 };
 
+export type SparseKernelBooleanResult = {
+  ok: boolean;
+};
+
 export type SparseKernelResourceBudgets = {
   logical_agents_max: number;
   active_agent_steps_max: number;
@@ -691,7 +695,7 @@ export class SparseKernelClient {
   }
 
   async recordBrowserObservation(input: SparseKernelBrowserObservationInput): Promise<void> {
-    await this.postJson<{ ok: boolean }>("/browser/contexts/observe", input);
+    await this.postJson<SparseKernelBooleanResult>("/browser/contexts/observe", input);
   }
 
   async recordBrowserTarget(
@@ -734,17 +738,17 @@ export class SparseKernelClient {
   }
 
   async heartbeatTask(input: SparseKernelHeartbeatTaskInput): Promise<boolean> {
-    const response = await this.postJson<{ ok: boolean }>("/tasks/heartbeat", input);
+    const response = await this.postJson<SparseKernelBooleanResult>("/tasks/heartbeat", input);
     return response.ok;
   }
 
   async completeTask(input: SparseKernelCompleteTaskInput): Promise<boolean> {
-    const response = await this.postJson<{ ok: boolean }>("/tasks/complete", input);
+    const response = await this.postJson<SparseKernelBooleanResult>("/tasks/complete", input);
     return response.ok;
   }
 
   async failTask(input: SparseKernelFailTaskInput): Promise<boolean> {
-    const response = await this.postJson<{ ok: boolean }>("/tasks/fail", input);
+    const response = await this.postJson<SparseKernelBooleanResult>("/tasks/fail", input);
     return response.ok;
   }
 

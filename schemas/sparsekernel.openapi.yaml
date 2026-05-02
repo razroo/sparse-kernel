@@ -767,7 +767,7 @@ components:
         error: { type: string }
     BrowserContext:
       type: object
-      required: [id, pool_id, profile_mode, status, created_at]
+      required: [id, pool_id, profile_mode, allowed_origins, status, created_at]
       properties:
         id: { type: string }
         pool_id: { type: string }
@@ -775,6 +775,7 @@ components:
         session_id: { type: [string, "null"] }
         task_id: { type: [string, "null"] }
         profile_mode: { type: string }
+        allowed_origins: true
         status: { type: string }
         created_at: { type: string }
     BrowserPool:
@@ -817,6 +818,7 @@ components:
         trust_zone_id: { type: string }
         max_contexts: { type: integer }
         cdp_endpoint: { type: [string, "null"] }
+        allowed_origins: true
     SandboxAllocation:
       type: object
       required: [id, trust_zone_id, backend, status, created_at]

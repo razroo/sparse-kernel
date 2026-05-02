@@ -41,6 +41,7 @@ class LiveSmokeKernel implements SparseKernelBrowserKernelClient {
       id: `browser_ctx_live_${this.nextContext++}`,
       pool_id: "browser_pool_public_web",
       profile_mode: "ephemeral",
+      allowed_origins: null,
       status: "active",
       created_at: new Date().toISOString(),
     };

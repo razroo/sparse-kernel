@@ -44,8 +44,8 @@ export type SparseKernelNetworkPolicy = {
   id: string;
   default_action: SparseKernelNetworkDefaultAction;
   allow_private_network: boolean;
-  allowed_hosts?: string[];
-  denied_cidrs?: string[];
+  allowed_hosts: string[];
+  denied_cidrs: string[];
   proxy_ref?: string | null;
   created_at: string;
 };
@@ -58,7 +58,7 @@ export type SparseKernelTrustZoneProxyAttachment = {
 
 export type SparseKernelSupervisedEgressProxy = {
   trust_zone_id: string;
-  proxy_ref: string;
+  proxy_ref?: string | null;
   pid?: number;
   mode?: string | null;
   already_running?: boolean;
@@ -210,7 +210,7 @@ export type SparseKernelBrowserContext = {
   session_id?: string | null;
   task_id?: string | null;
   profile_mode: string;
-  allowed_origins?: unknown;
+  allowed_origins: unknown;
   allowedOrigins?: unknown;
   status: string;
   created_at: string;
@@ -383,9 +383,9 @@ export type SparseKernelSandboxBackendProbe = {
   backend: string;
   available: boolean;
   command?: string | null;
-  hard_boundary?: boolean;
-  isolation?: string | null;
-  notes?: string[];
+  hard_boundary: boolean;
+  isolation: string;
+  notes: string[];
 };
 
 export type SparseKernelAllocateSandboxInput = {

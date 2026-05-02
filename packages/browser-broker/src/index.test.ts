@@ -65,6 +65,7 @@ class FakeKernel implements SparseKernelBrowserKernelClient {
       agent_id: "agent-a",
       task_id: "task-a",
       profile_mode: "ephemeral",
+      allowed_origins: null,
       status: "active",
       created_at: "2026-04-27T00:00:00Z",
     };

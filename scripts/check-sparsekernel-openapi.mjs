@@ -88,6 +88,14 @@ export function collectClientRouteKeys(source) {
 }
 
 export function collectClientTypeProperties(source, typeName, seen = new Set()) {
+  return collectClientTypeShape(source, typeName, seen)?.properties;
+}
+
+export function collectClientTypeRequiredProperties(source, typeName, seen = new Set()) {
+  return collectClientTypeShape(source, typeName, seen)?.required;
+}
+
+function collectClientTypeShape(source, typeName, seen = new Set()) {
   if (seen.has(typeName)) {
     return undefined;
   }
@@ -97,7 +105,7 @@ export function collectClientTypeProperties(source, typeName, seen = new Set()) 
     source,
   );
   if (typeMatch) {
-    return collectObjectProperties(typeMatch[1]);
+    return collectObjectShape(typeMatch[1]);
   }
 
   const intersectionMatch = new RegExp(
@@ -108,20 +116,31 @@ export function collectClientTypeProperties(source, typeName, seen = new Set()) 
     return undefined;
   }
 
-  const baseProperties = collectClientTypeProperties(source, intersectionMatch[1], seen);
-  if (!baseProperties) {
+  const baseShape = collectClientTypeShape(source, intersectionMatch[1], seen);
+  if (!baseShape) {
     return undefined;
   }
-  return new Set([...baseProperties, ...collectObjectProperties(intersectionMatch[2])]);
+  const objectShape = collectObjectShape(intersectionMatch[2]);
+  return {
+    properties: new Set([...baseShape.properties, ...objectShape.properties]),
+    required: new Set([...baseShape.required, ...objectShape.required]),
+  };
 }
 
-function collectObjectProperties(body) {
-  return new Set(
-    body
-      .split("\n")
-      .map((line) => /^\s*([A-Za-z0-9_]+)\??:/u.exec(line)?.[1])
-      .filter(Boolean),
-  );
+function collectObjectShape(body) {
+  const properties = new Set();
+  const required = new Set();
+  for (const line of body.split("\n")) {
+    const match = /^\s*([A-Za-z0-9_]+)(\?)?:/u.exec(line);
+    if (!match) {
+      continue;
+    }
+    properties.add(match[1]);
+    if (!match[2]) {
+      required.add(match[1]);
+    }
+  }
+  return { properties, required };
 }
 
 export function collectSchemaRefs(value, refs = new Set()) {
@@ -241,19 +260,42 @@ function methodForClientCall(callName) {
 function checkClientSchemaProperties(errors, clientSource, schemas) {
   for (const item of CLIENT_SCHEMA_MAPPINGS) {
     const clientProperties = collectClientTypeProperties(clientSource, item.clientType);
+    const clientRequiredProperties = collectClientTypeRequiredProperties(
+      clientSource,
+      item.clientType,
+    );
     const schemaProperties = schemaPropertiesFor(schemas, item.schemaName);
+    const schemaRequiredProperties = schemaRequiredPropertiesFor(schemas, item.schemaName);
     if (!clientProperties) {
       errors.push(`Client type missing for SparseKernel OpenAPI parity: ${item.clientType}`);
+      continue;
+    }
+    if (!clientRequiredProperties) {
+      errors.push(
+        `Client type required fields missing for SparseKernel OpenAPI parity: ${item.clientType}`,
+      );
       continue;
     }
     if (!schemaProperties) {
       errors.push(`OpenAPI schema missing for SparseKernel client parity: ${item.schemaName}`);
       continue;
     }
+    if (!schemaRequiredProperties) {
+      errors.push(
+        `OpenAPI schema required fields missing for SparseKernel client parity: ${item.schemaName}`,
+      );
+      continue;
+    }
 
     const ignoredClientProperties = new Set(item.ignoreClientProperties ?? []);
     const filteredClientProperties = new Set(
       [...clientProperties].filter((property) => !ignoredClientProperties.has(property)),
+    );
+    const filteredClientRequiredProperties = new Set(
+      [...clientRequiredProperties].filter((property) => !ignoredClientProperties.has(property)),
+    );
+    const filteredSchemaRequiredProperties = new Set(
+      [...schemaRequiredProperties].filter((property) => !ignoredClientProperties.has(property)),
     );
     pushSetDiff(
       errors,
@@ -267,6 +309,18 @@ function checkClientSchemaProperties(errors, clientSource, schemas) {
       schemaProperties,
       filteredClientProperties,
     );
+    pushSetDiff(
+      errors,
+      `${item.clientType} required properties missing from ${item.schemaName}`,
+      filteredClientRequiredProperties,
+      filteredSchemaRequiredProperties,
+    );
+    pushSetDiff(
+      errors,
+      `${item.schemaName} required properties missing from ${item.clientType}`,
+      filteredSchemaRequiredProperties,
+      filteredClientRequiredProperties,
+    );
   }
 }
 
@@ -276,6 +330,17 @@ function schemaPropertiesFor(schemas, schemaName) {
     return undefined;
   }
   return new Set(Object.keys(properties));
+}
+
+function schemaRequiredPropertiesFor(schemas, schemaName) {
+  const required = schemas?.[schemaName]?.required;
+  if (required === undefined) {
+    return new Set();
+  }
+  if (!Array.isArray(required)) {
+    return undefined;
+  }
+  return new Set(required);
 }
 
 function pushSetDiff(errors, title, left, right) {

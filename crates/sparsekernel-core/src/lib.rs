@@ -415,6 +415,7 @@ pub struct BrowserPoolRecord {
     pub browser_kind: String,
     pub status: String,
     pub max_contexts: i64,
+    pub active_contexts: i64,
     pub cdp_endpoint: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -1784,8 +1785,14 @@ impl SparseKernelDb {
 
     pub fn list_browser_pools(&self) -> Result<Vec<BrowserPoolRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, trust_zone_id, browser_kind, status, max_contexts, cdp_endpoint, created_at, updated_at
-             FROM browser_pools ORDER BY trust_zone_id ASC, browser_kind ASC, id ASC",
+            "SELECT bp.id, bp.trust_zone_id, bp.browser_kind, bp.status, bp.max_contexts,
+                    COUNT(CASE WHEN bc.status = 'active' THEN 1 END) AS active_contexts,
+                    bp.cdp_endpoint, bp.created_at, bp.updated_at
+             FROM browser_pools bp
+             LEFT JOIN browser_contexts bc ON bc.pool_id = bp.id
+             GROUP BY bp.id, bp.trust_zone_id, bp.browser_kind, bp.status, bp.max_contexts,
+                      bp.cdp_endpoint, bp.created_at, bp.updated_at
+             ORDER BY bp.trust_zone_id ASC, bp.browser_kind ASC, bp.id ASC",
         )?;
         let rows = stmt.query_map([], browser_pool_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -2159,9 +2166,10 @@ fn browser_pool_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserPoo
         browser_kind: row.get(2)?,
         status: row.get(3)?,
         max_contexts: row.get(4)?,
-        cdp_endpoint: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        active_contexts: row.get(5)?,
+        cdp_endpoint: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -4107,6 +4115,13 @@ mod tests {
             browser_pool_ids,
             vec!["pool-a".to_string(), "pool-b".to_string()]
         );
+        let active_contexts: Vec<i64> = db
+            .list_browser_pools()
+            .unwrap()
+            .into_iter()
+            .map(|pool| pool.active_contexts)
+            .collect();
+        assert_eq!(active_contexts, vec![0, 0]);
 
         for id in ["context-b", "context-a"] {
             db.conn
@@ -4278,6 +4293,7 @@ mod tests {
             .unwrap();
         let pools = db.list_browser_pools().unwrap();
         assert_eq!(pools[0].browser_kind, "cdp");
+        assert_eq!(pools[0].active_contexts, 1);
         assert_eq!(
             pools[0].cdp_endpoint.as_deref(),
             Some("http://127.0.0.1:9222")

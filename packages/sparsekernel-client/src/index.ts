@@ -221,6 +221,7 @@ export type SparseKernelBrowserPool = {
   browser_kind: string;
   status: string;
   max_contexts: number;
+  active_contexts: number;
   cdp_endpoint?: string | null;
   created_at: string;
   updated_at: string;

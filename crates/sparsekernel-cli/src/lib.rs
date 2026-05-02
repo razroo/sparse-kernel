@@ -2470,6 +2470,7 @@ mod tests {
             .body;
         assert_eq!(pools[0]["trust_zone_id"], "public_web");
         assert_eq!(pools[0]["browser_kind"], "cdp");
+        assert_eq!(pools[0]["active_contexts"], 1);
         assert_eq!(pools[0]["cdp_endpoint"], "http://127.0.0.1:9222");
 
         let released = json_call(

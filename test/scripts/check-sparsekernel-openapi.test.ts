@@ -88,6 +88,7 @@ describe("scripts/check-sparsekernel-openapi", () => {
   it("finds missing and duplicate operation ids", () => {
     const paths = {
       "/tasks": {
+        parameters: [{ name: "agentId", in: "query" }],
         get: { operationId: "listTasks" },
       },
       "/tasks/enqueue": {
@@ -107,6 +108,7 @@ describe("scripts/check-sparsekernel-openapi", () => {
   it("finds operations missing 200 JSON response schemas", () => {
     const paths = {
       "/health": {
+        parameters: [{ name: "agentId", in: "query" }],
         get: {
           responses: {
             "200": {
@@ -220,6 +222,7 @@ describe("scripts/check-sparsekernel-openapi", () => {
   it("finds inline request body schemas that bypass client parity mappings", () => {
     const paths = {
       "/leases/release-expired": {
+        parameters: [{ name: "agentId", in: "query" }],
         post: {
           requestBody: {
             content: {

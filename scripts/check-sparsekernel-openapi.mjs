@@ -5,6 +5,16 @@ import { parse } from "yaml";
 const OPENAPI_PATH = "schemas/sparsekernel.openapi.yaml";
 const DAEMON_PATH = "crates/sparsekernel-cli/src/lib.rs";
 const CLIENT_PATH = "packages/sparsekernel-client/src/index.ts";
+const OPENAPI_HTTP_METHODS = new Set([
+  "get",
+  "post",
+  "put",
+  "patch",
+  "delete",
+  "options",
+  "head",
+  "trace",
+]);
 const CLIENT_SCHEMA_MAPPINGS = [
   mapping("SparseKernelHealth", "Health"),
   mapping("SparseKernelInspect", "Inspect"),
@@ -293,7 +303,7 @@ function collectOpenApiRouteKeys(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const method of Object.keys(operations)) {
+    for (const method of Object.keys(operations).filter(isOpenApiHttpMethod)) {
       routeKeys.add(`${method.toUpperCase()} ${routePath}`);
     }
   }
@@ -328,7 +338,7 @@ export function collectOpenApiOperationIdProblems(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const [method, operation] of Object.entries(operations)) {
+    for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const routeKey = `${method.toUpperCase()} ${routePath}`;
       const operationId = operationIdFor(operation);
       if (!operationId) {
@@ -391,7 +401,7 @@ export function collectOpenApiMissingJsonResponseSchemaRoutes(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const [method, operation] of Object.entries(operations)) {
+    for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const schema = jsonResponseSchema(operation);
       if (!schema) {
         routes.push(`${method.toUpperCase()} ${routePath}`);
@@ -407,7 +417,7 @@ export function collectOpenApiInlineObjectResponseSchemaRoutes(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const [method, operation] of Object.entries(operations)) {
+    for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const schema = jsonResponseSchema(operation);
       if (schema && isInlineObjectResponseSchema(schema)) {
         routes.push(`${method.toUpperCase()} ${routePath}`);
@@ -427,7 +437,7 @@ export function collectOpenApiInlineArrayResponseItemRoutes(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const [method, operation] of Object.entries(operations)) {
+    for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const schema = jsonResponseSchema(operation);
       if (schema?.type === "array" && !schema.items?.$ref) {
         routes.push(`${method.toUpperCase()} ${routePath}`);
@@ -454,7 +464,7 @@ export function collectOpenApiRequestBodySchemaNames(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const operation of Object.values(operations)) {
+    for (const [, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const ref = requestBodySchemaRef(operation);
       if (ref?.startsWith("#/components/schemas/")) {
         schemaNames.add(ref.slice("#/components/schemas/".length));
@@ -478,7 +488,7 @@ export function collectOpenApiInlineRequestBodyRoutes(paths) {
     if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
       continue;
     }
-    for (const [method, operation] of Object.entries(operations)) {
+    for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const schema = requestBodySchema(operation);
       if (schema && !schema.$ref) {
         routes.add(`${method.toUpperCase()} ${routePath}`);
@@ -502,6 +512,14 @@ function requestBodySchema(operation) {
     return undefined;
   }
   return schema;
+}
+
+function isOpenApiOperationEntry([method]) {
+  return isOpenApiHttpMethod(method);
+}
+
+function isOpenApiHttpMethod(method) {
+  return OPENAPI_HTTP_METHODS.has(method.toLowerCase());
 }
 
 function methodForClientCall(callName) {

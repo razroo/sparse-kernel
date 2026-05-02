@@ -2049,6 +2049,18 @@ mod tests {
         assert_eq!(updated["active_agent_steps_max"], 12);
         assert_eq!(updated["browser_contexts_max"], 3);
         assert_eq!(updated["heavy_sandboxes_max"], 2);
+
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "resource_budget.updated");
+        assert_eq!(audit[0].object_id.as_deref(), Some("budgets"));
+        assert_eq!(
+            audit[0].payload.as_ref().unwrap()["updatedKeys"],
+            json!([
+                "activeAgentStepsMax",
+                "browserContextsMax",
+                "heavySandboxesMax"
+            ])
+        );
     }
 
     #[test]

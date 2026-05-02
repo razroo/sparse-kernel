@@ -1116,6 +1116,7 @@ impl SparseKernelDb {
     ) -> Result<ResourceBudgetSnapshot> {
         let tx = self.conn.transaction()?;
         let now = now_iso();
+        let mut updated_keys = Vec::new();
         let set_value = |key: &str, value: Option<i64>| -> Result<()> {
             if let Some(value) = value {
                 tx.execute(
@@ -1129,31 +1130,59 @@ impl SparseKernelDb {
             }
             Ok(())
         };
+        if input.logical_agents_max.is_some() {
+            updated_keys.push("logicalAgentsMax");
+        }
         set_value(
             "resource_budget.logical_agents_max",
             input.logical_agents_max,
         )?;
+        if input.active_agent_steps_max.is_some() {
+            updated_keys.push("activeAgentStepsMax");
+        }
         set_value(
             "resource_budget.active_agent_steps_max",
             input.active_agent_steps_max,
         )?;
+        if input.model_calls_in_flight_max.is_some() {
+            updated_keys.push("modelCallsInFlightMax");
+        }
         set_value(
             "resource_budget.model_calls_in_flight_max",
             input.model_calls_in_flight_max,
         )?;
+        if input.file_patch_jobs_max.is_some() {
+            updated_keys.push("filePatchJobsMax");
+        }
         set_value(
             "resource_budget.file_patch_jobs_max",
             input.file_patch_jobs_max,
         )?;
+        if input.test_jobs_max.is_some() {
+            updated_keys.push("testJobsMax");
+        }
         set_value("resource_budget.test_jobs_max", input.test_jobs_max)?;
+        if input.browser_contexts_max.is_some() {
+            updated_keys.push("browserContextsMax");
+        }
         set_value(
             "resource_budget.browser_contexts_max",
             input.browser_contexts_max,
         )?;
+        if input.heavy_sandboxes_max.is_some() {
+            updated_keys.push("heavySandboxesMax");
+        }
         set_value(
             "resource_budget.heavy_sandboxes_max",
             input.heavy_sandboxes_max,
         )?;
+        if !updated_keys.is_empty() {
+            tx.execute(
+                "INSERT INTO audit_log(actor_type, actor_id, action, object_type, object_id, payload_json, created_at)
+                 VALUES('runtime', NULL, 'resource_budget.updated', 'runtime', 'budgets', ?, ?)",
+                params![json!({ "updatedKeys": updated_keys }).to_string(), now],
+            )?;
+        }
         tx.commit()?;
         self.resource_budgets()
     }

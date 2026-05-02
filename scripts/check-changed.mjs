@@ -22,6 +22,12 @@ const LIVE_DOCKER_AUTH_SHELL_TARGETS = [
   "scripts/test-live-gateway-models-docker.sh",
   "scripts/test-live-models-docker.sh",
 ];
+const SPARSEKERNEL_OPENAPI_CONTRACT_PATHS = new Set([
+  "crates/sparsekernel-cli/src/lib.rs",
+  "packages/sparsekernel-client/src/index.ts",
+  "schemas/sparsekernel.openapi.yaml",
+  "scripts/check-sparsekernel-openapi.mjs",
+]);
 
 export function createChangedCheckChildEnv(baseEnv = process.env) {
   const resolvedBaseEnv = resolveLocalHeavyCheckEnv(baseEnv);
@@ -66,6 +72,12 @@ export function createChangedCheckPlan(result, options = {}) {
 
   const lanes = result.lanes;
   const runAll = lanes.all;
+  if (
+    runAll ||
+    result.paths.some((changedPath) => SPARSEKERNEL_OPENAPI_CONTRACT_PATHS.has(changedPath))
+  ) {
+    add("sparsekernel OpenAPI parity", ["check:sparsekernel-openapi"]);
+  }
 
   if (lanes.releaseMetadata) {
     add("release metadata guard", [

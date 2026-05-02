@@ -713,6 +713,22 @@ describe("scripts/changed-lanes", () => {
     expect(plan.commands.map((command) => command.args[0])).not.toContain("test");
   });
 
+  it("checks SparseKernel OpenAPI parity for schema changes", () => {
+    const result = detectChangedLanes(["schemas/sparsekernel.openapi.yaml"]);
+    const plan = createChangedCheckPlan(result);
+
+    expect(result.lanes.all).toBe(true);
+    expect(plan.commands.map((command) => command.args[0])).toContain("check:sparsekernel-openapi");
+  });
+
+  it("checks SparseKernel OpenAPI parity for daemon route changes", () => {
+    const result = detectChangedLanes(["crates/sparsekernel-cli/src/lib.rs"]);
+    const plan = createChangedCheckPlan(result);
+
+    expect(result.lanes.rust).toBe(true);
+    expect(plan.commands.map((command) => command.args[0])).toContain("check:sparsekernel-openapi");
+  });
+
   it("keeps an empty changed path list as a no-op", () => {
     const result = detectChangedLanes([]);
     const plan = createChangedCheckPlan(result);

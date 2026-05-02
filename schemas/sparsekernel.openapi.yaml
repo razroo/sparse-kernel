@@ -1121,7 +1121,17 @@ components:
         created_at: { type: string }
     BrowserPool:
       type: object
-      required: [id, trust_zone_id, browser_kind, status, max_contexts, active_contexts, created_at, updated_at]
+      required:
+        [
+          id,
+          trust_zone_id,
+          browser_kind,
+          status,
+          max_contexts,
+          active_contexts,
+          created_at,
+          updated_at,
+        ]
       properties:
         id: { type: string }
         trust_zone_id: { type: string }

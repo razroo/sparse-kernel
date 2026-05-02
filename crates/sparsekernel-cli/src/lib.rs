@@ -2417,18 +2417,46 @@ mod tests {
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["output"]["artifact_ids"][0], artifact.id);
 
+        let failed_call = json_call(
+            &mut db,
+            "POST",
+            "/tool-calls/create",
+            json!({
+                "id": "tool-call-b",
+                "agent_id": "main",
+                "tool_name": "browser.capture",
+            }),
+        );
+        assert_eq!(failed_call["status"], "created");
+        let failed = json_call(
+            &mut db,
+            "POST",
+            "/tool-calls/fail",
+            json!({ "id": "tool-call-b", "error": "renderer crashed" }),
+        );
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "renderer crashed");
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "tool_call.failed");
+        assert_eq!(audit[0].object_id.as_deref(), Some("tool-call-b"));
+        assert_eq!(
+            audit[0].payload.as_ref().unwrap()["error"],
+            "renderer crashed"
+        );
+
         let calls = handle_api_request(&mut db, "GET", "/tool-calls", &[])
             .unwrap()
             .body;
-        assert_eq!(calls.as_array().unwrap().len(), 1);
+        assert_eq!(calls.as_array().unwrap().len(), 2);
         let actions: Vec<String> = db
-            .list_audit(10)
+            .list_audit(20)
             .unwrap()
             .into_iter()
             .map(|event| event.action)
             .collect();
         assert!(actions.contains(&"tool_call.denied".to_string()));
         assert!(actions.contains(&"tool_call.completed".to_string()));
+        assert!(actions.contains(&"tool_call.failed".to_string()));
     }
 
     #[test]

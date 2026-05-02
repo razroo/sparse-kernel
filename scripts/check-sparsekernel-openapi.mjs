@@ -393,6 +393,15 @@ function checkOpenApiJsonResponseSchemas(errors, paths) {
       ),
     );
   }
+  const inlineAnyOfItems = collectOpenApiInlineAnyOfResponseItemRoutes(paths);
+  if (inlineAnyOfItems.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel OpenAPI anyOf response items must use component schema refs or null",
+        inlineAnyOfItems.toSorted(compareStrings),
+      ),
+    );
+  }
 }
 
 export function collectOpenApiMissingJsonResponseSchemaRoutes(paths) {
@@ -440,6 +449,22 @@ export function collectOpenApiInlineArrayResponseItemRoutes(paths) {
     for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
       const schema = jsonResponseSchema(operation);
       if (schema?.type === "array" && !schema.items?.$ref) {
+        routes.push(`${method.toUpperCase()} ${routePath}`);
+      }
+    }
+  }
+  return routes;
+}
+
+export function collectOpenApiInlineAnyOfResponseItemRoutes(paths) {
+  const routes = [];
+  for (const [routePath, operations] of Object.entries(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const [method, operation] of Object.entries(operations).filter(isOpenApiOperationEntry)) {
+      const schema = jsonResponseSchema(operation);
+      if (schema?.anyOf?.some((item) => !item.$ref && item.type !== "null")) {
         routes.push(`${method.toUpperCase()} ${routePath}`);
       }
     }

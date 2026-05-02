@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   collectClientSchemaMappingProblems,
   collectOpenApiInlineArrayResponseItemRoutes,
+  collectOpenApiInlineAnyOfResponseItemRoutes,
   collectOpenApiInlineObjectResponseSchemaRoutes,
   collectOpenApiInlineRequestBodyRoutes,
   collectOpenApiMissingJsonResponseSchemaRoutes,
@@ -217,6 +218,49 @@ describe("scripts/check-sparsekernel-openapi", () => {
     };
 
     expect(collectOpenApiInlineArrayResponseItemRoutes(paths)).toEqual(["GET /tasks"]);
+  });
+
+  it("finds inline anyOf response item schemas that bypass client parity mappings", () => {
+    const paths = {
+      "/tasks/claim": {
+        post: {
+          responses: {
+            "200": {
+              content: {
+                "application/json": {
+                  schema: {
+                    anyOf: [
+                      {
+                        type: "object",
+                        properties: { id: { type: "string" } },
+                      },
+                      { type: "null" },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/sessions/current": {
+        post: {
+          responses: {
+            "200": {
+              content: {
+                "application/json": {
+                  schema: {
+                    anyOf: [{ $ref: "#/components/schemas/Session" }, { type: "null" }],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+
+    expect(collectOpenApiInlineAnyOfResponseItemRoutes(paths)).toEqual(["POST /tasks/claim"]);
   });
 
   it("finds inline request body schemas that bypass client parity mappings", () => {

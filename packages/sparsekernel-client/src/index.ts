@@ -50,9 +50,18 @@ export type SparseKernelNetworkPolicy = {
   created_at: string;
 };
 
+export type SparseKernelTrustZoneInput = {
+  trust_zone_id: string;
+};
+
 export type SparseKernelTrustZoneProxyAttachment = {
   trust_zone_id: string;
   network_policy_id: string;
+  proxy_ref?: string | null;
+};
+
+export type SparseKernelTrustZoneProxyRefInput = {
+  trust_zone_id: string;
   proxy_ref?: string | null;
 };
 
@@ -63,6 +72,20 @@ export type SparseKernelSupervisedEgressProxy = {
   mode?: string | null;
   already_running?: boolean;
   stopped?: boolean;
+};
+
+export type SparseKernelStartEgressProxyInput = {
+  trust_zone_id: string;
+  host?: string | null;
+  port?: number | null;
+  mode?: string | null;
+  command?: string | null;
+  args?: string[];
+};
+
+export type SparseKernelStopEgressProxyInput = {
+  trust_zone_id: string;
+  clear_proxy_ref?: boolean;
 };
 
 export type SparseKernelTask = {
@@ -235,6 +258,10 @@ export type SparseKernelBrowserEndpointProbe = {
   browser?: string | null;
   web_socket_debugger_url?: string | null;
   error?: string | null;
+};
+
+export type SparseKernelProbeBrowserPoolInput = {
+  cdp_endpoint: string;
 };
 
 export type SparseKernelBrowserTarget = {
@@ -499,19 +526,18 @@ export class SparseKernelClient {
     return await this.postJson<SparseKernelResourceBudgets>("/runtime/budgets/update", input);
   }
 
-  async trustZoneNetworkPolicy(input: {
-    trust_zone_id: string;
-  }): Promise<SparseKernelNetworkPolicy | null> {
+  async trustZoneNetworkPolicy(
+    input: SparseKernelTrustZoneInput,
+  ): Promise<SparseKernelNetworkPolicy | null> {
     return await this.postJson<SparseKernelNetworkPolicy | null>(
       "/trust-zones/network-policy",
       input,
     );
   }
 
-  async attachTrustZoneProxyRef(input: {
-    trust_zone_id: string;
-    proxy_ref?: string | null;
-  }): Promise<SparseKernelTrustZoneProxyAttachment> {
+  async attachTrustZoneProxyRef(
+    input: SparseKernelTrustZoneProxyRefInput,
+  ): Promise<SparseKernelTrustZoneProxyAttachment> {
     return await this.postJson<SparseKernelTrustZoneProxyAttachment>(
       "/trust-zones/proxy-ref",
       input,
@@ -522,20 +548,15 @@ export class SparseKernelClient {
     return await this.getJson<SparseKernelSupervisedEgressProxy[]>("/egress-proxies");
   }
 
-  async startEgressProxy(input: {
-    trust_zone_id: string;
-    host?: string | null;
-    port?: number | null;
-    command?: string | null;
-    args?: string[];
-  }): Promise<SparseKernelSupervisedEgressProxy> {
+  async startEgressProxy(
+    input: SparseKernelStartEgressProxyInput,
+  ): Promise<SparseKernelSupervisedEgressProxy> {
     return await this.postJson<SparseKernelSupervisedEgressProxy>("/egress-proxies/start", input);
   }
 
-  async stopEgressProxy(input: {
-    trust_zone_id: string;
-    clear_proxy_ref?: boolean;
-  }): Promise<SparseKernelSupervisedEgressProxy> {
+  async stopEgressProxy(
+    input: SparseKernelStopEgressProxyInput,
+  ): Promise<SparseKernelSupervisedEgressProxy> {
     return await this.postJson<SparseKernelSupervisedEgressProxy>("/egress-proxies/stop", input);
   }
 
@@ -609,9 +630,9 @@ export class SparseKernelClient {
     return await this.getJson<SparseKernelBrowserPool[]>("/browser/pools");
   }
 
-  async probeBrowserPool(input: {
-    cdp_endpoint: string;
-  }): Promise<SparseKernelBrowserEndpointProbe> {
+  async probeBrowserPool(
+    input: SparseKernelProbeBrowserPoolInput,
+  ): Promise<SparseKernelBrowserEndpointProbe> {
     return await this.postJson<SparseKernelBrowserEndpointProbe>("/browser/pools/probe", input);
   }
 

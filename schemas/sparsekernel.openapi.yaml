@@ -658,11 +658,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [tasks, resources]
-                properties:
-                  tasks: { type: integer }
-                  resources: { type: integer }
+                $ref: "#/components/schemas/ReleaseExpiredLeasesResult"
   /capabilities/grant:
     post:
       operationId: grantCapability
@@ -792,12 +788,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [artifact, content_base64]
-                properties:
-                  artifact:
-                    $ref: "#/components/schemas/Artifact"
-                  content_base64: { type: string }
+                $ref: "#/components/schemas/ReadArtifactResult"
   /artifacts/export-file:
     post:
       operationId: exportArtifactFile
@@ -1256,6 +1247,12 @@ components:
         observation_type: { type: [string, "null"] }
         since: { type: [string, "null"] }
         limit: { type: integer }
+    ReleaseExpiredLeasesResult:
+      type: object
+      required: [tasks, resources]
+      properties:
+        tasks: { type: integer }
+        resources: { type: integer }
     SandboxAllocation:
       type: object
       required: [id, trust_zone_id, backend, status, created_at]
@@ -1379,6 +1376,13 @@ components:
         id: { type: string }
         subject:
           $ref: "#/components/schemas/ArtifactSubject"
+    ReadArtifactResult:
+      type: object
+      required: [artifact, content_base64]
+      properties:
+        artifact:
+          $ref: "#/components/schemas/Artifact"
+        content_base64: { type: string }
     ExportArtifactFileInput:
       type: object
       required: [id]

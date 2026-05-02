@@ -2176,6 +2176,10 @@ mod tests {
         let task = json_call(&mut db, "POST", "/tasks/enqueue", json!({ "kind": "demo" }));
         let task_id = task["id"].as_str().unwrap().to_string();
         assert_eq!(task["priority"], 0);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "task.created");
+        assert_eq!(audit[0].object_id.as_deref(), Some(task_id.as_str()));
+        assert_eq!(audit[0].payload.as_ref().unwrap()["kind"], "demo");
 
         let claimed = json_call(
             &mut db,
@@ -2185,6 +2189,10 @@ mod tests {
         );
         assert_eq!(claimed["id"], task_id);
         assert_eq!(claimed["lease_owner"], "worker-a");
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "task.claimed");
+        assert_eq!(audit[0].actor_id.as_deref(), Some("worker-a"));
+        assert_eq!(audit[0].object_id.as_deref(), Some(task_id.as_str()));
 
         let empty_claim = json_call(
             &mut db,
@@ -2201,6 +2209,10 @@ mod tests {
             json!({ "task_id": task_id, "worker_id": "worker-a" }),
         );
         assert_eq!(completed["ok"], true);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "task.completed");
+        assert_eq!(audit[0].actor_id.as_deref(), Some("worker-a"));
+        assert_eq!(audit[0].object_id.as_deref(), Some(task_id.as_str()));
     }
 
     #[test]
@@ -2288,6 +2300,10 @@ mod tests {
         assert_eq!(session["id"], "session-a");
         assert_eq!(session["agent_id"], "agent-a");
         assert_eq!(session["current_token_count"], 12);
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "session.upserted");
+        assert_eq!(audit[0].object_id.as_deref(), Some("session-a"));
+        assert_eq!(audit[0].payload.as_ref().unwrap()["agentId"], "agent-a");
 
         let sessions = handle_api_request(&mut db, "GET", "/sessions", &[])
             .unwrap()
@@ -2306,6 +2322,12 @@ mod tests {
             }),
         );
         assert_eq!(event["seq"], 1);
+        let event_id = event["id"].as_i64().unwrap().to_string();
+        let audit = db.list_audit(1).unwrap();
+        assert_eq!(audit[0].action, "transcript_event.appended");
+        assert_eq!(audit[0].object_id.as_deref(), Some(event_id.as_str()));
+        assert_eq!(audit[0].payload.as_ref().unwrap()["sessionId"], "session-a");
+        assert_eq!(audit[0].payload.as_ref().unwrap()["seq"], 1);
         let events = json_call(
             &mut db,
             "POST",

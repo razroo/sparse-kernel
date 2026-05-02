@@ -6,7 +6,12 @@ const OPENAPI_PATH = "schemas/sparsekernel.openapi.yaml";
 const DAEMON_PATH = "crates/sparsekernel-cli/src/lib.rs";
 const CLIENT_PATH = "packages/sparsekernel-client/src/index.ts";
 const CLIENT_SCHEMA_MAPPINGS = [
+  mapping("SparseKernelHealth", "Health"),
+  mapping("SparseKernelInspect", "Inspect"),
   mapping("SparseKernelBooleanResult", "BooleanResult"),
+  mapping("SparseKernelReleaseResult", "ReleaseResult"),
+  mapping("SparseKernelCapabilityCheckResult", "CapabilityCheckResult"),
+  mapping("SparseKernelCapabilityRevokeResult", "CapabilityRevokeResult"),
   mapping("SparseKernelResourceBudgets", "RuntimeResourceBudgets"),
   mapping("SparseKernelResourceBudgetUpdateInput", "RuntimeResourceBudgetUpdateInput"),
   mapping("SparseKernelNetworkPolicy", "NetworkPolicy"),

@@ -24,6 +24,18 @@ export type SparseKernelBooleanResult = {
   ok: boolean;
 };
 
+export type SparseKernelReleaseResult = {
+  released: boolean;
+};
+
+export type SparseKernelCapabilityCheckResult = {
+  allowed: boolean;
+};
+
+export type SparseKernelCapabilityRevokeResult = {
+  revoked: boolean;
+};
+
 export type SparseKernelResourceBudgets = {
   logical_agents_max: number;
   active_agent_steps_max: number;
@@ -690,7 +702,10 @@ export class SparseKernelClient {
     const input: SparseKernelReleaseBrowserContextInput = {
       context_id: contextId,
     };
-    const response = await this.postJson<{ released: boolean }>("/browser/contexts/release", input);
+    const response = await this.postJson<SparseKernelReleaseResult>(
+      "/browser/contexts/release",
+      input,
+    );
     return response.released;
   }
 
@@ -771,7 +786,7 @@ export class SparseKernelClient {
     const input: SparseKernelReleaseSandboxInput = {
       allocation_id: allocationId,
     };
-    const response = await this.postJson<{ released: boolean }>("/sandbox/release", input);
+    const response = await this.postJson<SparseKernelReleaseResult>("/sandbox/release", input);
     return response.released;
   }
 
@@ -802,13 +817,19 @@ export class SparseKernelClient {
   }
 
   async checkCapability(input: SparseKernelCapabilityCheckInput): Promise<boolean> {
-    const response = await this.postJson<{ allowed: boolean }>("/capabilities/check", input);
+    const response = await this.postJson<SparseKernelCapabilityCheckResult>(
+      "/capabilities/check",
+      input,
+    );
     return response.allowed;
   }
 
   async revokeCapability(id: string): Promise<boolean> {
     const input: SparseKernelCapabilityIdInput = { id };
-    const response = await this.postJson<{ revoked: boolean }>("/capabilities/revoke", input);
+    const response = await this.postJson<SparseKernelCapabilityRevokeResult>(
+      "/capabilities/revoke",
+      input,
+    );
     return response.revoked;
   }
 

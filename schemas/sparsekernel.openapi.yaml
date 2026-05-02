@@ -15,21 +15,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [ok, service, version]
-                properties:
-                  ok: { type: boolean }
-                  service: { type: string }
-                  version: { type: string }
-                  protocol_version:
-                    type: string
-                    description: SparseKernel local API protocol version. Clients should require a compatible major.
-                  schema_version:
-                    type: integer
-                    description: Current SQLite ledger schema version.
-                  features:
-                    type: array
-                    items: { type: string }
+                $ref: "#/components/schemas/Health"
   /status:
     get:
       operationId: status
@@ -39,14 +25,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [path, schema_version, counts]
-                properties:
-                  path: { type: string }
-                  schema_version: { type: integer }
-                  counts:
-                    type: object
-                    additionalProperties: { type: integer }
+                $ref: "#/components/schemas/Inspect"
   /runtime/budgets:
     get:
       operationId: getRuntimeBudgets
@@ -486,10 +465,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [released]
-                properties:
-                  released: { type: boolean }
+                $ref: "#/components/schemas/ReleaseResult"
   /browser/contexts/observe:
     post:
       operationId: recordBrowserObservation
@@ -506,10 +482,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [ok]
-                properties:
-                  ok: { type: boolean }
+                $ref: "#/components/schemas/BooleanResult"
   /browser/targets/record:
     post:
       operationId: recordBrowserTarget
@@ -614,10 +587,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [released]
-                properties:
-                  released: { type: boolean }
+                $ref: "#/components/schemas/ReleaseResult"
   /sandbox/backends/probe:
     get:
       operationId: probeSandboxBackends
@@ -678,10 +648,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [allowed]
-                properties:
-                  allowed: { type: boolean }
+                $ref: "#/components/schemas/CapabilityCheckResult"
   /capabilities/revoke:
     post:
       operationId: revokeCapability
@@ -697,10 +664,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [revoked]
-                properties:
-                  revoked: { type: boolean }
+                $ref: "#/components/schemas/CapabilityRevokeResult"
   /capabilities/list:
     post:
       operationId: listCapabilities
@@ -818,6 +782,46 @@ paths:
                   $ref: "#/components/schemas/AuditEvent"
 components:
   schemas:
+    Health:
+      type: object
+      required: [ok, service, version]
+      properties:
+        ok: { type: boolean }
+        service: { type: string }
+        version: { type: string }
+        protocol_version:
+          type: string
+          description: SparseKernel local API protocol version. Clients should require a compatible major.
+        schema_version:
+          type: integer
+          description: Current SQLite ledger schema version.
+        features:
+          type: array
+          items: { type: string }
+    Inspect:
+      type: object
+      required: [path, schema_version, counts]
+      properties:
+        path: { type: string }
+        schema_version: { type: integer }
+        counts:
+          type: object
+          additionalProperties: { type: integer }
+    ReleaseResult:
+      type: object
+      required: [released]
+      properties:
+        released: { type: boolean }
+    CapabilityCheckResult:
+      type: object
+      required: [allowed]
+      properties:
+        allowed: { type: boolean }
+    CapabilityRevokeResult:
+      type: object
+      required: [revoked]
+      properties:
+        revoked: { type: boolean }
     RuntimeResourceBudgets:
       type: object
       required:

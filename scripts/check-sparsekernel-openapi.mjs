@@ -582,6 +582,28 @@ function checkClientSchemaProperties(errors, clientSource, schemas) {
     }
 
     const ignoredClientProperties = new Set(item.ignoreClientProperties ?? []);
+    const { ignoredPropertiesMissingFromClient, ignoredPropertiesPresentInSchema } =
+      collectIgnoredClientPropertyProblems({
+        clientProperties,
+        ignoredClientProperties,
+        schemaProperties,
+      });
+    if (ignoredPropertiesMissingFromClient.length > 0) {
+      errors.push(
+        formatList(
+          `${item.clientType} ignored properties missing from client type`,
+          ignoredPropertiesMissingFromClient,
+        ),
+      );
+    }
+    if (ignoredPropertiesPresentInSchema.length > 0) {
+      errors.push(
+        formatList(
+          `${item.clientType} ignored properties unexpectedly present in ${item.schemaName}`,
+          ignoredPropertiesPresentInSchema,
+        ),
+      );
+    }
     const filteredClientProperties = new Set(
       [...clientProperties].filter((property) => !ignoredClientProperties.has(property)),
     );
@@ -643,6 +665,21 @@ export function collectClientSchemaMappingProblems(mappings) {
   return {
     duplicateClientTypes: collectDuplicateMappingValues(mappings, "clientType"),
     duplicateSchemaNames: collectDuplicateMappingValues(mappings, "schemaName"),
+  };
+}
+
+export function collectIgnoredClientPropertyProblems({
+  clientProperties,
+  ignoredClientProperties,
+  schemaProperties,
+}) {
+  return {
+    ignoredPropertiesMissingFromClient: [...ignoredClientProperties]
+      .filter((property) => !clientProperties.has(property))
+      .toSorted(compareStrings),
+    ignoredPropertiesPresentInSchema: [...ignoredClientProperties]
+      .filter((property) => schemaProperties.has(property))
+      .toSorted(compareStrings),
   };
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   collectClientSchemaMappingProblems,
+  collectIgnoredClientPropertyProblems,
   collectOpenApiInlineArrayResponseItemRoutes,
   collectOpenApiInlineAnyOfResponseItemRoutes,
   collectOpenApiInlineObjectResponseSchemaRoutes,
@@ -23,6 +24,19 @@ describe("scripts/check-sparsekernel-openapi", () => {
     ).toEqual({
       duplicateClientTypes: ["SparseKernelTask"],
       duplicateSchemaNames: ["Task"],
+    });
+  });
+
+  it("finds invalid ignored client parity properties", () => {
+    expect(
+      collectIgnoredClientPropertyProblems({
+        clientProperties: new Set(["id", "allowedOrigins", "status"]),
+        ignoredClientProperties: new Set(["allowedOrigins", "missingProperty", "status"]),
+        schemaProperties: new Set(["id", "status"]),
+      }),
+    ).toEqual({
+      ignoredPropertiesMissingFromClient: ["missingProperty"],
+      ignoredPropertiesPresentInSchema: ["status"],
     });
   });
 

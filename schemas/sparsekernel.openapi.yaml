@@ -386,6 +386,98 @@ paths:
                 required: [released]
                 properties:
                   released: { type: boolean }
+  /browser/contexts/observe:
+    post:
+      operationId: recordBrowserObservation
+      description: Record a broker-owned browser observation for a leased context.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrowserObservationInput"
+      responses:
+        "200":
+          description: Observation recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+  /browser/targets/record:
+    post:
+      operationId: recordBrowserTarget
+      description: Upsert broker-owned browser target state for a leased context.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecordBrowserTargetInput"
+      responses:
+        "200":
+          description: Browser target record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowserTarget"
+  /browser/targets/close:
+    post:
+      operationId: closeBrowserTarget
+      description: Mark a broker-owned browser target closed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CloseBrowserTargetInput"
+      responses:
+        "200":
+          description: Closed browser target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowserTarget"
+  /browser/targets/list:
+    post:
+      operationId: listBrowserTargets
+      description: List broker-owned browser targets.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListBrowserTargetsInput"
+      responses:
+        "200":
+          description: Browser targets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BrowserTarget"
+  /browser/observations/list:
+    post:
+      operationId: listBrowserObservations
+      description: List broker-owned browser observations.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListBrowserObservationsInput"
+      responses:
+        "200":
+          description: Browser observations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BrowserObservation"
   /sandbox/allocate:
     post:
       operationId: allocateSandbox
@@ -801,6 +893,45 @@ components:
         browser: { type: [string, "null"] }
         web_socket_debugger_url: { type: [string, "null"] }
         error: { type: [string, "null"] }
+    BrowserTarget:
+      type: object
+      required:
+        [
+          id,
+          context_id,
+          target_id,
+          status,
+          console_count,
+          network_count,
+          artifact_count,
+          created_at,
+          updated_at,
+        ]
+      properties:
+        id: { type: string }
+        context_id: { type: string }
+        target_id: { type: string }
+        opener_target_id: { type: [string, "null"] }
+        url: { type: [string, "null"] }
+        title: { type: [string, "null"] }
+        status: { type: string }
+        close_reason: { type: [string, "null"] }
+        console_count: { type: integer }
+        network_count: { type: integer }
+        artifact_count: { type: integer }
+        created_at: { type: string }
+        updated_at: { type: string }
+        closed_at: { type: [string, "null"] }
+    BrowserObservation:
+      type: object
+      required: [id, context_id, observation_type, created_at]
+      properties:
+        id: { type: integer }
+        context_id: { type: string }
+        target_id: { type: [string, "null"] }
+        observation_type: { type: string }
+        payload: true
+        created_at: { type: string }
     ProbeBrowserPoolInput:
       type: object
       required: [cdp_endpoint]
@@ -819,6 +950,53 @@ components:
         max_contexts: { type: integer }
         cdp_endpoint: { type: [string, "null"] }
         allowed_origins: true
+    BrowserObservationInput:
+      type: object
+      required: [context_id, observation_type]
+      properties:
+        context_id: { type: string }
+        target_id: { type: [string, "null"] }
+        observation_type: { type: string }
+        payload: true
+        created_at: { type: [string, "null"] }
+    RecordBrowserTargetInput:
+      type: object
+      required: [context_id, target_id]
+      properties:
+        context_id: { type: string }
+        target_id: { type: string }
+        opener_target_id: { type: [string, "null"] }
+        url: { type: [string, "null"] }
+        title: { type: [string, "null"] }
+        status: { type: [string, "null"] }
+        close_reason: { type: [string, "null"] }
+        created_at: { type: [string, "null"] }
+        updated_at: { type: [string, "null"] }
+        closed_at: { type: [string, "null"] }
+    CloseBrowserTargetInput:
+      type: object
+      required: [context_id, target_id]
+      properties:
+        context_id: { type: string }
+        target_id: { type: string }
+        reason: { type: [string, "null"] }
+        closed_at: { type: [string, "null"] }
+    ListBrowserTargetsInput:
+      type: object
+      properties:
+        context_id: { type: [string, "null"] }
+        session_id: { type: [string, "null"] }
+        task_id: { type: [string, "null"] }
+        status: { type: [string, "null"] }
+        limit: { type: integer }
+    ListBrowserObservationsInput:
+      type: object
+      properties:
+        context_id: { type: [string, "null"] }
+        target_id: { type: [string, "null"] }
+        observation_type: { type: [string, "null"] }
+        since: { type: [string, "null"] }
+        limit: { type: integer }
     SandboxAllocation:
       type: object
       required: [id, trust_zone_id, backend, status, created_at]

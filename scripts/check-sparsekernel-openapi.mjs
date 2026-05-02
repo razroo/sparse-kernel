@@ -225,6 +225,7 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
     clientRouteKeys,
     openapiRouteKeys,
   );
+  checkOpenApiOperationIds(errors, paths);
 
   const schemas = openapi.components?.schemas;
   const schemaNames = new Set(
@@ -290,6 +291,61 @@ function collectOpenApiRouteKeys(paths) {
     }
   }
   return routeKeys;
+}
+
+function checkOpenApiOperationIds(errors, paths) {
+  const { missingOperationIds, duplicateOperationIds } = collectOpenApiOperationIdProblems(paths);
+  if (missingOperationIds.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel OpenAPI operations missing operationId",
+        missingOperationIds.toSorted(compareStrings),
+      ),
+    );
+  }
+  if (duplicateOperationIds.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel OpenAPI duplicate operationIds",
+        duplicateOperationIds.toSorted(compareStrings),
+      ),
+    );
+  }
+}
+
+export function collectOpenApiOperationIdProblems(paths) {
+  const missingOperationIds = [];
+  const seenOperationIds = new Map();
+  const duplicateOperationIds = [];
+  for (const [routePath, operations] of Object.entries(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const [method, operation] of Object.entries(operations)) {
+      const routeKey = `${method.toUpperCase()} ${routePath}`;
+      const operationId = operationIdFor(operation);
+      if (!operationId) {
+        missingOperationIds.push(routeKey);
+        continue;
+      }
+      const existingRoute = seenOperationIds.get(operationId);
+      if (existingRoute) {
+        duplicateOperationIds.push(`${operationId}: ${existingRoute}, ${routeKey}`);
+        continue;
+      }
+      seenOperationIds.set(operationId, routeKey);
+    }
+  }
+  return { duplicateOperationIds, missingOperationIds };
+}
+
+function operationIdFor(operation) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+    return undefined;
+  }
+  return typeof operation.operationId === "string" && operation.operationId.trim()
+    ? operation.operationId
+    : undefined;
 }
 
 export function collectOpenApiRequestBodySchemaNames(paths) {

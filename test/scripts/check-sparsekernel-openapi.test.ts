@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   collectOpenApiInlineRequestBodyRoutes,
+  collectOpenApiOperationIdProblems,
   collectOpenApiReferencedSchemaNames,
   collectOpenApiRequestBodySchemaNames,
 } from "../../scripts/check-sparsekernel-openapi.mjs";
@@ -64,6 +65,25 @@ describe("scripts/check-sparsekernel-openapi", () => {
       "EnqueueTaskInput",
       "Task",
     ]);
+  });
+
+  it("finds missing and duplicate operation ids", () => {
+    const paths = {
+      "/tasks": {
+        get: { operationId: "listTasks" },
+      },
+      "/tasks/enqueue": {
+        post: { operationId: "listTasks" },
+      },
+      "/tasks/claim": {
+        post: {},
+      },
+    };
+
+    expect(collectOpenApiOperationIdProblems(paths)).toEqual({
+      duplicateOperationIds: ["listTasks: GET /tasks, POST /tasks/enqueue"],
+      missingOperationIds: ["POST /tasks/claim"],
+    });
   });
 
   it("finds inline request body schemas that bypass client parity mappings", () => {

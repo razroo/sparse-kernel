@@ -148,6 +148,13 @@ describe("scripts/test-projects changed-target routing", () => {
     });
   });
 
+  it("routes SparseKernel OpenAPI checker edits to checker tests", () => {
+    expect(resolveChangedTestTargetPlan(["scripts/check-sparsekernel-openapi.mjs"])).toEqual({
+      mode: "targets",
+      targets: ["test/scripts/check-sparsekernel-openapi.test.ts"],
+    });
+  });
+
   it("does not route live tests through the normal changed-test lane", () => {
     expect(
       resolveChangedTestTargetPlan(["src/gateway/gateway-codex-harness.live.test.ts"]),

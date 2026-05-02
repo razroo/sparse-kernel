@@ -238,6 +238,23 @@ export function checkSparseKernelOpenApi({ openapiText, daemonSource, clientSour
     errors.push(formatList("Unresolved SparseKernel OpenAPI schema refs", unresolvedSchemaRefs));
   }
 
+  const inlineRequestBodies = collectOpenApiInlineRequestBodyRoutes(paths);
+  if (inlineRequestBodies.size > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel OpenAPI request bodies must use component schema refs",
+        [...inlineRequestBodies].toSorted(compareStrings),
+      ),
+    );
+  }
+  const mappedSchemaNames = new Set(CLIENT_SCHEMA_MAPPINGS.map((item) => item.schemaName));
+  pushSetDiff(
+    errors,
+    "SparseKernel OpenAPI request body schemas missing client parity mapping",
+    collectOpenApiRequestBodySchemaNames(paths),
+    mappedSchemaNames,
+  );
+
   checkClientSchemaProperties(errors, clientSource, schemas);
 
   return {
@@ -265,6 +282,54 @@ function collectOpenApiRouteKeys(paths) {
     }
   }
   return routeKeys;
+}
+
+export function collectOpenApiRequestBodySchemaNames(paths) {
+  const schemaNames = new Set();
+  for (const operations of Object.values(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const operation of Object.values(operations)) {
+      const ref = requestBodySchemaRef(operation);
+      if (ref?.startsWith("#/components/schemas/")) {
+        schemaNames.add(ref.slice("#/components/schemas/".length));
+      }
+    }
+  }
+  return schemaNames;
+}
+
+export function collectOpenApiInlineRequestBodyRoutes(paths) {
+  const routes = new Set();
+  for (const [routePath, operations] of Object.entries(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const [method, operation] of Object.entries(operations)) {
+      const schema = requestBodySchema(operation);
+      if (schema && !schema.$ref) {
+        routes.add(`${method.toUpperCase()} ${routePath}`);
+      }
+    }
+  }
+  return routes;
+}
+
+function requestBodySchemaRef(operation) {
+  const ref = requestBodySchema(operation)?.$ref;
+  return typeof ref === "string" ? ref : undefined;
+}
+
+function requestBodySchema(operation) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+    return undefined;
+  }
+  const schema = operation.requestBody?.content?.["application/json"]?.schema;
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return undefined;
+  }
+  return schema;
 }
 
 function methodForClientCall(callName) {

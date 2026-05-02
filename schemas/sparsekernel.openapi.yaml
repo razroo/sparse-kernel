@@ -47,6 +47,117 @@ paths:
                   counts:
                     type: object
                     additionalProperties: { type: integer }
+  /runtime/budgets:
+    get:
+      operationId: getRuntimeBudgets
+      description: Read SparseKernel runtime resource budgets.
+      responses:
+        "200":
+          description: Runtime resource budgets
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeResourceBudgets"
+  /runtime/budgets/update:
+    post:
+      operationId: updateRuntimeBudgets
+      description: Update one or more SparseKernel runtime resource budgets.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RuntimeResourceBudgetUpdateInput"
+      responses:
+        "200":
+          description: Updated runtime resource budgets
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeResourceBudgets"
+  /trust-zones/network-policy:
+    post:
+      operationId: getTrustZoneNetworkPolicy
+      description: Read the network policy attached to a trust zone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrustZoneInput"
+      responses:
+        "200":
+          description: Trust-zone network policy, or null when the trust zone has no policy row.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/NetworkPolicy"
+                  - type: "null"
+  /trust-zones/proxy-ref:
+    post:
+      operationId: attachTrustZoneProxyRef
+      description: Attach or clear a loopback proxy reference on a trust-zone network policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrustZoneProxyRefInput"
+      responses:
+        "200":
+          description: Updated trust-zone proxy attachment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustZoneProxyAttachment"
+  /egress-proxies:
+    get:
+      operationId: listEgressProxies
+      description: List daemon-supervised egress proxy processes.
+      responses:
+        "200":
+          description: Supervised egress proxies
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SupervisedEgressProxy"
+  /egress-proxies/start:
+    post:
+      operationId: startEgressProxy
+      description: Start a daemon-supervised egress proxy for a trust zone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartEgressProxyInput"
+      responses:
+        "200":
+          description: Started or already-running supervised egress proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupervisedEgressProxy"
+  /egress-proxies/stop:
+    post:
+      operationId: stopEgressProxy
+      description: Stop a daemon-supervised egress proxy for a trust zone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StopEgressProxyInput"
+      responses:
+        "200":
+          description: Stop result for the supervised egress proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupervisedEgressProxy"
   /tasks:
     get:
       operationId: listTasks
@@ -517,6 +628,19 @@ paths:
                 required: [released]
                 properties:
                   released: { type: boolean }
+  /sandbox/backends/probe:
+    get:
+      operationId: probeSandboxBackends
+      description: Probe sandbox backend availability and boundary descriptions on this host.
+      responses:
+        "200":
+          description: Sandbox backend probes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxBackendProbe"
   /leases/release-expired:
     post:
       operationId: releaseExpiredLeases
@@ -635,6 +759,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Artifact"
+  /artifacts/import-file:
+    post:
+      operationId: importArtifactFile
+      description: Import an artifact from a daemon-owned staging file without base64 JSON transport.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportArtifactFileInput"
+      responses:
+        "200":
+          description: Imported artifact metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
   /artifacts/read:
     post:
       operationId: readArtifact
@@ -657,6 +798,23 @@ paths:
                   artifact:
                     $ref: "#/components/schemas/Artifact"
                   content_base64: { type: string }
+  /artifacts/export-file:
+    post:
+      operationId: exportArtifactFile
+      description: Export an artifact to a daemon-owned staging file without base64 JSON transport.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExportArtifactFileInput"
+      responses:
+        "200":
+          description: Exported artifact metadata and staged path
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportArtifactFileResult"
   /artifacts/metadata:
     post:
       operationId: artifactMetadata
@@ -688,6 +846,97 @@ paths:
                   $ref: "#/components/schemas/AuditEvent"
 components:
   schemas:
+    RuntimeResourceBudgets:
+      type: object
+      required:
+        [
+          logical_agents_max,
+          active_agent_steps_max,
+          model_calls_in_flight_max,
+          file_patch_jobs_max,
+          test_jobs_max,
+          browser_contexts_max,
+          heavy_sandboxes_max,
+        ]
+      properties:
+        logical_agents_max: { type: integer }
+        active_agent_steps_max: { type: integer }
+        model_calls_in_flight_max: { type: integer }
+        file_patch_jobs_max: { type: integer }
+        test_jobs_max: { type: integer }
+        browser_contexts_max: { type: integer }
+        heavy_sandboxes_max: { type: integer }
+    RuntimeResourceBudgetUpdateInput:
+      type: object
+      properties:
+        logical_agents_max: { type: integer }
+        active_agent_steps_max: { type: integer }
+        model_calls_in_flight_max: { type: integer }
+        file_patch_jobs_max: { type: integer }
+        test_jobs_max: { type: integer }
+        browser_contexts_max: { type: integer }
+        heavy_sandboxes_max: { type: integer }
+    TrustZoneInput:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        trust_zone_id: { type: string }
+    NetworkPolicy:
+      type: object
+      required: [id, default_action, allow_private_network, allowed_hosts, denied_cidrs, created_at]
+      properties:
+        id: { type: string }
+        default_action: { type: string }
+        allow_private_network: { type: boolean }
+        allowed_hosts:
+          type: array
+          items: { type: string }
+        denied_cidrs:
+          type: array
+          items: { type: string }
+        proxy_ref: { type: [string, "null"] }
+        created_at: { type: string }
+    TrustZoneProxyRefInput:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        trust_zone_id: { type: string }
+        proxy_ref: { type: [string, "null"] }
+    TrustZoneProxyAttachment:
+      type: object
+      required: [trust_zone_id, network_policy_id]
+      properties:
+        trust_zone_id: { type: string }
+        network_policy_id: { type: string }
+        proxy_ref: { type: [string, "null"] }
+    SupervisedEgressProxy:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        trust_zone_id: { type: string }
+        proxy_ref: { type: [string, "null"] }
+        pid: { type: [integer, "null"] }
+        mode: { type: [string, "null"] }
+        already_running: { type: boolean }
+        stopped: { type: boolean }
+    StartEgressProxyInput:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        trust_zone_id: { type: string }
+        host: { type: [string, "null"] }
+        port: { type: [integer, "null"] }
+        mode: { type: [string, "null"] }
+        command: { type: [string, "null"] }
+        args:
+          type: array
+          items: { type: string }
+    StopEgressProxyInput:
+      type: object
+      required: [trust_zone_id]
+      properties:
+        trust_zone_id: { type: string }
+        clear_proxy_ref: { type: boolean }
     Task:
       type: object
       required: [id, kind, priority, status, attempts, created_at, updated_at]
@@ -1006,7 +1255,23 @@ components:
         trust_zone_id: { type: string }
         backend: { type: string }
         status: { type: string }
+        lease_until: { type: [string, "null"] }
+        max_runtime_ms: { type: [integer, "null"] }
+        max_bytes_out: { type: [integer, "null"] }
+        docker_image: { type: [string, "null"] }
         created_at: { type: string }
+    SandboxBackendProbe:
+      type: object
+      required: [backend, available, hard_boundary, isolation, notes]
+      properties:
+        backend: { type: string }
+        available: { type: boolean }
+        command: { type: [string, "null"] }
+        hard_boundary: { type: boolean }
+        isolation: { type: string }
+        notes:
+          type: array
+          items: { type: string }
     AllocateSandboxInput:
       type: object
       required: [trust_zone_id]
@@ -1015,6 +1280,9 @@ components:
         task_id: { type: [string, "null"] }
         trust_zone_id: { type: string }
         backend: { type: [string, "null"] }
+        docker_image: { type: [string, "null"] }
+        max_runtime_ms: { type: [integer, "null"] }
+        max_bytes_out: { type: [integer, "null"] }
     Capability:
       type: object
       required: [id, subject_type, subject_id, resource_type, action, created_at]
@@ -1083,6 +1351,17 @@ components:
       anyOf:
         - required: [content_base64]
         - required: [content_text]
+    ImportArtifactFileInput:
+      type: object
+      required: [staged_path]
+      properties:
+        staged_path: { type: string }
+        mime_type: { type: [string, "null"] }
+        retention_policy:
+          type: [string, "null"]
+          enum: [ephemeral, session, durable, debug, null]
+        subject:
+          $ref: "#/components/schemas/ArtifactSubject"
     ArtifactAccessInput:
       type: object
       required: [id]
@@ -1090,6 +1369,21 @@ components:
         id: { type: string }
         subject:
           $ref: "#/components/schemas/ArtifactSubject"
+    ExportArtifactFileInput:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        file_name: { type: [string, "null"] }
+        subject:
+          $ref: "#/components/schemas/ArtifactSubject"
+    ExportArtifactFileResult:
+      type: object
+      required: [artifact, staged_path]
+      properties:
+        artifact:
+          $ref: "#/components/schemas/Artifact"
+        staged_path: { type: string }
     AuditEvent:
       type: object
       required: [id, action, created_at]

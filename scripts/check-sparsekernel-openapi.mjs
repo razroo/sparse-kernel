@@ -23,6 +23,7 @@ const CLIENT_SCHEMA_MAPPINGS = [
   mapping("SparseKernelImportArtifactFileInput", "ImportArtifactFileInput"),
   mapping("SparseKernelArtifactAccessInput", "ArtifactAccessInput"),
   mapping("SparseKernelReadArtifactResult", "ReadArtifactResult"),
+  mapping("SparseKernelExportArtifactFileInput", "ExportArtifactFileInput"),
   mapping("SparseKernelExportArtifactFileResult", "ExportArtifactFileResult"),
   mapping("SparseKernelBrowserContext", "BrowserContext", {
     ignoreClientProperties: ["allowedOrigins"],
@@ -86,15 +87,37 @@ export function collectClientRouteKeys(source) {
   );
 }
 
-export function collectClientTypeProperties(source, typeName) {
+export function collectClientTypeProperties(source, typeName, seen = new Set()) {
+  if (seen.has(typeName)) {
+    return undefined;
+  }
+  seen.add(typeName);
+
   const typeMatch = new RegExp(`export type ${typeName} = \\{([\\s\\S]*?)\\n\\};`, "u").exec(
     source,
   );
-  if (!typeMatch) {
+  if (typeMatch) {
+    return collectObjectProperties(typeMatch[1]);
+  }
+
+  const intersectionMatch = new RegExp(
+    `export type ${typeName} =\\s*([A-Za-z0-9_]+)\\s*&\\s*\\{([\\s\\S]*?)\\n\\};`,
+    "u",
+  ).exec(source);
+  if (!intersectionMatch) {
     return undefined;
   }
+
+  const baseProperties = collectClientTypeProperties(source, intersectionMatch[1], seen);
+  if (!baseProperties) {
+    return undefined;
+  }
+  return new Set([...baseProperties, ...collectObjectProperties(intersectionMatch[2])]);
+}
+
+function collectObjectProperties(body) {
   return new Set(
-    typeMatch[1]
+    body
       .split("\n")
       .map((line) => /^\s*([A-Za-z0-9_]+)\??:/u.exec(line)?.[1])
       .filter(Boolean),

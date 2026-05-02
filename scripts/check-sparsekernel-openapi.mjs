@@ -364,6 +364,15 @@ function checkOpenApiJsonResponseSchemas(errors, paths) {
       ),
     );
   }
+  const inlineResponseSchemas = collectOpenApiInlineObjectResponseSchemaRoutes(paths);
+  if (inlineResponseSchemas.length > 0) {
+    errors.push(
+      formatList(
+        "SparseKernel OpenAPI object response schemas must use component schema refs",
+        inlineResponseSchemas.toSorted(compareStrings),
+      ),
+    );
+  }
 }
 
 export function collectOpenApiMissingJsonResponseSchemaRoutes(paths) {
@@ -380,6 +389,26 @@ export function collectOpenApiMissingJsonResponseSchemaRoutes(paths) {
     }
   }
   return routes;
+}
+
+export function collectOpenApiInlineObjectResponseSchemaRoutes(paths) {
+  const routes = [];
+  for (const [routePath, operations] of Object.entries(paths)) {
+    if (!operations || typeof operations !== "object" || Array.isArray(operations)) {
+      continue;
+    }
+    for (const [method, operation] of Object.entries(operations)) {
+      const schema = jsonResponseSchema(operation);
+      if (schema && isInlineObjectResponseSchema(schema)) {
+        routes.push(`${method.toUpperCase()} ${routePath}`);
+      }
+    }
+  }
+  return routes;
+}
+
+function isInlineObjectResponseSchema(schema) {
+  return !schema.$ref && schema.type !== "array" && !schema.anyOf;
 }
 
 function jsonResponseSchema(operation) {

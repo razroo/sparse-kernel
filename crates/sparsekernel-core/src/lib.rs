@@ -1502,11 +1502,25 @@ impl SparseKernelDb {
         subject_id: &str,
         permission: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO artifact_access(artifact_id, subject_type, subject_id, permission, created_at)
              VALUES(?, ?, ?, ?, ?)",
             params![artifact_id, subject_type, subject_id, permission, now_iso()],
         )?;
+        if inserted > 0 {
+            self.record_audit(AuditInput {
+                actor_type: Some("runtime".to_string()),
+                actor_id: None,
+                action: "artifact_access.granted".to_string(),
+                object_type: Some("artifact".to_string()),
+                object_id: Some(artifact_id.to_string()),
+                payload: Some(json!({
+                    "subjectType": subject_type,
+                    "subjectId": subject_id,
+                    "permission": permission,
+                })),
+            })?;
+        }
         Ok(())
     }
 
@@ -4035,11 +4049,24 @@ mod tests {
         assert!(store
             .read(&first.id, Some(("agent", "other", "read")))
             .is_err());
+        db.grant_artifact_access(&first.id, "agent", "main", "read")
+            .unwrap();
         let export_path = dir.path().join("export.txt");
         store
             .export_file(&first.id, &export_path, Some(("agent", "main", "read")))
             .unwrap();
         assert_eq!(fs::read(export_path).unwrap(), b"hello");
+        let audit = db.list_audit(10).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event.action == "artifact_access.granted")
+                .count(),
+            1
+        );
+        assert!(audit
+            .iter()
+            .any(|event| event.action == "artifact_access.denied"));
     }
 
     #[test]
